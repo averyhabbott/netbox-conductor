@@ -1,7 +1,7 @@
 .PHONY: all dev build-server build-agent build-all test vet lint migrate-up migrate-down clean
 
-BINARY_SERVER        := bin/netbox-tool
-BINARY_SERVER_ARM64  := bin/netbox-tool-server-linux-arm64
+BINARY_SERVER        := bin/netbox-conductor
+BINARY_SERVER_ARM64  := bin/netbox-conductor-linux-arm64
 BINARY_AGENT         := bin/netbox-agent
 BINARY_AGENT_AMD64   := bin/netbox-agent-linux-amd64
 BINARY_AGENT_ARM64   := bin/netbox-agent-linux-arm64

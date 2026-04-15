@@ -132,7 +132,7 @@ func run(ctx context.Context) error {
 	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, logDir, logName)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
 	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, enc, witnessManager)
-	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, broker, serverURL, logDir, logName)
+	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, dispatcher, broker, serverURL, logDir, logName)
 	credHandler := handlers.NewCredentialHandler(credQ, enc)
 	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker)

@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	defaultWitnessScript = "/opt/netbox-tool/patroni-witness.py"
-	defaultPythonBin     = "/opt/netbox-tool/venv/bin/python3"
+	defaultWitnessScript = "/opt/netbox-conductor/patroni-witness.py"
+	defaultPythonBin     = "/opt/netbox-conductor/venv/bin/python3"
 	defaultBasePort      = 5500
 )
 

@@ -21,29 +21,64 @@ install -m 755 netbox-agent "$BIN_DEST"
 
 echo "→ Creating $ENV_DIR"
 mkdir -p "$ENV_DIR"
+chown netbox-agent:netbox-agent "$ENV_DIR"
+chmod 750 "$ENV_DIR"
 if [[ ! -f "$ENV_DIR/netbox-agent.env" ]]; then
-  install -m 640 netbox-agent.env.example "$ENV_DIR/netbox-agent.env"
-  chown root:netbox-agent "$ENV_DIR/netbox-agent.env"
+  install -m 600 netbox-agent.env.example "$ENV_DIR/netbox-agent.env"
+  chown netbox-agent:netbox-agent "$ENV_DIR/netbox-agent.env"
   echo "  Created $ENV_DIR/netbox-agent.env"
   echo "  Fill in AGENT_NODE_ID, AGENT_TOKEN, and AGENT_SERVER_URL before starting."
   echo "  (Or download a pre-filled env file from the Conductor UI.)"
 else
-  echo "  $ENV_DIR/netbox-agent.env already exists — not overwritten"
+  # Ensure agent owns the env file so cert-learning can update it.
+  chown netbox-agent:netbox-agent "$ENV_DIR/netbox-agent.env"
+  chmod 600 "$ENV_DIR/netbox-agent.env"
+  echo "  $ENV_DIR/netbox-agent.env already exists — permissions updated"
 fi
 
 echo "→ Setting up managed directories"
-# NetBox configuration directory — agent writes configuration.py here
-if [[ -d /opt/netbox/netbox/netbox ]]; then
-  chown root:netbox-agent /opt/netbox/netbox/netbox
-  chmod g+w /opt/netbox/netbox/netbox
+
+# ── NetBox configuration directory ──────────────────────────────────────────
+# The agent writes configuration.py here; NetBox services read it.
+# Strategy: add netbox-agent to the 'netbox' group, then set setgid + group-write
+# on the directory so files written by the agent are readable by the netbox user.
+NB_CONFIG=""
+if [[ -f "$ENV_DIR/netbox-agent.env" ]]; then
+  NB_CONFIG=$(grep -E "^NETBOX_CONFIG_PATH=" "$ENV_DIR/netbox-agent.env" | head -1 | cut -d= -f2-)
+fi
+if [[ -z "$NB_CONFIG" ]]; then
+  for p in /opt/netbox/netbox/netbox/configuration.py /opt/netbox-*/netbox/netbox/configuration.py; do
+    if [[ -f "$p" ]]; then
+      NB_CONFIG="$p"
+      break
+    fi
+  done
+fi
+if [[ -n "$NB_CONFIG" ]]; then
+  NB_DIR=$(dirname "$NB_CONFIG")
+  echo "  NetBox config dir: $NB_DIR"
+  if getent group netbox >/dev/null 2>&1; then
+    usermod -aG netbox netbox-agent
+    chown :netbox "$NB_DIR"
+    chmod g+ws "$NB_DIR"
+    echo "  Added netbox-agent to 'netbox' group; $NB_DIR is now group-writable (setgid)"
+  else
+    echo "  WARNING: 'netbox' group not found — skipping NetBox directory setup"
+    echo "  Run manually: usermod -aG <netbox-group> netbox-agent && chmod g+ws $NB_DIR"
+  fi
+else
+  echo "  WARNING: NetBox installation not detected"
+  echo "  After setting NETBOX_CONFIG_PATH in $ENV_DIR/netbox-agent.env, re-run install.sh"
 fi
 
-# Patroni configuration directory — create if absent, owned by agent
+# ── Patroni configuration directory ─────────────────────────────────────────
+# Create if absent, owned by agent
 mkdir -p /etc/patroni
 chown netbox-agent:netbox-agent /etc/patroni
 chmod 750 /etc/patroni
 
-# Redis/Sentinel configuration directory — add agent to the redis group
+# ── Redis/Sentinel configuration directory ───────────────────────────────────
+# Add agent to the redis group for sentinel.conf write access
 if getent group redis >/dev/null 2>&1; then
   usermod -aG redis netbox-agent
 fi

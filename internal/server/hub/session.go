@@ -16,6 +16,8 @@ import (
 type Session struct {
 	NodeID          uuid.UUID
 	ClusterID       uuid.UUID
+	AgentVersion    string // from agent.hello
+	NetboxVersion   string // from heartbeat; updated on each heartbeat
 	// NetboxLogPathFn derives the on-disk path for a forwarded NetBox log file.
 	// logFilename is the base name as reported by the agent, e.g. "netbox.log".
 	// Nil when the node was connected before log-forwarding was configured.

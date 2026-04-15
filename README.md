@@ -101,12 +101,74 @@ The server binary embeds the compiled frontend (`go:embed`), so there is only on
 
 ## Installation
 
-### Prerequisites
+### Server Prerequisites
 
-- Go 1.25+
-- Node.js 20+ (for building the frontend)
-- PostgreSQL 15+ on the server host
-- Linux hosts for the managed nodes (agent binary targets Linux amd64/arm64)
+The conductor server and build toolchain are tested on **Linux (arm64/amd64)** and **macOS**. The agent binary targets Linux only.
+
+#### Go 1.25+
+
+**macOS:**
+
+```bash
+brew install go
+```
+
+**Linux (Ubuntu/Debian):**
+
+```bash
+# Download the official tarball — check https://go.dev/dl/ for the latest 1.25.x release
+wget https://go.dev/dl/go1.25.9.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.25.9.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh
+source /etc/profile.d/go.sh
+go version
+```
+
+#### Node.js 20+
+
+**macOS:**
+
+```bash
+brew install node
+```
+
+**Linux (Ubuntu/Debian):**
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node --version
+```
+
+#### PostgreSQL 15+ (conductor server host only)
+
+**macOS:**
+
+```bash
+brew install postgresql@15
+brew services start postgresql@15
+```
+
+**Linux (Ubuntu/Debian):**
+
+```bash
+sudo apt-get install -y postgresql postgresql-contrib
+sudo systemctl enable --now postgresql
+```
+
+#### Managed nodes (agent hosts)
+
+The agent binary is statically compiled — no runtime dependencies are required on managed nodes beyond a standard Linux installation with systemd.
+
+---
+
+### Get the Code
+
+```bash
+git clone https://github.com/averyhabbott/netbox-conductor.git
+cd netbox-conductor
+```
 
 ### Build
 
@@ -115,7 +177,7 @@ The server binary embeds the compiled frontend (`go:embed`), so there is only on
 make build-all
 
 # Output:
-#   bin/netbox-tool-server-linux-arm64
+#   bin/netbox-conductor-linux-arm64
 #   bin/netbox-agent-linux-amd64
 #   bin/netbox-agent-linux-arm64
 
@@ -126,79 +188,124 @@ make build-agent    # agent for local OS
 
 ### Server Setup
 
+Run all commands from the repository root (the directory that contains `deployments/` and `bin/`):
+
+```bash
+cd /path/to/netbox-conductor
+```
+
 **1. Create the system user and directories:**
 
 ```bash
-groupadd --system netbox-conductor
-useradd --system --gid netbox-conductor --no-create-home --shell /usr/sbin/nologin netbox-conductor
+sudo groupadd --system netbox-conductor
+sudo useradd --system --gid netbox-conductor --no-create-home --shell /usr/sbin/nologin netbox-conductor
 
-mkdir -p /opt/netbox-conductor/bin
-mkdir -p /etc/netbox-conductor
-mkdir -p /var/log/netbox-conductor
-chown netbox-conductor:netbox-conductor /var/log/netbox-conductor
+sudo mkdir -p /opt/netbox-conductor/bin
+sudo mkdir -p /etc/netbox-conductor
+sudo mkdir -p /var/log/netbox-conductor
+sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor
+sudo chown netbox-conductor:netbox-conductor /var/log/netbox-conductor
 ```
 
 **2. Copy the binary:**
 
 ```bash
-cp bin/netbox-tool-server-linux-arm64 /opt/netbox-conductor/bin/netbox-conductor
-chmod +x /opt/netbox-conductor/bin/netbox-conductor
+sudo cp bin/netbox-conductor-linux-arm64 /opt/netbox-conductor/bin/netbox-conductor
+sudo chmod +x /opt/netbox-conductor/bin/netbox-conductor
 ```
 
 **3. Copy agent binaries** (served to managed nodes via download endpoint):
 
 ```bash
-mkdir -p /var/lib/netbox-conductor/bin
-cp bin/netbox-agent-linux-amd64 /var/lib/netbox-conductor/bin/
-cp bin/netbox-agent-linux-arm64 /var/lib/netbox-conductor/bin/
-chmod +x /var/lib/netbox-conductor/bin/netbox-agent-linux-*
+sudo mkdir -p /var/lib/netbox-conductor/bin
+sudo cp bin/netbox-agent-linux-amd64 /var/lib/netbox-conductor/bin/
+sudo cp bin/netbox-agent-linux-arm64 /var/lib/netbox-conductor/bin/
+sudo chmod +x /var/lib/netbox-conductor/bin/netbox-agent-linux-*
 ```
 
-**4. Configure the environment** — copy and edit `deployments/server/netbox-conductor.env.example` to `/etc/netbox-conductor/netbox-conductor.env`:
+**4. Configure the environment:**
 
 ```bash
-# Required
-DATABASE_URL=postgres://netbox_conductor:<password>@localhost:5432/netbox_conductor?sslmode=disable
-JWT_SECRET=<64 random hex chars>
-SERVER_URL=https://your-conductor.example.com
+sudo cp deployments/server/netbox-conductor.env.example /etc/netbox-conductor/netbox-conductor.env
+sudo chown root:netbox-conductor /etc/netbox-conductor/netbox-conductor.env
+sudo chmod 640 /etc/netbox-conductor/netbox-conductor.env
+```
 
-# Optional (defaults shown)
+Generate a JWT signing secret:
+
+```bash
+openssl rand -hex 32
+```
+
+Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required values:
+
+```bash
+# PostgreSQL connection string — use the user/password created in Step 6
+DATABASE_URL=postgres://netbox_conductor:<password>@localhost:5432/netbox_conductor?sslmode=disable
+
+# Paste the output of: openssl rand -hex 32
+JWT_SECRET=<openssl output>
+
+# Public base URL — must include the port if the conductor is not on 443
+SERVER_URL=https://your-conductor.example.com:8443
+
 LISTEN_ADDR=:8443
 LOG_DIR=/var/log
 LOG_NAME=netbox-conductor
 LOG_LEVEL=info
 
-# Encryption key for secrets at rest (generate once; back up securely)
-# Either point to a key file:
-NETBOX_TOOL_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
-# Or provide inline:
-# NETBOX_TOOL_MASTER_KEY=<64 hex chars>
+# Uncomment and set the master key path (key is generated in Step 5)
+NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
 
-# TLS (leave empty to auto-generate a self-signed cert on first start)
-# TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
-# TLS_KEY_FILE=/etc/netbox-conductor/tls.key
-
-# Path to agent binaries for download endpoint
-AGENT_BIN_DIR=/var/lib/netbox-conductor/bin
+# TLS cert paths — auto-generated on first start if absent
+TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
+TLS_KEY_FILE=/etc/netbox-conductor/tls.key
 ```
 
-**5. Create the database:**
+**5. Generate the master key** (encrypts credentials at rest):
 
 ```bash
-createdb netbox_conductor
-# Migrations run automatically on startup — no manual migration step needed
+openssl rand -hex 32 | sudo tee /etc/netbox-conductor/master.key
+sudo chmod 400 /etc/netbox-conductor/master.key
+sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor/master.key
 ```
 
-**6. Install and start the systemd service:**
+**6. Create the database user and database:**
+
+First, generate a strong database password and save it — you will need it in the `DATABASE_URL` in Step 4:
 
 ```bash
-cp deployments/server/netbox-conductor.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now netbox-conductor
-journalctl -u netbox-conductor -f
+openssl rand -hex 16
+```
+
+**macOS:**
+
+```bash
+createuser --pwprompt netbox_conductor   # enter the generated password when prompted
+createdb -O netbox_conductor netbox_conductor
+```
+
+**Linux:**
+
+```bash
+sudo -u postgres psql -c "CREATE USER netbox_conductor WITH PASSWORD '<generated password>';"
+sudo -u postgres createdb -O netbox_conductor netbox_conductor
+```
+
+Migrations run automatically on first startup — no manual migration step needed.
+
+**7. Install and start the systemd service:**
+
+```bash
+sudo cp deployments/server/netbox-conductor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netbox-conductor
+sudo journalctl -u netbox-conductor -f
 ```
 
 The UI is available at `https://<server>:8443`. On first start, create your admin account via the login page (if no users exist, the first registration is granted admin).
+
+---
 
 ### Agent Setup (per managed node)
 
@@ -209,13 +316,13 @@ There are two ways to install the agent on a managed node:
 1. In the Conductor UI, navigate to your cluster and click **Add Node**
 2. Complete Step 1 (hostname, IP, role) and Step 2 (install agent):
    ```bash
-   curl -fsSL https://your-conductor.example.com/api/v1/downloads/agent-linux-amd64 \
+   curl -fsSL https://your-conductor.example.com:8443/api/v1/downloads/agent-linux-amd64 \
      -o netbox-agent.tar.gz
    tar -xzf netbox-agent.tar.gz
    sudo bash install.sh
    ```
 3. The tarball includes: agent binary, `install.sh`, `netbox-agent.service`, `netbox-agent-sudoers`, and `netbox-agent.env.example`
-4. Step 3 generates the env snippet — copy it to `/etc/netbox-agent/netbox-agent.env` on the node, then:
+4. Step 3 in the UI generates the env snippet — copy it to `/etc/netbox-agent/netbox-agent.env` on the node, then:
    ```bash
    sudo systemctl start netbox-agent
    ```
@@ -234,11 +341,11 @@ sudo chmod +x /usr/local/bin/netbox-agent
 sudo cp netbox-agent.service /etc/systemd/system/
 sudo install -m 440 netbox-agent-sudoers /etc/sudoers.d/netbox-agent
 
-# Create config dir
+# Create config dir — must be owned by the agent (cert-learning writes here)
 sudo mkdir -p /etc/netbox-agent
 sudo cp netbox-agent.env.example /etc/netbox-agent/netbox-agent.env
-sudo chown root:netbox-agent /etc/netbox-agent/netbox-agent.env
-sudo chmod 640 /etc/netbox-agent/netbox-agent.env
+sudo chown -R netbox-agent:netbox-agent /etc/netbox-agent
+sudo chmod 600 /etc/netbox-agent/netbox-agent.env
 ```
 
 Edit `/etc/netbox-agent/netbox-agent.env`:
@@ -246,8 +353,20 @@ Edit `/etc/netbox-agent/netbox-agent.env`:
 ```bash
 AGENT_NODE_ID=<uuid from Conductor>
 AGENT_TOKEN=<token from Conductor>
-AGENT_SERVER_URL=https://your-conductor.example.com/api/v1/agent/connect
-# For self-signed certs in dev:
+
+# WebSocket URL — must use wss:// and include the port if not on 443
+AGENT_SERVER_URL=wss://your-conductor.example.com:8443/api/v1/agent/connect
+
+# TLS — cert-learning handles this automatically by default:
+# On first start the agent downloads the conductor's CA cert, saves it to
+# /etc/netbox-agent/ca.crt, updates this env file, and switches to verified TLS.
+UPDATE_CERT=true
+
+# To supply the CA cert manually instead:
+# UPDATE_CERT=false
+# AGENT_TLS_CA_CERT=/etc/netbox-agent/ca.crt
+
+# For development only (insecure — not for production):
 # AGENT_TLS_SKIP_VERIFY=true
 
 # NetBox paths (adjust to your installation)
@@ -265,15 +384,36 @@ sudo systemctl enable --now netbox-agent
 
 The node will appear as **Connected** in the Conductor UI once the agent authenticates.
 
+---
+
 ### Directory Permissions (managed nodes)
 
-The `install.sh` script handles these, but for reference:
+The `install.sh` script handles all of these automatically. For reference:
 
-| Directory | Required action |
+| Path | Setup required |
 |---|---|
-| `/opt/netbox/netbox/netbox` | `chown root:netbox-agent`, `chmod g+w` |
-| `/etc/patroni` | Create, `chown netbox-agent:netbox-agent` |
-| `/etc/redis` | `usermod -aG redis netbox-agent` |
+| `/opt/netbox/netbox/netbox/` | `usermod -aG netbox netbox-agent` + `chown :netbox <dir>` + `chmod g+ws <dir>` — setgid ensures files written by the agent inherit the `netbox` group and are readable by gunicorn and netbox-rq |
+| `/etc/patroni` | `mkdir -p`, `chown netbox-agent:netbox-agent`, `chmod 750` |
+| Redis Sentinel config | `usermod -aG redis netbox-agent` |
+
+> **Important:** The NetBox config directory group must be `netbox` (not `netbox-agent`) so that the `netbox` user running gunicorn and netbox-rq can read `configuration.py` after the agent writes it. Do not use `chown netbox-agent:netbox-agent` on this directory.
+
+---
+
+### Master Key Rotation
+
+To re-encrypt all secrets at rest with a new AES-256-GCM key:
+
+```bash
+DATABASE_URL=postgres://... \
+NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key \
+NEW_MASTER_KEY_FILE=/etc/netbox-conductor/master.key.new \
+  rotate-key
+```
+
+Without `--in-place`, the new key is written to `NEW_MASTER_KEY_FILE`. Swap the file and restart the conductor once you have verified the new key. With `--in-place`, the current key file is overwritten on success.
+
+All re-encryption runs in a single transaction — it either fully succeeds or rolls back with no changes.
 
 ---
 
@@ -285,12 +425,13 @@ createdb netbox_conductor_dev
 
 # 2. Copy and edit the server env
 cp deployments/server/netbox-conductor.env.example .env
-# Edit DATABASE_URL, JWT_SECRET, SERVER_URL
+# Edit DATABASE_URL, JWT_SECRET
+# Set SERVER_URL=https://localhost:8443  (must include port for agent env snippets)
 
-# 3. Start the backend (auto-runs migrations, serves API on :8443)
+# 3. Start the backend (auto-runs migrations, serves API on :8443 by default)
 make dev
 
-# 4. In a separate terminal, start the frontend dev server (proxies /api to :8443)
+# 4. In a separate terminal, start the frontend dev server (proxies /api to backend)
 make dev-frontend
 # → http://localhost:5173
 ```
@@ -336,7 +477,6 @@ Items are roughly ordered by priority.
 | **NetBox upgrade orchestration** | One-click rolling upgrade: upgrade standby → validate → migrate primary → upgrade old primary |
 | **Task timeout sweep** | Server background job to move stale `sent`/`ack` tasks to `timeout` status |
 | **ClusterDetail topology graph** | Visual Patroni topology diagram |
-| **Master key rotation** | CLI command to re-encrypt all secrets with a new AES key |
 
 ### Long-term / Wishlist
 
@@ -355,14 +495,15 @@ Items are roughly ordered by priority.
 netbox-conductor/
 ├── cmd/
 │   ├── server/          # Conductor server binary entry point
-│   └── agent/           # Agent binary entry point (task executor)
+│   ├── agent/           # Agent binary entry point (task executor)
+│   └── rotate-key/      # Offline key-rotation tool (re-encrypts all secrets)
 ├── deployments/
 │   ├── server/          # Server systemd unit, env template, Patroni witness script
 │   └── agent/           # Agent systemd unit, install.sh, env template, sudoers, bundle.go
 ├── internal/
 │   ├── agent/
-│   │   ├── config/      # Agent env file loading and validation
-│   │   ├── executor/    # Task implementations (config write, Patroni, media sync, etc.)
+│   │   ├── config/      # Agent env file loading, validation, and cert-learning
+│   │   ├── executor/    # Task implementations (config write, Patroni, media sync, upgrade, etc.)
 │   │   └── ws/          # WebSocket client (connect, reconnect, heartbeat)
 │   ├── server/
 │   │   ├── api/

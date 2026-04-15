@@ -2,11 +2,15 @@
 package executor
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,6 +28,7 @@ type MetricsCollector struct {
 	mediaRoot        string
 	patroniRESTURL   string
 	httpClient       *http.Client
+	cachedNBVersion  string // cached after first successful detection
 }
 
 // NewMetricsCollector creates a collector using the given config paths.
@@ -62,6 +67,12 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 	// Service state
 	hb.NetboxRunning = isServiceActive("netbox")
 	hb.RQRunning = isServiceActive("netbox-rq")
+
+	// NetBox version (cached; re-detected if empty)
+	if m.cachedNBVersion == "" {
+		m.cachedNBVersion = detectNetboxVersion(m.netboxConfigPath)
+	}
+	hb.NetboxVersion = m.cachedNBVersion
 
 	// Patroni state
 	role, lagBytes, stateJSON := m.queryPatroni()
@@ -162,6 +173,58 @@ func (w *PatroniRoleWatcher) Poll() {
 			w.lastRole = role // silent first population
 		}
 	}
+}
+
+// detectNetboxVersion returns the NetBox version string by reading release.py or
+// the package __init__.py adjacent to the configuration.py path.
+// Returns "" if the version cannot be determined.
+func detectNetboxVersion(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	// configPath is typically /opt/netbox/netbox/netbox/configuration.py
+	// NetBox version lives in /opt/netbox/netbox/netbox/release.py (older) or
+	// /opt/netbox/netbox/netbox/__init__.py (newer) or the installed package metadata.
+	dir := filepath.Dir(configPath)
+
+	// Try release.py: VERSION = (4, 1, 0)  or  VERSION = "4.1.0"
+	if v := parseVersionFile(filepath.Join(dir, "release.py")); v != "" {
+		return v
+	}
+	// Try __init__.py with same patterns
+	if v := parseVersionFile(filepath.Join(dir, "__init__.py")); v != "" {
+		return v
+	}
+	// Try one level up (netbox package __init__.py)
+	if v := parseVersionFile(filepath.Join(filepath.Dir(dir), "__init__.py")); v != "" {
+		return v
+	}
+	return ""
+}
+
+var (
+	reVersionTuple  = regexp.MustCompile(`VERSION\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)`)
+	reVersionString = regexp.MustCompile(`VERSION\s*=\s*["'](\d+\.\d+\.\d+[^"']*)["']`)
+)
+
+func parseVersionFile(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if m := reVersionTuple.FindStringSubmatch(line); m != nil {
+			return m[1] + "." + m[2] + "." + m[3]
+		}
+		if m := reVersionString.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 // formatSI formats bytes as a human-readable string (for logging).

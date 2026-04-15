@@ -120,6 +120,7 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/clusters/:id/nodes/:nid/stop-netbox", cfg.NodeHandler.ServiceAction, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/nodes/:nid/restart-netbox", cfg.NodeHandler.ServiceAction, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/nodes/:nid/restart-rq", cfg.NodeHandler.ServiceAction, mw.RequireRole("operator"))
+	protected.POST("/clusters/:id/nodes/:nid/upgrade-agent", cfg.NodeHandler.UpgradeAgent, mw.RequireRole("operator"))
 
 	// ── Config (Phase 3) ────────────────────────────────────────────────────
 	protected.GET("/clusters/:id/config", cfg.ConfigHandler.GetOrCreate)

@@ -9,4 +9,5 @@ netbox-agent ALL=(ALL) NOPASSWD: \
   /usr/bin/systemctl restart netbox-rq, \
   /usr/bin/systemctl restart patroni, \
   /usr/bin/systemctl restart redis, \
-  /usr/bin/systemctl restart redis-sentinel
+  /usr/bin/systemctl restart redis-sentinel, \
+  /usr/bin/systemctl restart netbox-agent

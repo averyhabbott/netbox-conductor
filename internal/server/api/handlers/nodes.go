@@ -26,6 +26,7 @@ type NodeHandler struct {
 	agentToks   *queries.AgentTokenQuerier
 	taskResults *queries.TaskResultQuerier
 	hub         *hub.Hub
+	dispatcher  *hub.Dispatcher
 	broker      *sse.Broker
 	serverURL   string // base URL shown to operators in ENV snippet
 	logDir      string
@@ -39,6 +40,7 @@ func NewNodeHandler(
 	taskResults *queries.TaskResultQuerier,
 	clusters *queries.ClusterQuerier,
 	h *hub.Hub,
+	dispatcher *hub.Dispatcher,
 	broker *sse.Broker,
 	serverURL, logDir, logName string,
 ) *NodeHandler {
@@ -49,6 +51,7 @@ func NewNodeHandler(
 		agentToks:   agentToks,
 		taskResults: taskResults,
 		hub:         h,
+		dispatcher:  dispatcher,
 		broker:      broker,
 		serverURL:   serverURL,
 		logDir:      logDir,
@@ -66,8 +69,11 @@ type nodeResponse struct {
 	Role              string  `json:"role"`
 	FailoverPriority  int     `json:"failover_priority"`
 	AgentStatus       string  `json:"agent_status"`
+	AgentVersion      string  `json:"agent_version,omitempty"`
 	NetboxRunning     *bool   `json:"netbox_running"`
 	RQRunning         *bool   `json:"rq_running"`
+	NetboxVersion     string  `json:"netbox_version,omitempty"`
+	HealthStatus      string  `json:"health_status"` // "healthy" | "degraded" | "offline"
 	SuppressAutoStart bool    `json:"suppress_auto_start"`
 	MaintenanceMode   bool    `json:"maintenance_mode"`
 	SSHPort           int     `json:"ssh_port"`
@@ -90,6 +96,7 @@ func toNodeResponse(n *queries.Node) nodeResponse {
 		Role:              n.Role,
 		FailoverPriority:  n.FailoverPriority,
 		AgentStatus:       n.AgentStatus,
+		HealthStatus:      "offline",
 		NetboxRunning:     n.NetboxRunning,
 		MaintenanceMode:   n.MaintenanceMode,
 		RQRunning:         n.RQRunning,
@@ -103,6 +110,22 @@ func toNodeResponse(n *queries.Node) nodeResponse {
 		r.LastSeenAt = &s
 	}
 	return r
+}
+
+// computeHealth derives a health status from live session data.
+// "healthy" = connected + NetBox running + RQ running
+// "degraded" = connected but at least one service down
+// "offline"  = not connected
+func computeHealth(status string, netboxRunning, rqRunning *bool) string {
+	if status != "connected" {
+		return "offline"
+	}
+	nb := netboxRunning != nil && *netboxRunning
+	rq := rqRunning != nil && *rqRunning
+	if nb && rq {
+		return "healthy"
+	}
+	return "degraded"
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -123,10 +146,12 @@ func (h *NodeHandler) List(c echo.Context) error {
 	resp := make([]nodeResponse, 0, len(nodes))
 	for i := range nodes {
 		r := toNodeResponse(&nodes[i])
-		// Override agent status with live hub state
-		if h.hub.IsConnected(nodes[i].ID) {
+		if sess := h.hub.Get(nodes[i].ID); sess != nil {
 			r.AgentStatus = "connected"
+			r.AgentVersion = sess.AgentVersion
+			r.NetboxVersion = sess.NetboxVersion
 		}
+		r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning)
 		resp = append(resp, r)
 	}
 	return c.JSON(http.StatusOK, resp)
@@ -197,9 +222,12 @@ func (h *NodeHandler) Get(c echo.Context) error {
 	}
 
 	r := toNodeResponse(node)
-	if h.hub.IsConnected(nid) {
+	if sess := h.hub.Get(nid); sess != nil {
 		r.AgentStatus = "connected"
+		r.AgentVersion = sess.AgentVersion
+		r.NetboxVersion = sess.NetboxVersion
 	}
+	r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning)
 	return c.JSON(http.StatusOK, r)
 }
 
@@ -284,9 +312,12 @@ func (h *NodeHandler) Status(c echo.Context) error {
 	}
 
 	r := toNodeResponse(node)
-	if h.hub.IsConnected(nid) {
+	if sess := h.hub.Get(nid); sess != nil {
 		r.AgentStatus = "connected"
+		r.AgentVersion = sess.AgentVersion
+		r.NetboxVersion = sess.NetboxVersion
 	}
+	r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning)
 	return c.JSON(http.StatusOK, r)
 }
 
@@ -620,4 +651,66 @@ func (h *NodeHandler) GetNetboxLogNames(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{"names": names})
+}
+
+// UpgradeAgent dispatches an agent.upgrade task to the node.
+// POST /api/v1/clusters/:id/nodes/:nid/upgrade-agent
+func (h *NodeHandler) UpgradeAgent(c echo.Context) error {
+	nid, err := uuid.Parse(c.Param("nid"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid node id")
+	}
+
+	ctx := c.Request().Context()
+
+	node, err := h.nodes.GetByID(ctx, nid)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "node not found")
+	}
+
+	sess := h.hub.Get(nid)
+	if sess == nil {
+		return echo.NewHTTPError(http.StatusConflict, "node is not connected")
+	}
+
+	// Derive architecture from the current session's hello (stored in AgentVersion prefix if needed).
+	// Default to amd64; agent can detect its own arch.
+	arch := "amd64"
+	conductorURL := h.serverURL
+	if conductorURL == "" {
+		conductorURL = "https://localhost:8443"
+	}
+	downloadURL := conductorURL + "/api/v1/downloads/agent-linux-" + arch
+
+	taskID := uuid.New()
+	params, _ := json.Marshal(protocol.AgentUpgradeParams{
+		DownloadURL: downloadURL,
+		Arch:        arch,
+	})
+	dispatch := protocol.TaskDispatchPayload{
+		TaskID:      taskID.String(),
+		TaskType:    protocol.TaskAgentUpgrade,
+		Params:      json.RawMessage(params),
+		TimeoutSecs: 120,
+	}
+
+	_ = h.taskResults.Create(ctx, nid, taskID, string(protocol.TaskAgentUpgrade), mustMarshal(dispatch))
+
+	if err := h.dispatcher.Dispatch(nid, dispatch); err != nil {
+		return echo.NewHTTPError(http.StatusConflict, "dispatch failed: "+err.Error())
+	}
+	_ = h.taskResults.SetSent(ctx, taskID)
+
+	_ = node // used for hostname in future logging
+	return c.JSON(http.StatusAccepted, map[string]any{
+		"task_id":   taskID.String(),
+		"task_type": protocol.TaskAgentUpgrade,
+		"node_id":   nid.String(),
+		"status":    "dispatched",
+	})
+}
+
+func mustMarshal(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }

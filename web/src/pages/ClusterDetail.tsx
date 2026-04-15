@@ -12,6 +12,10 @@ import client from '../api/client'
 import Layout from '../components/Layout'
 import AddNodeWizard from './AddNodeWizard'
 
+// The agent version that ships with this conductor build.
+// Keep in sync with agentVersion in internal/agent/ws/client.go.
+const CURRENT_AGENT_VERSION = '0.1.0'
+
 function AgentStatusBadge({ status }: { status: string }) {
   const styles: Record<string, string> = {
     connected: 'bg-emerald-900/50 text-emerald-400 border-emerald-800',
@@ -38,6 +42,24 @@ function AgentStatusBadge({ status }: { status: string }) {
   )
 }
 
+function HealthDot({ status }: { status?: string }) {
+  const color =
+    status === 'healthy'
+      ? 'bg-emerald-400'
+      : status === 'degraded'
+      ? 'bg-amber-400'
+      : 'bg-red-500'
+  const title =
+    status === 'healthy'
+      ? 'Healthy'
+      : status === 'degraded'
+      ? 'Degraded (service down)'
+      : 'Offline'
+  return (
+    <span title={title} className={`inline-block w-2.5 h-2.5 rounded-full ${color}`} />
+  )
+}
+
 function ServiceBadge({ running, label }: { running: boolean | null; label: string }) {
   if (running === null)
     return <span className="text-gray-600 text-xs">{label}: —</span>
@@ -51,11 +73,27 @@ function ServiceBadge({ running, label }: { running: boolean | null; label: stri
 }
 
 function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
+  const qc = useQueryClient()
+  const upgrade = useMutation({
+    mutationFn: () => nodesApi.upgradeAgent(clusterId, node.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['nodes', clusterId] }),
+  })
+  const upgradeAvailable =
+    node.agent_status === 'connected' &&
+    node.agent_version != null &&
+    node.agent_version !== CURRENT_AGENT_VERSION
+
   return (
     <tr className="border-b border-gray-800 last:border-0 hover:bg-gray-800/40">
       <td className="px-6 py-4">
         <div className="flex items-center gap-2">
-          <span className="font-medium">{node.hostname}</span>
+          <HealthDot status={node.health_status} />
+          <Link
+            to={`/clusters/${clusterId}/nodes/${node.id}`}
+            className="font-medium hover:text-blue-400 transition-colors"
+          >
+            {node.hostname}
+          </Link>
           {node.maintenance_mode && (
             <span className="text-xs px-1.5 py-0.5 rounded bg-amber-900/50 text-amber-400 border border-amber-800">
               maintenance
@@ -69,22 +107,32 @@ function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
       </td>
       <td className="px-6 py-4">
         <AgentStatusBadge status={node.agent_status} />
+        {node.agent_version && (
+          <div className="text-xs text-gray-500 mt-0.5 font-mono">
+            v{node.agent_version}
+            {upgradeAvailable && (
+              <button
+                onClick={() => upgrade.mutate()}
+                disabled={upgrade.isPending}
+                className="ml-2 text-amber-400 hover:text-amber-300 disabled:opacity-40"
+                title={`Upgrade from v${node.agent_version} to v${CURRENT_AGENT_VERSION}`}
+              >
+                {upgrade.isPending ? 'upgrading…' : '↑ upgrade'}
+              </button>
+            )}
+          </div>
+        )}
       </td>
       <td className="px-6 py-4">
         <div className="flex gap-3">
           <ServiceBadge running={node.netbox_running} label="NetBox" />
           <ServiceBadge running={node.rq_running} label="RQ" />
         </div>
+        {node.netbox_version && (
+          <div className="text-xs text-gray-500 mt-0.5">nb {node.netbox_version}</div>
+        )}
       </td>
       <td className="px-6 py-4 text-gray-400 text-sm">{node.failover_priority}</td>
-      <td className="px-6 py-4 text-right">
-        <Link
-          to={`/clusters/${clusterId}/nodes/${node.id}`}
-          className="text-blue-400 hover:text-blue-300 text-sm transition-colors"
-        >
-          Details →
-        </Link>
-      </td>
     </tr>
   )
 }
@@ -955,7 +1003,6 @@ export default function ClusterDetail() {
                     <th className="text-left px-6 py-3 font-medium">Agent</th>
                     <th className="text-left px-6 py-3 font-medium">Services</th>
                     <th className="text-left px-6 py-3 font-medium">Priority</th>
-                    <th className="px-6 py-3" />
                   </tr>
                 </thead>
                 <tbody>

@@ -3,12 +3,12 @@
 // Usage:
 //
 //	DATABASE_URL=postgres://... \
-//	NETBOX_TOOL_MASTER_KEY_FILE=/etc/netbox-tool/master.key \
-//	NEW_MASTER_KEY_FILE=/etc/netbox-tool/master.key.new \
+//	NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key \
+//	NEW_MASTER_KEY_FILE=/etc/netbox-conductor/master.key.new \
 //	  rotate-key
 //
 // The tool will:
-//  1. Load the current master key (from NETBOX_TOOL_MASTER_KEY_FILE or NETBOX_TOOL_MASTER_KEY).
+//  1. Load the current master key (from NETBOX_CONDUCTOR_MASTER_KEY_FILE or NETBOX_CONDUCTOR_MASTER_KEY).
 //  2. Load or generate the new key (from NEW_MASTER_KEY_FILE or NEW_MASTER_KEY).
 //  3. Re-encrypt all encrypted columns in a single transaction.
 //  4. Write the new key to NEW_MASTER_KEY_FILE on success (or overwrite the current key file
@@ -122,9 +122,9 @@ func main() {
 	// Write new key to disk
 	destPath := newKeyPath
 	if *inPlace {
-		destPath = os.Getenv("NETBOX_TOOL_MASTER_KEY_FILE")
+		destPath = os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY_FILE")
 		if destPath == "" {
-			destPath = "/etc/netbox-tool/master.key"
+			destPath = "/etc/netbox-conductor/master.key"
 		}
 	}
 	newKeyHex := hex.EncodeToString(newKey[:]) + "\n"
@@ -184,9 +184,9 @@ func reencryptColumn(ctx context.Context, tx pgx.Tx, oldEnc, newEnc *crypto.Encr
 func loadOrGenerateNewKey() (*crypto.MasterKey, string, error) {
 	path := os.Getenv("NEW_MASTER_KEY_FILE")
 	if path == "" {
-		path = os.Getenv("NETBOX_TOOL_MASTER_KEY_FILE") + ".new"
+		path = os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY_FILE") + ".new"
 		if path == ".new" {
-			path = "/etc/netbox-tool/master.key.new"
+			path = "/etc/netbox-conductor/master.key.new"
 		}
 	}
 

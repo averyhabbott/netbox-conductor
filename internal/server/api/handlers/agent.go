@@ -261,6 +261,7 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	agentLog := logging.OpenAgentLog(h.logDir, h.logName, clusterName, node.Hostname)
 
 	sess := hub.NewSession(nodeID, clusterID, conn)
+	sess.AgentVersion = hello.AgentVersion
 	h.hub.Register(sess)
 	// Capture variables for the closure — don't close over the loop-local pointers.
 	logDir, logName, cn, hn := h.logDir, h.logName, clusterName, node.Hostname
@@ -490,6 +491,10 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 
 	if err := h.nodes.UpdateHeartbeat(ctx, sess.NodeID, hb.NetboxRunning, hb.RQRunning, patroniStateJSON); err != nil {
 		logger.Warn("heartbeat DB update failed", "error", err)
+	}
+
+	if hb.NetboxVersion != "" {
+		sess.NetboxVersion = hb.NetboxVersion
 	}
 
 	// Heartbeats are Debug — they fire every 15s and would flood Info logs.

@@ -8,8 +8,11 @@ export interface Node {
   role: 'hyperconverged' | 'app' | 'db_only'
   failover_priority: number
   agent_status: 'connected' | 'disconnected' | 'unknown'
+  agent_version?: string
   netbox_running: boolean | null
   rq_running: boolean | null
+  netbox_version?: string
+  health_status?: 'healthy' | 'degraded' | 'offline'
   suppress_auto_start: boolean
   maintenance_mode: boolean
   ssh_port: number
@@ -112,5 +115,12 @@ export const nodesApi = {
   getNetboxLogNames: (clusterId: string, nodeId: string) =>
     client
       .get<{ names: string[] }>(`/clusters/${clusterId}/nodes/${nodeId}/netbox-log-names`)
+      .then((r) => r.data),
+
+  upgradeAgent: (clusterId: string, nodeId: string) =>
+    client
+      .post<{ task_id: string; status: string }>(
+        `/clusters/${clusterId}/nodes/${nodeId}/upgrade-agent`
+      )
       .then((r) => r.data),
 }

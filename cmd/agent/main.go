@@ -38,6 +38,17 @@ func main() {
 		log.Fatalf("agent is not registered: AGENT_NODE_ID and AGENT_TOKEN must be set in %s", envFile)
 	}
 
+	// Cert-learning: one-time download of conductor's CA cert.
+	// Only runs when UPDATE_CERT=true (default); updates the env file and the
+	// in-memory config so the WS connection uses the downloaded cert.
+	if cfg.UpdateCert {
+		if err := agentconfig.LearnCert(cfg, envFile); err != nil {
+			log.Printf("WARNING: cert-learning failed (%v) — continuing without pinned cert", err)
+		} else {
+			log.Printf("cert-learning succeeded; TLS CA cert saved to %s", cfg.TLSCACert)
+		}
+	}
+
 	// Set up structured logging.
 	// Writes to stderr (captured by journald) and also to the local syslog socket
 	// so events appear in /var/log/messages (or equivalent) on the managed host.
@@ -383,6 +394,20 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			// just signals readiness — actual writing happens in the message handler.
 			output = "pull mode: ready to receive chunks"
 			success = true
+		}
+
+	case protocol.TaskAgentUpgrade:
+		var params protocol.AgentUpgradeParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.UpgradeAgent(params, cfg.TLSSkipVerify, cfg.TLSCACert)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
 		}
 
 	case protocol.TaskRunCommand:

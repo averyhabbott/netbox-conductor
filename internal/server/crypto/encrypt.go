@@ -22,18 +22,18 @@ var ErrInvalidCiphertext = errors.New("invalid ciphertext")
 // MasterKey holds the 32-byte AES-256 master key.
 type MasterKey [keySize]byte
 
-// LoadMasterKey loads the master key from the path in NETBOX_TOOL_MASTER_KEY_FILE,
-// falling back to NETBOX_TOOL_MASTER_KEY (hex-encoded env var).
+// LoadMasterKey loads the master key from the path in NETBOX_CONDUCTOR_MASTER_KEY_FILE,
+// falling back to NETBOX_CONDUCTOR_MASTER_KEY (hex-encoded env var).
 // If neither is set and create is true, a new key is generated and written to the file.
 func LoadMasterKey(create bool) (*MasterKey, error) {
-	if path := os.Getenv("NETBOX_TOOL_MASTER_KEY_FILE"); path != "" {
+	if path := os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY_FILE"); path != "" {
 		return loadFromFile(path, create)
 	}
-	if hexKey := os.Getenv("NETBOX_TOOL_MASTER_KEY"); hexKey != "" {
+	if hexKey := os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY"); hexKey != "" {
 		return loadFromHex(hexKey)
 	}
 	// Default path
-	return loadFromFile("/etc/netbox-tool/master.key", create)
+	return loadFromFile("/etc/netbox-conductor/master.key", create)
 }
 
 func loadFromFile(path string, create bool) (*MasterKey, error) {

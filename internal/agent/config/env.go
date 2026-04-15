@@ -22,6 +22,11 @@ type Config struct {
 	TLSCACert             string
 	ReconnectIntervalSecs int
 
+	// Cert auto-learning
+	// When true the agent downloads the conductor's CA cert on startup,
+	// saves it to /etc/netbox-agent/ca.crt, and updates the env file.
+	UpdateCert bool
+
 	// Logging
 	LogLevel string
 
@@ -59,6 +64,10 @@ func Load(envFile string) (*Config, error) {
 
 	skipVerify := strings.ToLower(os.Getenv("AGENT_TLS_SKIP_VERIFY"))
 	cfg.TLSSkipVerify = skipVerify == "true" || skipVerify == "1" || skipVerify == "yes"
+
+	updateCert := strings.ToLower(os.Getenv("UPDATE_CERT"))
+	// Default true if the variable is unset (empty string treated as true)
+	cfg.UpdateCert = updateCert == "" || updateCert == "true" || updateCert == "1" || updateCert == "yes"
 
 	return cfg, cfg.validate()
 }

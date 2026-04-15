@@ -36,6 +36,29 @@ const taskStatusColor: Record<string, string> = {
   queued: 'text-gray-400',
 }
 
+// Log level ordering (lower index = lower priority)
+const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
+type LogLevel = typeof LOG_LEVELS[number]
+
+// filterLogLines returns only lines whose level is >= minLevel.
+// Handles slog text format: `level=INFO ...` and `level=WARN ...`
+// Lines with no recognisable level are kept when minLevel is debug/info,
+// excluded at warn/error (they're typically continuation lines or blanks).
+function filterLogLines(lines: string[], minLevel: LogLevel): string[] {
+  const minIdx = LOG_LEVELS.indexOf(minLevel)
+  return lines.filter((line) => {
+    const m = line.match(/\blevel=([A-Za-z]+)/i)
+    if (!m) {
+      // Keep unrecognised lines for low thresholds only
+      return minIdx <= 1
+    }
+    const lvl = m[1].toLowerCase() as LogLevel
+    const idx = LOG_LEVELS.indexOf(lvl)
+    if (idx === -1) return minIdx <= 1
+    return idx >= minIdx
+  })
+}
+
 // ── Sparkline ─────────────────────────────────────────────────────────────────
 
 const MAX_SAMPLES = 24 // ~6 minutes at 15s refetch
@@ -682,6 +705,7 @@ export default function NodeDetail() {
 
   const [logSource, setLogSource] = useState<'agent' | 'netbox'>('agent')
   const [netboxLogName, setNetboxLogName] = useState<string>('')
+  const [logLevel, setLogLevel] = useState<'debug' | 'info' | 'warn' | 'error'>('info')
 
   const { data: netboxLogNamesData } = useQuery({
     queryKey: ['netbox-log-names', nid],
@@ -905,7 +929,7 @@ export default function NodeDetail() {
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 md:col-span-2">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <h3 className="font-medium">Logs</h3>
                 <div className="flex text-xs border border-gray-700 rounded-lg overflow-hidden">
                   {(['agent', 'netbox'] as const).map((src) => (
@@ -922,6 +946,17 @@ export default function NodeDetail() {
                     </button>
                   ))}
                 </div>
+                <select
+                  value={logLevel}
+                  onChange={(e) => setLogLevel(e.target.value as typeof logLevel)}
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs focus:outline-none focus:border-blue-500"
+                  title="Minimum log level to display"
+                >
+                  <option value="debug">debug+</option>
+                  <option value="info">info+</option>
+                  <option value="warn">warn+</option>
+                  <option value="error">error only</option>
+                </select>
               </div>
               {logSource === 'netbox' && availableLogNames.length > 1 && (
                 <select
@@ -954,7 +989,7 @@ export default function NodeDetail() {
             </p>
           ) : (
             <pre className="text-xs font-mono text-gray-400 bg-gray-950 rounded-lg p-4 overflow-auto max-h-96 leading-5">
-              {logsData.lines.join('\n')}
+              {filterLogLines(logsData.lines, logLevel).join('\n')}
             </pre>
           )}
         </div>

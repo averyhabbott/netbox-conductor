@@ -2,6 +2,7 @@ import { useReducer, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
+import type { ClusterStatus } from '../api/clusters'
 import Layout from '../components/Layout'
 import { useSSE } from '../hooks/useSSE'
 import type { SSEEvent } from '../hooks/useSSE'
@@ -41,7 +42,7 @@ type FeedAction =
 function feedReducer(state: FeedEntry[], action: FeedAction): FeedEntry[] {
   switch (action.type) {
     case 'add':
-      return [action.entry, ...state].slice(0, 50) // keep last 50
+      return [action.entry, ...state].slice(0, 50)
     case 'clear':
       return []
     default:
@@ -49,13 +50,118 @@ function feedReducer(state: FeedEntry[], action: FeedAction): FeedEntry[] {
   }
 }
 
-// ── Connected-node tracker ────────────────────────────────────────────────────
-
 const eventTypeColor: Record<string, string> = {
   'node.status': 'text-blue-400',
   'node.heartbeat': 'text-gray-500',
   'task.complete': 'text-emerald-400',
   'patroni.state': 'text-amber-400',
+}
+
+// ── Health helpers ────────────────────────────────────────────────────────────
+
+type HealthStatus = 'healthy' | 'degraded' | 'offline'
+
+function nodeHealth(n: ClusterStatus['nodes'][number]): HealthStatus {
+  if (n.agent_status !== 'connected') return 'offline'
+  if (n.netbox_running && n.rq_running) return 'healthy'
+  return 'degraded'
+}
+
+function clusterHealth(nodes: ClusterStatus['nodes']): HealthStatus {
+  if (!nodes.length) return 'offline'
+  const statuses = nodes.map(nodeHealth)
+  if (statuses.every((s) => s === 'healthy')) return 'healthy'
+  if (statuses.some((s) => s !== 'offline')) return 'degraded'
+  return 'offline'
+}
+
+// ── Donut chart ───────────────────────────────────────────────────────────────
+
+const DONUT_R = 40
+const DONUT_CIRC = 2 * Math.PI * DONUT_R
+
+const HEALTH_COLORS: Record<HealthStatus, string> = {
+  healthy: '#34d399',
+  degraded: '#fbbf24',
+  offline: '#ef4444',
+}
+
+const HEALTH_KEYS: HealthStatus[] = ['healthy', 'degraded', 'offline']
+
+function DonutChart({
+  counts,
+  total,
+  label,
+}: {
+  counts: Record<HealthStatus, number>
+  total: number
+  label: string
+}) {
+  let acc = 0
+  const slices = HEALTH_KEYS
+    .filter((k) => counts[k] > 0)
+    .map((k) => {
+      const frac = counts[k] / total
+      const dashArray = `${frac * DONUT_CIRC} ${DONUT_CIRC}`
+      const dashOffset = -(acc * DONUT_CIRC)
+      acc += frac
+      return { k, dashArray, dashOffset }
+    })
+
+  return (
+    <div className="flex flex-col items-center gap-3">
+      <div className="relative w-32 h-32">
+        <svg viewBox="0 0 100 100" className="w-full h-full -rotate-90">
+          <circle cx="50" cy="50" r={DONUT_R} fill="none" stroke="#1f2937" strokeWidth="12" />
+          {total > 0 && slices.map(({ k, dashArray, dashOffset }) => (
+            <circle
+              key={k}
+              cx="50"
+              cy="50"
+              r={DONUT_R}
+              fill="none"
+              stroke={HEALTH_COLORS[k]}
+              strokeWidth="12"
+              strokeDasharray={dashArray}
+              strokeDashoffset={dashOffset}
+            />
+          ))}
+        </svg>
+        <div className="absolute inset-0 flex items-center justify-center">
+          <span className="text-3xl font-bold">{total}</span>
+        </div>
+      </div>
+      <div className="text-center">
+        <p className="text-sm font-medium text-gray-300">{label}</p>
+        <div className="flex gap-3 mt-1.5 justify-center flex-wrap">
+          {HEALTH_KEYS.filter((k) => counts[k] > 0).map((k) => (
+            <span key={k} className="flex items-center gap-1 text-xs text-gray-400">
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: HEALTH_COLORS[k] }} />
+              {counts[k]} {k}
+            </span>
+          ))}
+          {total === 0 && <span className="text-xs text-gray-600">—</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Cluster health dot ────────────────────────────────────────────────────────
+
+const HEALTH_DOT_BG: Record<HealthStatus, string> = {
+  healthy: 'bg-emerald-400',
+  degraded: 'bg-amber-400',
+  offline: 'bg-red-500',
+}
+
+function ClusterHealthDot({ status }: { status: HealthStatus }) {
+  return (
+    <span
+      className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${HEALTH_DOT_BG[status]}`}
+      title={status}
+    />
+  )
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -81,7 +187,6 @@ export default function Dashboard() {
   })
 
   const handleSSE = useCallback((ev: SSEEvent) => {
-    // Skip noisy heartbeats from the live feed (still count them for status)
     if (ev.type !== 'node.heartbeat') {
       dispatch({
         type: 'add',
@@ -94,8 +199,6 @@ export default function Dashboard() {
         },
       })
     }
-
-    // Invalidate node queries on status or patroni changes so they stay fresh
     if (ev.type === 'node.status' || ev.type === 'patroni.state') {
       qc.invalidateQueries({ queryKey: ['nodes'] })
     }
@@ -106,32 +209,37 @@ export default function Dashboard() {
 
   useSSE(handleSSE)
 
-  // Derive connected node count across all clusters
-  const connectedCount = clusterStatuses
-    ? clusterStatuses
-        .flatMap((s) => s?.nodes ?? [])
-        .filter((n) => n.agent_status === 'connected').length
-    : '—'
+  // Derive health counts for pie charts
+  const clusterHealthCounts: Record<HealthStatus, number> = { healthy: 0, degraded: 0, offline: 0 }
+  const nodeHealthCounts: Record<HealthStatus, number> = { healthy: 0, degraded: 0, offline: 0 }
+
+  if (clusters && clusterStatuses) {
+    clusters.forEach((_, i) => {
+      const status = clusterStatuses[i]
+      clusterHealthCounts[status ? clusterHealth(status.nodes) : 'offline']++
+      status?.nodes.forEach((n) => { nodeHealthCounts[nodeHealth(n)]++ })
+    })
+  }
+
+  const totalClusters = clusters?.length ?? 0
+  const totalNodes = nodeHealthCounts.healthy + nodeHealthCounts.degraded + nodeHealthCounts.offline
 
   return (
     <Layout>
       <h2 className="text-2xl font-semibold mb-6">Dashboard</h2>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-        {[
-          { label: 'Clusters', value: clusters?.length ?? '—' },
-          { label: 'Nodes Connected', value: connectedCount },
-          { label: 'Active Alerts', value: '0' },
-        ].map((stat) => (
-          <div key={stat.label} className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-            <p className="text-sm text-gray-400 mb-1">{stat.label}</p>
-            <p className="text-3xl font-semibold">{stat.value}</p>
-          </div>
-        ))}
+      {/* Health pie charts */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 flex items-center justify-center">
+          <DonutChart counts={clusterHealthCounts} total={totalClusters} label="Clusters" />
+        </div>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 flex items-center justify-center">
+          <DonutChart counts={nodeHealthCounts} total={totalNodes} label="Nodes" />
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Clusters table */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+        {/* Clusters list */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
             <h3 className="font-medium">Clusters</h3>
@@ -154,44 +262,23 @@ export default function Dashboard() {
               </Link>
             </div>
           ) : (
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-gray-400 border-b border-gray-800">
-                  <th className="text-left px-6 py-3 font-medium">Name</th>
-                  <th className="text-left px-6 py-3 font-medium">Mode</th>
-                  <th className="text-left px-6 py-3 font-medium">Auto Failover</th>
-                  <th className="px-6 py-3" />
-                </tr>
-              </thead>
-              <tbody>
-                {clusters.map((c) => (
-                  <tr
-                    key={c.id}
-                    className="border-b border-gray-800 last:border-0 hover:bg-gray-800/40"
-                  >
-                    <td className="px-6 py-3 font-medium">{c.name}</td>
-                    <td className="px-6 py-3 text-gray-400">
-                      {c.mode === 'active_standby' ? 'Active / Standby' : 'HA'}
-                    </td>
-                    <td className="px-6 py-3 text-gray-400">
-                      {c.auto_failover ? (
-                        <span className="text-emerald-400">On</span>
-                      ) : (
-                        'Off'
-                      )}
-                    </td>
-                    <td className="px-6 py-3 text-right">
-                      <Link
-                        to={`/clusters/${c.id}`}
-                        className="text-blue-400 hover:text-blue-300 transition-colors"
-                      >
-                        View →
-                      </Link>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <ul className="divide-y divide-gray-800">
+              {clusters.map((c, i) => {
+                const status = clusterStatuses?.[i]
+                const health = status ? clusterHealth(status.nodes) : 'offline'
+                return (
+                  <li key={c.id}>
+                    <Link
+                      to={`/clusters/${c.id}`}
+                      className="flex items-center gap-3 px-6 py-3 hover:bg-gray-800/40 transition-colors"
+                    >
+                      <ClusterHealthDot status={health} />
+                      <span className="font-medium text-sm">{c.name}</span>
+                    </Link>
+                  </li>
+                )
+              })}
+            </ul>
           )}
         </div>
 
@@ -234,6 +321,12 @@ export default function Dashboard() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Active Alerts */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <p className="text-sm text-gray-400 mb-1">Active Alerts</p>
+        <p className="text-3xl font-semibold">0</p>
       </div>
     </Layout>
   )

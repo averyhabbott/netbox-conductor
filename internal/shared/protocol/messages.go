@@ -38,9 +38,10 @@ const (
 	TaskRestartSentinel   TaskType = "service.restart.redis-sentinel"
 	TaskWriteSentinelConf TaskType = "sentinel.write_config"
 	TaskMediaSync         TaskType = "media.sync"
-	TaskDBRestore         TaskType = "db.restore"   // reinitialize a replica or restore from backup
-	TaskRunCommand        TaskType = "exec.run"      // admin-only ad-hoc
-	TaskEnforceRetention  TaskType = "backup.expire" // run pgbackrest expire / retention enforcement
+	TaskDBRestore         TaskType = "db.restore"    // reinitialize a replica or restore from backup
+	TaskRunCommand        TaskType = "exec.run"       // admin-only ad-hoc
+	TaskEnforceRetention  TaskType = "backup.expire"  // run pgbackrest expire / retention enforcement
+	TaskAgentUpgrade      TaskType = "agent.upgrade"  // self-upgrade the agent binary
 )
 
 // Envelope wraps every WebSocket message.
@@ -75,6 +76,7 @@ type HeartbeatPayload struct {
 	DiskUsedPct   float64  `json:"disk_used_pct"`
 	NetboxRunning bool     `json:"netbox_running"`
 	RQRunning     bool     `json:"rq_running"`
+	NetboxVersion string   `json:"netbox_version,omitempty"` // e.g. "4.1.0"
 	PatroniRole   string   `json:"patroni_role"`   // "primary", "replica", "standby_leader", ""
 	PatroniLagB   *int64   `json:"patroni_lag_bytes,omitempty"`
 	PatroniState  *json.RawMessage `json:"patroni_state,omitempty"` // full Patroni /patroni response
@@ -215,4 +217,10 @@ type PatroniInstallParams struct {
 type EnforceRetentionParams struct {
 	PatroniScope string `json:"patroni_scope"` // pgBackRest stanza name (defaults to "main")
 	ExpireCmd    string `json:"expire_cmd"`    // optional override for the expire command
+}
+
+// AgentUpgradeParams are the params for TaskAgentUpgrade.
+type AgentUpgradeParams struct {
+	DownloadURL string `json:"download_url"` // full URL of the tarball (e.g. https://conductor:8443/api/v1/downloads/agent-linux-amd64)
+	Arch        string `json:"arch"`         // "amd64" | "arm64"
 }
