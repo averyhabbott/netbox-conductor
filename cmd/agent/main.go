@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -15,6 +16,8 @@ import (
 
 	agentconfig "github.com/averyhabbott/netbox-conductor/internal/agent/config"
 	"github.com/averyhabbott/netbox-conductor/internal/agent/executor"
+	"github.com/averyhabbott/netbox-conductor/internal/agent/statusserver"
+	"github.com/averyhabbott/netbox-conductor/internal/agent/syncperm"
 	"github.com/averyhabbott/netbox-conductor/internal/agent/ws"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
@@ -32,6 +35,21 @@ func main() {
 	cfg, err := agentconfig.Load(envFile)
 	if err != nil {
 		log.Fatalf("configuration error: %v", err)
+	}
+
+	// Subcommands — dispatch before the daemon starts.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "check-sync-permissions":
+			if err := syncperm.Run(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown subcommand: %s\nUsage: netbox-agent [check-sync-permissions]\n", os.Args[1])
+			os.Exit(1)
+		}
 	}
 
 	if !cfg.IsRegistered() {
@@ -59,6 +77,14 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Status server state — updated when the server delivers cluster config on connect.
+	statusState := statusserver.NewState(cfg.PatroniRESTURL)
+
+	// Status server — HTTP health endpoint for VIP / reverse-proxy health checks.
+	if cfg.StatusAddr != "" {
+		go statusserver.Serve(ctx, cfg.StatusAddr, cfg.NodeID, statusState)
+	}
 
 	// Metrics collector
 	metrics := executor.NewMetricsCollector(cfg.NetboxConfigPath, cfg.NetboxMediaRoot, cfg.PatroniRESTURL)
@@ -128,6 +154,16 @@ func main() {
 	// Wire heartbeat function
 	client.HeartbeatFn = func() (protocol.HeartbeatPayload, error) {
 		return metrics.Collect()
+	}
+
+	// Update status server state whenever the server delivers cluster config.
+	client.OnServerHello = func(hello protocol.ServerHelloPayload) {
+		slog.Info("cluster config received from server",
+			"cluster_id", hello.ClusterID,
+			"patroni_configured", hello.PatroniConfigured,
+			"app_tier_always_available", hello.AppTierAlwaysAvailable,
+		)
+		statusState.Update(hello.PatroniConfigured, hello.AppTierAlwaysAvailable)
 	}
 
 	// Poll Patroni role every 10s (independent of heartbeat cadence)
@@ -347,6 +383,34 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskDBBackup:
+		var params protocol.DBBackupParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunDBBackup(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskUpdateDBHost:
+		var params protocol.DBHostUpdateParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.UpdateDBHost(params, cfg.NetboxConfigPath)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
 	case protocol.TaskInstallPatroni:
 		var params protocol.PatroniInstallParams
 		if err := json.Unmarshal(task.Params, &params); err != nil {
@@ -428,12 +492,20 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		errMsg = "unknown task type: " + string(task.TaskType)
 	}
 
-	slog.Info("task done",
-		"task_id", task.TaskID,
-		"type", task.TaskType,
-		"success", success,
-		"duration_ms", time.Since(start).Milliseconds(),
-	)
+	if success {
+		slog.Info("task done",
+			"task_id", task.TaskID,
+			"type", task.TaskType,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	} else {
+		slog.Warn("task failed",
+			"task_id", task.TaskID,
+			"type", task.TaskType,
+			"error", errMsg,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	}
 
 	sendResult(client, task.TaskID, success, output, errMsg, time.Since(start).Milliseconds())
 }

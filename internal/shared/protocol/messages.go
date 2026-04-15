@@ -27,6 +27,7 @@ type TaskType string
 
 const (
 	TaskWriteConfig       TaskType = "config.write"
+	TaskUpdateDBHost      TaskType = "config.update_db_host"
 	TaskStartNetbox       TaskType = "service.start.netbox"
 	TaskStopNetbox        TaskType = "service.stop.netbox"
 	TaskRestartNetbox     TaskType = "service.restart.netbox"
@@ -39,6 +40,7 @@ const (
 	TaskWriteSentinelConf TaskType = "sentinel.write_config"
 	TaskMediaSync         TaskType = "media.sync"
 	TaskDBRestore         TaskType = "db.restore"    // reinitialize a replica or restore from backup
+	TaskDBBackup          TaskType = "db.backup"     // pg_dump the primary database before destructive ops
 	TaskRunCommand        TaskType = "exec.run"       // admin-only ad-hoc
 	TaskEnforceRetention  TaskType = "backup.expire"  // run pgbackrest expire / retention enforcement
 	TaskAgentUpgrade      TaskType = "agent.upgrade"  // self-upgrade the agent binary
@@ -134,10 +136,19 @@ type NetboxLogPayload struct {
 // ────────────────────────────────────────────────────────────────
 
 // ServerHelloPayload is the server's response to AgentHelloPayload.
+// It includes cluster configuration so the agent can update the status server
+// and behave correctly without an additional round-trip.
 type ServerHelloPayload struct {
 	Accepted      bool   `json:"accepted"`
 	RejectReason  string `json:"reject_reason,omitempty"`
 	ServerVersion string `json:"server_version"`
+
+	// Cluster configuration delivered on connect.
+	// Zero values when the agent is in staging or the cluster lookup fails.
+	ClusterID              string `json:"cluster_id,omitempty"`
+	AppTierAlwaysAvailable bool   `json:"app_tier_always_available"`
+	PatroniScope           string `json:"patroni_scope,omitempty"`
+	PatroniConfigured      bool   `json:"patroni_configured"`
 }
 
 // TaskDispatchPayload instructs the agent to execute a task.
@@ -158,6 +169,15 @@ type MediaRequestPayload struct {
 // ────────────────────────────────────────────────────────────────
 // Task param structs (embedded in TaskDispatchPayload.Params)
 // ────────────────────────────────────────────────────────────────
+
+// DBHostUpdateParams are the params for TaskUpdateDBHost.
+// The agent patches only the DATABASE.HOST line in configuration.py, preserving
+// all other settings. Used when the Patroni primary changes and all app-tier
+// nodes running in app_tier_always_available mode need to reconnect to the new primary.
+type DBHostUpdateParams struct {
+	Host         string `json:"host"`          // new DATABASE.HOST value (bare IP, no CIDR)
+	RestartAfter bool   `json:"restart_after"` // restart netbox+netbox-rq after patching
+}
 
 // ConfigWriteParams are the params for TaskWriteConfig.
 type ConfigWriteParams struct {
@@ -196,6 +216,16 @@ type DBRestoreParams struct {
 	TargetTime    string `json:"target_time"`     // ISO8601 — used for pitr
 	RestoreCmd    string `json:"restore_command"` // optional: override default restore command
 	PatroniScope  string `json:"patroni_scope"`   // cluster scope for patronictl
+}
+
+// DBBackupParams are the params for TaskDBBackup.
+// The agent runs pg_dump on the local Postgres instance and writes the backup
+// file to OutputDir. The resulting path is returned in the task output so the
+// operator can retrieve it later (the restore-from-backup UI is a future feature).
+type DBBackupParams struct {
+	DBName    string `json:"db_name"`    // database to dump; default "netbox"
+	DBUser    string `json:"db_user"`    // Postgres role to connect as; default "postgres"
+	OutputDir string `json:"output_dir"` // directory for the dump file; default "/var/lib/postgresql/backups"
 }
 
 // MediaSyncParams are the params for TaskMediaSync.

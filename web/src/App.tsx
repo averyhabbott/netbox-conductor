@@ -10,6 +10,7 @@ import NodeDetail from './pages/NodeDetail'
 import ConfigEditor from './pages/ConfigEditor'
 import Settings from './pages/Settings'
 import AvailableAgents from './pages/AvailableAgents'
+import Nodes from './pages/Nodes'
 import ProtectedRoute from './components/ProtectedRoute'
 
 const queryClient = new QueryClient({
@@ -90,6 +91,14 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <AvailableAgents />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/nodes"
+            element={
+              <ProtectedRoute>
+                <Nodes />
               </ProtectedRoute>
             }
           />

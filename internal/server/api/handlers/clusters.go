@@ -48,30 +48,50 @@ func NewClusterHandler(
 // ── Response types ────────────────────────────────────────────────────────────
 
 type clusterResponse struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	Mode         string  `json:"mode"`
-	AutoFailover bool    `json:"auto_failover"`
-	AutoFailback bool    `json:"auto_failback"`
-	VIP          *string `json:"vip,omitempty"`
-	PatroniScope string  `json:"patroni_scope"`
-	NetboxVersion string `json:"netbox_version"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
+	ID                      string   `json:"id"`
+	Name                    string   `json:"name"`
+	Mode                    string   `json:"mode"`
+	AutoFailover            bool     `json:"auto_failover"`
+	AutoFailback            bool     `json:"auto_failback"`
+	AppTierAlwaysAvailable  bool     `json:"app_tier_always_available"`
+	FailoverOnMaintenance   bool     `json:"failover_on_maintenance"`
+	FailoverDelaySecs       int      `json:"failover_delay_secs"`
+	VIP                     *string  `json:"vip,omitempty"`
+	PatroniScope            string   `json:"patroni_scope"`
+	NetboxVersion           string   `json:"netbox_version"`
+	MediaSyncEnabled        bool     `json:"media_sync_enabled"`
+	ExtraFoldersSyncEnabled bool     `json:"extra_folders_sync_enabled"`
+	ExtraSyncFolders        []string `json:"extra_sync_folders"`
+	PatroniConfigured       bool     `json:"patroni_configured"`
+	RedisSentinelMaster     string   `json:"redis_sentinel_master"`
+	CreatedAt               string   `json:"created_at"`
+	UpdatedAt               string   `json:"updated_at"`
 }
 
 func toClusterResponse(c *queries.Cluster) clusterResponse {
+	folders := c.ExtraSyncFolders
+	if folders == nil {
+		folders = []string{}
+	}
 	return clusterResponse{
-		ID:           c.ID.String(),
-		Name:         c.Name,
-		Mode:         c.Mode,
-		AutoFailover: c.AutoFailover,
-		AutoFailback: c.AutoFailback,
-		VIP:          c.VIP,
-		PatroniScope: c.PatroniScope,
-		NetboxVersion: c.NetboxVersion,
-		CreatedAt:    c.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:    c.UpdatedAt.Format(time.RFC3339),
+		ID:                      c.ID.String(),
+		Name:                    c.Name,
+		Mode:                    c.Mode,
+		AutoFailover:            c.AutoFailover,
+		AutoFailback:            c.AutoFailback,
+		AppTierAlwaysAvailable:  c.AppTierAlwaysAvailable,
+		FailoverOnMaintenance:   c.FailoverOnMaintenance,
+		FailoverDelaySecs:       c.FailoverDelaySecs,
+		VIP:                     c.VIP,
+		PatroniScope:            c.PatroniScope,
+		NetboxVersion:           c.NetboxVersion,
+		MediaSyncEnabled:        c.MediaSyncEnabled,
+		ExtraFoldersSyncEnabled: c.ExtraFoldersSyncEnabled,
+		ExtraSyncFolders:        folders,
+		PatroniConfigured:       c.PatroniConfigured,
+		RedisSentinelMaster:     c.RedisSentinelMaster,
+		CreatedAt:               c.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:               c.UpdatedAt.Format(time.RFC3339),
 	}
 }
 
@@ -87,7 +107,11 @@ func (h *ClusterHandler) List(c echo.Context) error {
 
 	resp := make([]clusterResponse, 0, len(clusters))
 	for i := range clusters {
-		resp = append(resp, toClusterResponse(&clusters[i]))
+		r := toClusterResponse(&clusters[i])
+		if live := h.hub.NetboxVersionForCluster(clusters[i].ID); live != "" {
+			r.NetboxVersion = live
+		}
+		resp = append(resp, r)
 	}
 	return c.JSON(http.StatusOK, resp)
 }
@@ -166,13 +190,21 @@ func (h *ClusterHandler) Get(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
 	}
 
-	return c.JSON(http.StatusOK, toClusterResponse(cluster))
+	r := toClusterResponse(cluster)
+	if live := h.hub.NetboxVersionForCluster(id); live != "" {
+		r.NetboxVersion = live
+	}
+	return c.JSON(http.StatusOK, r)
 }
 
 type updateFailoverRequest struct {
-	AutoFailover bool    `json:"auto_failover"`
-	AutoFailback bool    `json:"auto_failback"`
-	VIP          *string `json:"vip"`
+	AutoFailover           bool    `json:"auto_failover"`
+	AutoFailback           bool    `json:"auto_failback"`
+	AppTierAlwaysAvailable bool    `json:"app_tier_always_available"`
+	FailoverOnMaintenance  bool    `json:"failover_on_maintenance"`
+	FailoverDelaySecs      int     `json:"failover_delay_secs"`
+	VIP                    *string `json:"vip"`
+	RedisSentinelMaster    string  `json:"redis_sentinel_master"`
 }
 
 // UpdateFailoverSettings godoc
@@ -188,11 +220,20 @@ func (h *ClusterHandler) UpdateFailoverSettings(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
 
+	// Default delay to 30 s if caller omits or sends 0.
+	if req.FailoverDelaySecs <= 0 {
+		req.FailoverDelaySecs = 30
+	}
+
 	if err := h.clusters.UpdateFailoverSettings(c.Request().Context(), queries.UpdateClusterParams{
-		ID:           id,
-		AutoFailover: req.AutoFailover,
-		AutoFailback: req.AutoFailback,
-		VIP:          req.VIP,
+		ID:                     id,
+		AutoFailover:           req.AutoFailover,
+		AutoFailback:           req.AutoFailback,
+		AppTierAlwaysAvailable: req.AppTierAlwaysAvailable,
+		FailoverOnMaintenance:  req.FailoverOnMaintenance,
+		FailoverDelaySecs:      req.FailoverDelaySecs,
+		VIP:                    req.VIP,
+		RedisSentinelMaster:    req.RedisSentinelMaster,
 	}); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
 	}
@@ -232,6 +273,42 @@ func (h *ClusterHandler) Delete(c echo.Context) error {
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+type updateMediaSyncRequest struct {
+	MediaSyncEnabled        bool     `json:"media_sync_enabled"`
+	ExtraFoldersSyncEnabled bool     `json:"extra_folders_sync_enabled"`
+	ExtraSyncFolders        []string `json:"extra_sync_folders"`
+}
+
+// UpdateMediaSyncSettings godoc
+// PATCH /api/v1/clusters/:id/media-sync-settings
+func (h *ClusterHandler) UpdateMediaSyncSettings(c echo.Context) error {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+
+	var req updateMediaSyncRequest
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+
+	if err := h.clusters.UpdateMediaSyncSettings(c.Request().Context(), queries.UpdateMediaSyncParams{
+		ID:                      id,
+		MediaSyncEnabled:        req.MediaSyncEnabled,
+		ExtraFoldersSyncEnabled: req.ExtraFoldersSyncEnabled,
+		ExtraSyncFolders:        req.ExtraSyncFolders,
+	}); err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	}
+
+	cluster, err := h.clusters.GetByID(c.Request().Context(), id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch updated cluster")
+	}
+
+	return c.JSON(http.StatusOK, toClusterResponse(cluster))
 }
 
 // Status godoc

@@ -175,17 +175,18 @@ func (w *PatroniRoleWatcher) Poll() {
 	}
 }
 
-// detectNetboxVersion returns the NetBox version string by reading release.py or
-// the package __init__.py adjacent to the configuration.py path.
+// detectNetboxVersion returns the NetBox version string by reading well-known
+// version files relative to the configuration.py path.
 // Returns "" if the version cannot be determined.
 func detectNetboxVersion(configPath string) string {
 	if configPath == "" {
 		return ""
 	}
 	// configPath is typically /opt/netbox/netbox/netbox/configuration.py
-	// NetBox version lives in /opt/netbox/netbox/netbox/release.py (older) or
-	// /opt/netbox/netbox/netbox/__init__.py (newer) or the installed package metadata.
-	dir := filepath.Dir(configPath)
+	// NetBox repo root is three levels up: /opt/netbox/
+	dir := filepath.Dir(configPath)         // /opt/netbox/netbox/netbox
+	pkgDir := filepath.Dir(dir)             // /opt/netbox/netbox
+	repoRoot := filepath.Dir(pkgDir)        // /opt/netbox
 
 	// Try release.py: VERSION = (4, 1, 0)  or  VERSION = "4.1.0"
 	if v := parseVersionFile(filepath.Join(dir, "release.py")); v != "" {
@@ -196,8 +197,27 @@ func detectNetboxVersion(configPath string) string {
 		return v
 	}
 	// Try one level up (netbox package __init__.py)
-	if v := parseVersionFile(filepath.Join(filepath.Dir(dir), "__init__.py")); v != "" {
+	if v := parseVersionFile(filepath.Join(pkgDir, "__init__.py")); v != "" {
 		return v
+	}
+	// NetBox v4+ stores version in pyproject.toml at the repo root
+	if v := parsePyprojectVersion(filepath.Join(repoRoot, "pyproject.toml")); v != "" {
+		return v
+	}
+	return ""
+}
+
+var rePyprojectVersion = regexp.MustCompile(`(?m)^\s*version\s*=\s*["'](\d+\.\d+\.\d+[^"']*)["']`)
+
+func parsePyprojectVersion(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if m := rePyprojectVersion.Find(data); m != nil {
+		if sub := rePyprojectVersion.FindSubmatch(data); len(sub) > 1 {
+			return string(sub[1])
+		}
 	}
 	return ""
 }

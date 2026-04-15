@@ -125,14 +125,16 @@ func (q *TaskResultQuerier) TimeoutStale(ctx context.Context, sentTimeout, ackTi
 	return tag.RowsAffected(), nil
 }
 
-// ListPendingByNode returns tasks in "sent" state for a node. These are tasks
-// that were dispatched before a disconnect and can safely be re-sent on reconnect.
+// ListPendingByNode returns tasks in "queued" or "sent" state for a node.
+// "sent" tasks were dispatched before a disconnect and need to be re-sent.
+// "queued" tasks were created while the node was offline (e.g. a stop.netbox
+// queued to prevent split-brain) and need to be dispatched for the first time.
 func (q *TaskResultQuerier) ListPendingByNode(ctx context.Context, nodeID uuid.UUID) ([]TaskResult, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, node_id, task_id, task_type, status,
 		       request_payload, response_payload, queued_at, completed_at
 		FROM task_results
-		WHERE node_id = $1 AND status = 'sent'
+		WHERE node_id = $1 AND status IN ('queued', 'sent')
 		ORDER BY queued_at`,
 		nodeID)
 	if err != nil {

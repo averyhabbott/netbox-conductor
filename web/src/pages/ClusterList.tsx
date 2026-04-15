@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { clustersApi } from '../api/clusters'
 import type { CreateClusterBody } from '../api/clusters'
 import Layout from '../components/Layout'
@@ -28,7 +28,7 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
     name: '',
     mode: 'active_standby',
     patroni_scope: '',
-    netbox_version: '4.x',
+    netbox_version: '',
   })
   const [error, setError] = useState('')
 
@@ -93,15 +93,15 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
             />
           </div>
           <div>
-            <label className="block text-sm text-gray-400 mb-1">NetBox Version</label>
-            <select
+            <label className="block text-sm text-gray-400 mb-1">
+              NetBox Version <span className="text-gray-600">(updated automatically from agent heartbeat)</span>
+            </label>
+            <input
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+              placeholder="e.g. v4.5.7"
               value={form.netbox_version}
               onChange={(e) => setForm({ ...form, netbox_version: e.target.value })}
-            >
-              <option value="4.x">4.x</option>
-              <option value="3.x">3.x</option>
-            </select>
+            />
           </div>
           {error && <p className="text-sm text-red-400">{error}</p>}
           <div className="flex gap-3 pt-2">
@@ -127,6 +127,7 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
 }
 
 export default function ClusterList() {
+  const navigate = useNavigate()
   const [showCreate, setShowCreate] = useState(false)
   const { data: clusters, isLoading } = useQuery({
     queryKey: ['clusters'],
@@ -158,12 +159,15 @@ export default function ClusterList() {
                 <th className="text-left px-6 py-3 font-medium">Patroni Scope</th>
                 <th className="text-left px-6 py-3 font-medium">Auto Failover</th>
                 <th className="text-left px-6 py-3 font-medium">NetBox</th>
-                <th className="px-6 py-3" />
               </tr>
             </thead>
             <tbody>
               {clusters.map((cluster) => (
-                <tr key={cluster.id} className="border-b border-gray-800 last:border-0 hover:bg-gray-800/50">
+                <tr
+                  key={cluster.id}
+                  onClick={() => navigate(`/clusters/${cluster.id}`)}
+                  className="border-b border-gray-800 last:border-0 hover:bg-gray-800/40 cursor-pointer"
+                >
                   <td className="px-6 py-4 font-medium">{cluster.name}</td>
                   <td className="px-6 py-4 text-gray-300">
                     {cluster.mode === 'active_standby' ? 'Active / Standby' : 'HA'}
@@ -178,14 +182,6 @@ export default function ClusterList() {
                     </span>
                   </td>
                   <td className="px-6 py-4 text-gray-400">{cluster.netbox_version}</td>
-                  <td className="px-6 py-4 text-right">
-                    <Link
-                      to={`/clusters/${cluster.id}`}
-                      className="text-blue-400 hover:text-blue-300 transition-colors"
-                    >
-                      View →
-                    </Link>
-                  </td>
                 </tr>
               ))}
             </tbody>

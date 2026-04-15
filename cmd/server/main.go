@@ -19,6 +19,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db"
 	dbmigrations "github.com/averyhabbott/netbox-conductor/internal/server/db/migrations"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
@@ -124,6 +125,7 @@ func run(ctx context.Context) error {
 	auditQ := queries.NewAuditQuerier(store.Pool())
 	configQ := queries.NewConfigQuerier(store.Pool())
 	taskQ := queries.NewTaskResultQuerier(store.Pool())
+	failoverEventQ := queries.NewFailoverEventQuerier(store.Pool())
 
 	// Seed default admin
 	if err := seedAdminIfEmpty(ctx, userQ); err != nil {
@@ -144,16 +146,20 @@ func run(ctx context.Context) error {
 		ServerAddr: serverBindIP,
 	})
 
+	// Failover manager — orchestrates automatic NetBox failover/failback
+	failoverManager := failover.New(nodeQ, clusterQ, taskQ, failoverEventQ, h, dispatcher, broker)
+
 	// Handlers
 	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, enc)
-	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, logDir, logName)
+	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, failoverManager, logDir, logName)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
 	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, enc, witnessManager)
 	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, dispatcher, broker, serverURL, logDir, logName)
+	nodeHandler.SetFailoverManager(failoverManager)
 	credHandler := handlers.NewCredentialHandler(credQ, enc)
 	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker)
-	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, taskQ, retentionQ, enc, dispatcher, witnessManager)
+	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, taskQ, retentionQ, failoverEventQ, enc, dispatcher, witnessManager)
 	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)
 
 	// Router

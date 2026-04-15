@@ -43,6 +43,11 @@ type Client struct {
 	// HeartbeatFn is called each tick to produce heartbeat payload bytes.
 	// The agent package sets this to a function that reads real system metrics.
 	HeartbeatFn func() (protocol.HeartbeatPayload, error)
+
+	// OnServerHello is called after every successful server.hello exchange.
+	// Use it to propagate cluster config to other subsystems (e.g. status server).
+	// Called on the connect goroutine; must not block.
+	OnServerHello func(protocol.ServerHelloPayload)
 }
 
 // New creates a Client. HeartbeatFn must be set before Run is called.
@@ -149,7 +154,14 @@ func (c *Client) connect(ctx context.Context) error {
 	if !serverHello.Accepted {
 		return fmt.Errorf("rejected by server: %s", serverHello.RejectReason)
 	}
-	slog.Info("authenticated", "server_version", serverHello.ServerVersion)
+	slog.Info("authenticated", "server_version", serverHello.ServerVersion,
+		"cluster_id", serverHello.ClusterID,
+		"patroni_configured", serverHello.PatroniConfigured,
+		"app_tier_always_available", serverHello.AppTierAlwaysAvailable,
+	)
+	if c.OnServerHello != nil {
+		c.OnServerHello(serverHello)
+	}
 
 	// Run pumps
 	connCtx, connCancel := context.WithCancel(ctx)

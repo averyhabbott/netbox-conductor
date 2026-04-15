@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/server/media"
@@ -37,6 +39,7 @@ type AgentHandler struct {
 	taskResults   *queries.TaskResultQuerier
 	enc           *crypto.Encryptor
 	media         *media.Manager
+	failover      *failover.Manager
 	logDir        string
 	logName       string
 }
@@ -53,6 +56,7 @@ func NewAgentHandler(
 	taskResults *queries.TaskResultQuerier,
 	clusters *queries.ClusterQuerier,
 	enc *crypto.Encryptor,
+	fo *failover.Manager,
 	logDir, logName string,
 ) *AgentHandler {
 	return &AgentHandler{
@@ -68,6 +72,7 @@ func NewAgentHandler(
 		taskResults:   taskResults,
 		enc:           enc,
 		media:         media.NewManager(),
+		failover:      fo,
 		logDir:        logDir,
 		logName:       logName,
 	}
@@ -252,10 +257,12 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	nodeID := node.ID
 	clusterID := node.ClusterID
 
-	// Resolve cluster name for per-agent log file
+	// Look up cluster for logging and ServerHello config delivery.
+	var cluster *queries.Cluster
 	clusterName := clusterID.String()
-	if cluster, err := h.clusters.GetByID(ctx, clusterID); err == nil {
-		clusterName = cluster.Name
+	if c, err := h.clusters.GetByID(ctx, clusterID); err == nil {
+		clusterName = c.Name
+		cluster = c
 	}
 
 	agentLog := logging.OpenAgentLog(h.logDir, h.logName, clusterName, node.Hostname)
@@ -281,16 +288,29 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 				"node_id": nodeID,
 			},
 		})
+		if h.failover != nil {
+			h.failover.OnNodeDisconnect(nodeID, clusterID)
+		}
 		slog.Info("agent disconnected", "node", nodeID, "hostname", node.Hostname)
 	}()
 
 	_ = h.nodes.UpdateAgentStatus(ctx, nodeID, "connected")
 	_ = h.agentToks.Touch(ctx, crypto.HashToken(hello.Token))
+	if h.failover != nil {
+		h.failover.OnNodeConnect(nodeID, clusterID)
+	}
 
-	welcomePayload, _ := json.Marshal(protocol.ServerHelloPayload{
+	helloPayload := protocol.ServerHelloPayload{
 		Accepted:      true,
 		ServerVersion: serverVersion,
-	})
+	}
+	if cluster != nil {
+		helloPayload.ClusterID              = clusterID.String()
+		helloPayload.AppTierAlwaysAvailable = cluster.AppTierAlwaysAvailable
+		helloPayload.PatroniScope           = cluster.PatroniScope
+		helloPayload.PatroniConfigured      = cluster.PatroniConfigured
+	}
+	welcomePayload, _ := json.Marshal(helloPayload)
 	_ = wsjson.Write(ctx, conn, protocol.Envelope{
 		ID:      uuid.New().String(),
 		Type:    protocol.TypeServerHello,
@@ -313,9 +333,12 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	)
 	slog.Info("agent connected", "node", nodeID, "hostname", node.Hostname, "version", hello.AgentVersion)
 
-	// Re-dispatch tasks that were sent but never acked before this reconnect.
+	// Dispatch pending tasks on reconnect:
+	//   "sent"   tasks were in-flight before the last disconnect — re-send them.
+	//   "queued" tasks were created while the node was offline (e.g. a stop.netbox
+	//            enqueued to prevent split-brain) — dispatch them for the first time.
 	if pending, err := h.taskResults.ListPendingByNode(ctx, nodeID); err == nil && len(pending) > 0 {
-		slog.Info("re-dispatching pending tasks on reconnect", "node", nodeID, "count", len(pending))
+		slog.Info("dispatching pending tasks on reconnect", "node", nodeID, "count", len(pending))
 		for i := range pending {
 			t := &pending[i]
 			if len(t.RequestPayload) == 0 {
@@ -326,12 +349,17 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 				Type:    protocol.TypeTaskDispatch,
 				Payload: t.RequestPayload,
 			})
+			// Advance queued → sent; "sent" tasks are already in the correct state.
+			if t.Status == "queued" {
+				_ = h.taskResults.SetSent(ctx, t.TaskID)
+			}
 		}
 	}
 
 	pumpCtx, pumpCancel := context.WithCancel(ctx)
 	defer pumpCancel()
 
+	go sess.PingLoop(pumpCtx)
 	go sess.WritePump(pumpCtx)
 	h.readPump(pumpCtx, sess, conn, agentLog)
 
@@ -493,8 +521,26 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 		logger.Warn("heartbeat DB update failed", "error", err)
 	}
 
+	// Detect netbox_running transitions and notify the failover manager.
+	// prev == nil means this is the first heartbeat for this session — no transition to act on.
+	netboxRunningPtr := &hb.NetboxRunning
+	if prev, changed := sess.SetNetboxRunning(netboxRunningPtr); changed && prev != nil && h.failover != nil {
+		wasRunning := *prev
+		isRunning := hb.NetboxRunning
+		if wasRunning && !isRunning {
+			// NetBox stopped on a connected node — arm a failover grace timer.
+			go h.failover.OnNetboxStopped(sess.NodeID, sess.ClusterID)
+		} else if !wasRunning && isRunning {
+			// NetBox restarted — cancel any pending failover timer.
+			h.failover.OnNetboxStarted(sess.NodeID)
+		}
+	}
+
 	if hb.NetboxVersion != "" {
 		sess.NetboxVersion = hb.NetboxVersion
+		if err := h.clusters.UpdateNetboxVersion(ctx, sess.ClusterID, hb.NetboxVersion); err != nil {
+			logger.Warn("updating cluster netbox_version failed", "error", err)
+		}
 	}
 
 	// Heartbeats are Debug — they fire every 15s and would flood Info logs.
@@ -539,6 +585,64 @@ func (h *AgentHandler) handlePatroniState(ctx context.Context, sess *hub.Session
 			"prev_role": ps.PrevRole,
 		},
 	})
+
+	// When a node becomes the Patroni primary on an app_tier_always_available
+	// cluster, push the new primary's IP as DATABASE.HOST to all cluster nodes
+	// so every NetBox instance reconnects to the writable database immediately.
+	if ps.Role == "primary" {
+		go h.dispatchDBHostUpdate(context.Background(), sess.NodeID, sess.ClusterID)
+	}
+}
+
+// dispatchDBHostUpdate sends TaskUpdateDBHost to all connected nodes in the
+// cluster. Only runs for app_tier_always_available clusters with Patroni
+// configured; silently no-ops otherwise.
+func (h *AgentHandler) dispatchDBHostUpdate(ctx context.Context, newPrimaryNodeID, clusterID uuid.UUID) {
+	cluster, err := h.clusters.GetByID(ctx, clusterID)
+	if err != nil || !cluster.AppTierAlwaysAvailable || !cluster.PatroniConfigured {
+		return
+	}
+
+	newPrimary, err := h.nodes.GetByID(ctx, newPrimaryNodeID)
+	if err != nil {
+		slog.Warn("db-host-update: could not fetch new primary node", "node", newPrimaryNodeID, "error", err)
+		return
+	}
+
+	primaryIP := stripCIDR(newPrimary.IPAddress)
+	slog.Info("db-host-update: dispatching DATABASE.HOST update to all cluster nodes",
+		"cluster", clusterID, "new_primary", newPrimary.Hostname, "host", primaryIP)
+
+	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
+	if err != nil {
+		slog.Warn("db-host-update: could not list cluster nodes", "cluster", clusterID, "error", err)
+		return
+	}
+
+	params, _ := json.Marshal(protocol.DBHostUpdateParams{
+		Host:         primaryIP,
+		RestartAfter: true,
+	})
+
+	for _, node := range nodes {
+		if !h.hub.IsConnected(node.ID) {
+			slog.Debug("db-host-update: node not connected, skipping", "node", node.Hostname)
+			continue
+		}
+		taskID := uuid.New()
+		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskUpdateDBHost), params)
+		if err := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
+			TaskID:      taskID.String(),
+			TaskType:    protocol.TaskUpdateDBHost,
+			Params:      json.RawMessage(params),
+			TimeoutSecs: 60,
+		}); err != nil {
+			slog.Warn("db-host-update: dispatch failed", "node", node.Hostname, "error", err)
+		} else {
+			_ = h.taskResults.SetSent(ctx, taskID)
+			slog.Info("db-host-update: dispatched", "node", node.Hostname, "host", primaryIP)
+		}
+	}
 }
 
 func (h *AgentHandler) handleTaskAck(ctx context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
@@ -557,7 +661,11 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 	if err := json.Unmarshal(env.Payload, &result); err != nil {
 		return
 	}
-	logger.Info("task result", "task_id", result.TaskID, "success", result.Success, "duration_ms", result.DurationMs)
+	if result.Success {
+		logger.Info("task result", "task_id", result.TaskID, "success", true, "duration_ms", result.DurationMs)
+	} else {
+		logger.Warn("task result: failed", "task_id", result.TaskID, "error", result.ErrorMsg, "duration_ms", result.DurationMs)
+	}
 
 	if taskID, err := uuid.Parse(result.TaskID); err == nil {
 		responseJSON, _ := json.Marshal(map[string]any{
@@ -725,5 +833,159 @@ func (h *AgentHandler) StartMediaSync(c echo.Context) error {
 		"task_id":        taskID.String(),
 		"source_node_id": sourceNodeID.String(),
 		"target_node_id": targetNodeID.String(),
+	})
+}
+
+// ClusterMediaSync initiates a cluster-level media sync.
+// It auto-selects the most recently active connected app-tier or hyperconverged node
+// as the source, and dispatches sync tasks to all other connected app-tier or
+// hyperconverged nodes as targets.
+// POST /api/v1/clusters/:id/media-sync
+func (h *AgentHandler) ClusterMediaSync(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+	ctx := c.Request().Context()
+
+	cluster, err := h.clusters.GetByID(ctx, clusterID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	}
+	if !cluster.MediaSyncEnabled {
+		return echo.NewHTTPError(http.StatusConflict, "media sync is not enabled for this cluster")
+	}
+
+	allNodes, err := h.nodes.ListByCluster(ctx, clusterID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
+	}
+
+	// Only app-tier and hyperconverged nodes participate in media sync.
+	var appNodes []queries.Node
+	for _, n := range allNodes {
+		if n.Role == "app" || n.Role == "hyperconverged" {
+			appNodes = append(appNodes, n)
+		}
+	}
+	if len(appNodes) == 0 {
+		return echo.NewHTTPError(http.StatusConflict, "no app-tier or hyperconverged nodes in cluster")
+	}
+
+	// Source: most recently seen connected app node.
+	var source *queries.Node
+	for i := range appNodes {
+		n := &appNodes[i]
+		if !h.hub.IsConnected(n.ID) {
+			continue
+		}
+		if source == nil || (n.LastSeenAt != nil && (source.LastSeenAt == nil || n.LastSeenAt.After(*source.LastSeenAt))) {
+			source = n
+		}
+	}
+	if source == nil {
+		return echo.NewHTTPError(http.StatusConflict, "no connected app-tier or hyperconverged node available as sync source")
+	}
+
+	// Paths to sync: always includes MEDIA_ROOT (""), plus extra folders when enabled.
+	syncPaths := []string{""}
+	if cluster.ExtraFoldersSyncEnabled {
+		for _, p := range cluster.ExtraSyncFolders {
+			if p != "" {
+				syncPaths = append(syncPaths, p)
+			}
+		}
+	}
+
+	type syncResult struct {
+		TargetNodeID   string `json:"target_node_id"`
+		TargetHostname string `json:"target_hostname"`
+		TransferID     string `json:"transfer_id"`
+		TaskID         string `json:"task_id"`
+		SourcePath     string `json:"source_path,omitempty"`
+	}
+	var syncs []syncResult
+
+	for i := range appNodes {
+		target := &appNodes[i]
+		if target.ID == source.ID || !h.hub.IsConnected(target.ID) {
+			continue
+		}
+		for _, syncPath := range syncPaths {
+			transfer := h.media.Create(source.ID, target.ID)
+			taskID := uuid.New()
+			params, _ := json.Marshal(protocol.MediaSyncParams{
+				Direction:  "push_to_server",
+				SourcePath: syncPath,
+				ChunkSizeB: 64 * 1024,
+				TransferID: transfer.ID.String(),
+			})
+			_ = h.taskResults.Create(ctx, source.ID, taskID, string(protocol.TaskMediaSync), params)
+			if err := h.dispatcher.Dispatch(source.ID, protocol.TaskDispatchPayload{
+				TaskID:      taskID.String(),
+				TaskType:    protocol.TaskMediaSync,
+				Params:      json.RawMessage(params),
+				TimeoutSecs: 3600,
+			}); err != nil {
+				h.media.Remove(transfer.ID)
+				continue
+			}
+			_ = h.taskResults.SetSent(ctx, taskID)
+			syncs = append(syncs, syncResult{
+				TargetNodeID:   target.ID.String(),
+				TargetHostname: target.Hostname,
+				TransferID:     transfer.ID.String(),
+				TaskID:         taskID.String(),
+				SourcePath:     syncPath,
+			})
+		}
+	}
+
+	if len(syncs) == 0 {
+		return echo.NewHTTPError(http.StatusConflict, "no eligible target nodes to sync to")
+	}
+
+	return c.JSON(http.StatusAccepted, map[string]any{
+		"source_node_id":  source.ID.String(),
+		"source_hostname": source.Hostname,
+		"syncs":           syncs,
+	})
+}
+
+// SyncConfig returns the cluster-level media sync configuration for this node.
+// Used by the agent "check-sync-permissions" CLI command.
+// GET /api/v1/agent/sync-config
+func (h *AgentHandler) SyncConfig(c echo.Context) error {
+	raw := c.Request().Header.Get("Authorization")
+	rawToken, ok := strings.CutPrefix(raw, "Bearer ")
+	if !ok || rawToken == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "bearer token required")
+	}
+
+	ctx := c.Request().Context()
+	tok, err := h.agentToks.GetValid(ctx, crypto.HashToken(rawToken))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusUnauthorized, "invalid or revoked token")
+	}
+
+	node, err := h.nodes.GetByID(ctx, tok.NodeID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "node not found")
+	}
+
+	cluster, err := h.clusters.GetByID(ctx, node.ClusterID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	}
+
+	folders := cluster.ExtraSyncFolders
+	if folders == nil {
+		folders = []string{}
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"media_sync_enabled":          cluster.MediaSyncEnabled,
+		"extra_folders_sync_enabled":  cluster.ExtraFoldersSyncEnabled,
+		"extra_sync_folders":          folders,
 	})
 }

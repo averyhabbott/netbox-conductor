@@ -15,11 +15,21 @@ type Cluster struct {
 	Mode             string // "active_standby" | "ha"
 	AutoFailover     bool
 	AutoFailback     bool
+	AppTierAlwaysAvailable bool
+	FailoverOnMaintenance  bool
+	FailoverDelaySecs      int
 	VIP              *string
 	PatroniScope     string
 	NetboxVersion    string
 	NetboxSecretKey  []byte // encrypted
 	APITokenPepper   []byte // encrypted
+	// Media sync
+	MediaSyncEnabled        bool
+	ExtraFoldersSyncEnabled bool
+	ExtraSyncFolders        []string
+	// Patroni / HA
+	PatroniConfigured    bool
+	RedisSentinelMaster  string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
@@ -34,8 +44,13 @@ func NewClusterQuerier(pool *pgxpool.Pool) *ClusterQuerier {
 }
 
 const clusterColumns = `
-	id, name, mode, auto_failover, auto_failback, vip::text, patroni_scope,
-	netbox_version, netbox_secret_key, api_token_pepper, created_at, updated_at`
+	id, name, mode, auto_failover, auto_failback,
+	app_tier_always_available, failover_on_maintenance, failover_delay_secs,
+	vip::text, patroni_scope,
+	netbox_version, netbox_secret_key, api_token_pepper,
+	media_sync_enabled, extra_folders_sync_enabled, extra_sync_folders,
+	patroni_configured, redis_sentinel_master,
+	created_at, updated_at`
 
 func scanCluster(row interface {
 	Scan(...any) error
@@ -43,8 +58,11 @@ func scanCluster(row interface {
 	var c Cluster
 	if err := row.Scan(
 		&c.ID, &c.Name, &c.Mode, &c.AutoFailover, &c.AutoFailback,
+		&c.AppTierAlwaysAvailable, &c.FailoverOnMaintenance, &c.FailoverDelaySecs,
 		&c.VIP, &c.PatroniScope, &c.NetboxVersion,
 		&c.NetboxSecretKey, &c.APITokenPepper,
+		&c.MediaSyncEnabled, &c.ExtraFoldersSyncEnabled, &c.ExtraSyncFolders,
+		&c.PatroniConfigured, &c.RedisSentinelMaster,
 		&c.CreatedAt, &c.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -99,18 +117,74 @@ func (q *ClusterQuerier) Create(ctx context.Context, p CreateClusterParams) (*Cl
 }
 
 type UpdateClusterParams struct {
-	ID           uuid.UUID
-	AutoFailover bool
-	AutoFailback bool
-	VIP          *string
+	ID                     uuid.UUID
+	AutoFailover           bool
+	AutoFailback           bool
+	AppTierAlwaysAvailable bool
+	FailoverOnMaintenance  bool
+	FailoverDelaySecs      int
+	VIP                    *string
+	RedisSentinelMaster    string
 }
 
 func (q *ClusterQuerier) UpdateFailoverSettings(ctx context.Context, p UpdateClusterParams) error {
+	sentinel := p.RedisSentinelMaster
+	if sentinel == "" {
+		sentinel = "netbox"
+	}
 	_, err := q.pool.Exec(ctx, `
 		UPDATE clusters
-		SET auto_failover = $2, auto_failback = $3, vip = $4::inet, updated_at = now()
+		SET auto_failover             = $2,
+		    auto_failback             = $3,
+		    app_tier_always_available = $4,
+		    failover_on_maintenance   = $5,
+		    failover_delay_secs       = $6,
+		    vip                       = $7::inet,
+		    redis_sentinel_master     = $8,
+		    updated_at                = now()
 		WHERE id = $1
-	`, p.ID, p.AutoFailover, p.AutoFailback, p.VIP)
+	`, p.ID, p.AutoFailover, p.AutoFailback,
+		p.AppTierAlwaysAvailable, p.FailoverOnMaintenance, p.FailoverDelaySecs,
+		p.VIP, sentinel)
+	return err
+}
+
+// SetPatroniConfigured marks a cluster as having had Patroni fully configured.
+// Called at the end of a successful Configure Failover operation.
+func (q *ClusterQuerier) SetPatroniConfigured(ctx context.Context, clusterID uuid.UUID) error {
+	_, err := q.pool.Exec(ctx,
+		`UPDATE clusters SET patroni_configured = TRUE, updated_at = now() WHERE id = $1`,
+		clusterID)
+	return err
+}
+
+type UpdateMediaSyncParams struct {
+	ID                      uuid.UUID
+	MediaSyncEnabled        bool
+	ExtraFoldersSyncEnabled bool
+	ExtraSyncFolders        []string
+}
+
+func (q *ClusterQuerier) UpdateMediaSyncSettings(ctx context.Context, p UpdateMediaSyncParams) error {
+	folders := p.ExtraSyncFolders
+	if folders == nil {
+		folders = []string{}
+	}
+	_, err := q.pool.Exec(ctx, `
+		UPDATE clusters
+		SET media_sync_enabled = $2, extra_folders_sync_enabled = $3, extra_sync_folders = $4, updated_at = now()
+		WHERE id = $1
+	`, p.ID, p.MediaSyncEnabled, p.ExtraFoldersSyncEnabled, folders)
+	return err
+}
+
+// UpdateNetboxVersion sets the cluster's netbox_version to the value reported
+// by an agent heartbeat. Called at most once per unique version change.
+func (q *ClusterQuerier) UpdateNetboxVersion(ctx context.Context, clusterID uuid.UUID, version string) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE clusters SET netbox_version = $2, updated_at = now()
+		WHERE id = $1 AND netbox_version != $2
+	`, clusterID, version)
 	return err
 }
 

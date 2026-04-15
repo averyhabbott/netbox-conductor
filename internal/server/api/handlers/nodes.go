@@ -18,6 +18,12 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// NodeFailoverManager is the subset of failover.Manager used by NodeHandler.
+// Defined as an interface to avoid a direct package dependency.
+type NodeFailoverManager interface {
+	OnMaintenanceEnabled(nodeID, clusterID uuid.UUID)
+}
+
 // NodeHandler handles node CRUD and registration token endpoints.
 type NodeHandler struct {
 	nodes       *queries.NodeQuerier
@@ -31,6 +37,13 @@ type NodeHandler struct {
 	serverURL   string // base URL shown to operators in ENV snippet
 	logDir      string
 	logName     string
+	failover    NodeFailoverManager // optional; wired in after construction
+}
+
+// SetFailoverManager attaches the failover manager so that putting a node into
+// maintenance mode can trigger automatic failover when configured.
+func (h *NodeHandler) SetFailoverManager(fm NodeFailoverManager) {
+	h.failover = fm
 }
 
 func NewNodeHandler(
@@ -490,6 +503,13 @@ func (h *NodeHandler) SetMaintenance(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch node")
 	}
+
+	// When enabling maintenance, give the failover manager a chance to move
+	// NetBox off this node if the cluster policy requires it.
+	if body.Enabled && h.failover != nil {
+		go h.failover.OnMaintenanceEnabled(nid, node.ClusterID)
+	}
+
 	return c.JSON(http.StatusOK, toNodeResponse(node))
 }
 
@@ -606,6 +626,15 @@ NETBOX_MEDIA_ROOT=/opt/netbox/netbox/media
 # ── Patroni ───────────────────────────────────────────────────────────────────
 
 PATRONI_REST_URL=http://127.0.0.1:8008
+
+# ── Status server ─────────────────────────────────────────────────────────────
+# Local HTTP health endpoint used by the node's nginx/Apache reverse proxy.
+# The proxy exposes GET /status on HTTPS so health-checkers never need to reach
+# the agent port directly. Default binds to loopback only (127.0.0.1:8081).
+# Set to 0.0.0.0:8081 only if your LB must reach the agent port directly.
+# Leave empty to disable the status server entirely.
+
+AGENT_STATUS_ADDR=127.0.0.1:8081
 `,
 		node.Hostname,
 		time.Now().UTC().Format(time.RFC3339),

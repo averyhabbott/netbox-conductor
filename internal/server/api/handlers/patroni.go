@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -17,14 +19,15 @@ import (
 
 // PatroniHandler handles Patroni topology queries and config push.
 type PatroniHandler struct {
-	clusters    *queries.ClusterQuerier
-	nodes       *queries.NodeQuerier
-	creds       *queries.CredentialQuerier
-	taskResults *queries.TaskResultQuerier
-	retention   *queries.RetentionQuerier
-	enc         *crypto.Encryptor
-	dispatcher  *hub.Dispatcher
-	witness     *patroni.WitnessManager
+	clusters       *queries.ClusterQuerier
+	nodes          *queries.NodeQuerier
+	creds          *queries.CredentialQuerier
+	taskResults    *queries.TaskResultQuerier
+	retention      *queries.RetentionQuerier
+	failoverEvents *queries.FailoverEventQuerier
+	enc            *crypto.Encryptor
+	dispatcher     *hub.Dispatcher
+	witness        *patroni.WitnessManager
 }
 
 func NewPatroniHandler(
@@ -33,19 +36,21 @@ func NewPatroniHandler(
 	creds *queries.CredentialQuerier,
 	taskResults *queries.TaskResultQuerier,
 	retention *queries.RetentionQuerier,
+	failoverEvents *queries.FailoverEventQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	witness *patroni.WitnessManager,
 ) *PatroniHandler {
 	return &PatroniHandler{
-		clusters:    clusters,
-		nodes:       nodes,
-		creds:       creds,
-		taskResults: taskResults,
-		retention:   retention,
-		enc:         enc,
-		dispatcher:  dispatcher,
-		witness:     witness,
+		clusters:       clusters,
+		nodes:          nodes,
+		creds:          creds,
+		taskResults:    taskResults,
+		retention:      retention,
+		failoverEvents: failoverEvents,
+		enc:            enc,
+		dispatcher:     dispatcher,
+		witness:        witness,
 	}
 }
 
@@ -938,4 +943,413 @@ func (h *PatroniHandler) EnforceRetention(c echo.Context) error {
 		"hostname": targetNode.Hostname,
 		"status":   "dispatched",
 	})
+}
+
+// ConfigureFailover is the single-button HA setup endpoint.
+// It saves failover settings, auto-generates any missing credentials,
+// starts the Patroni witness on the conductor, optionally backs up the
+// primary database, pushes patroni.yml + restarts Patroni on all nodes,
+// and (when app_tier_always_available=true) pushes Sentinel config.
+// POST /api/v1/clusters/:id/configure-failover
+func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+
+	var req struct {
+		AutoFailover           bool    `json:"auto_failover"`
+		AutoFailback           bool    `json:"auto_failback"`
+		AppTierAlwaysAvailable bool    `json:"app_tier_always_available"`
+		FailoverOnMaintenance  bool    `json:"failover_on_maintenance"`
+		FailoverDelaySecs      int     `json:"failover_delay_secs"`
+		VIP                    *string `json:"vip"`
+		RedisSentinelMaster    string  `json:"redis_sentinel_master"`
+		SaveBackup             bool    `json:"save_backup"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	if req.FailoverDelaySecs <= 0 {
+		req.FailoverDelaySecs = 30
+	}
+	if req.RedisSentinelMaster == "" {
+		req.RedisSentinelMaster = "netbox"
+	}
+
+	ctx := c.Request().Context()
+
+	slog.Info("configure-failover: request received",
+		"cluster", clusterID,
+		"auto_failover", req.AutoFailover,
+		"app_tier_always_available", req.AppTierAlwaysAvailable,
+		"save_backup", req.SaveBackup,
+	)
+
+	cluster, err := h.clusters.GetByID(ctx, clusterID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	}
+	if cluster.Mode != "active_standby" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Configure Failover is only available for active_standby clusters")
+	}
+
+	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
+	}
+	if len(nodes) < 2 {
+		return echo.NewHTTPError(http.StatusBadRequest, "cluster must have at least 2 nodes before configuring failover")
+	}
+
+	// Persist failover settings
+	if err := h.clusters.UpdateFailoverSettings(ctx, queries.UpdateClusterParams{
+		ID:                     clusterID,
+		AutoFailover:           req.AutoFailover,
+		AutoFailback:           req.AutoFailback,
+		AppTierAlwaysAvailable: req.AppTierAlwaysAvailable,
+		FailoverOnMaintenance:  req.FailoverOnMaintenance,
+		FailoverDelaySecs:      req.FailoverDelaySecs,
+		VIP:                    req.VIP,
+		RedisSentinelMaster:    req.RedisSentinelMaster,
+	}); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to save failover settings")
+	}
+
+	// Auto-generate any missing credentials so the operator never has to
+	// visit the Credentials tab before clicking Configure Failover.
+	warnings := make([]string, 0)
+	for _, def := range []struct {
+		kind     string
+		username string
+		dbName   *string
+	}{
+		{"postgres_superuser", "postgres", nil},
+		{"postgres_replication", "replicator", nil},
+		{"patroni_rest_password", "patroni", nil},
+		{"redis_password", "redis", nil},
+	} {
+		if _, err := h.creds.GetByKind(ctx, clusterID, def.kind); err != nil {
+			raw, genErr := crypto.GenerateToken(32)
+			if genErr != nil {
+				warnings = append(warnings, fmt.Sprintf("could not generate %s credential: %v", def.kind, genErr))
+				continue
+			}
+			enc, encErr := h.enc.Encrypt([]byte(raw))
+			if encErr != nil {
+				warnings = append(warnings, fmt.Sprintf("could not encrypt %s credential: %v", def.kind, encErr))
+				continue
+			}
+			if err := h.creds.Upsert(ctx, queries.UpsertCredentialParams{
+				ClusterID:   clusterID,
+				Kind:        def.kind,
+				Username:    def.username,
+				PasswordEnc: enc,
+				DBName:      def.dbName,
+			}); err != nil {
+				slog.Warn("configure-failover: failed to store auto-generated credential",
+					"cluster", clusterID, "kind", def.kind, "error", err)
+				warnings = append(warnings, fmt.Sprintf("failed to store %s credential: %v", def.kind, err))
+			}
+		}
+	}
+
+	// Decrypt credentials for config rendering
+	superUser, superPass := "postgres", ""
+	replicaUser, replicaPass := "replicator", ""
+	restUser, restPass := "patroni", ""
+	redisPassword := ""
+
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_superuser"); err == nil {
+		superUser = cred.Username
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			superPass = string(pw)
+		}
+	}
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_replication"); err == nil {
+		replicaUser = cred.Username
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			replicaPass = string(pw)
+		}
+	}
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+		restUser = cred.Username
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			restPass = string(pw)
+		}
+	}
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_password"); err == nil {
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			redisPassword = string(pw)
+		}
+	}
+
+	// Identify primary: prefer Patroni state, fall back to netbox_running=true.
+	// Reject ambiguous states (0 or 2+ primaries) to prevent split-brain setup.
+	var primaryNode *queries.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if n.PatroniState != nil {
+			var ps map[string]any
+			if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
+				primaryNode = n
+				break
+			}
+		}
+	}
+	if primaryNode == nil {
+		for i := range nodes {
+			n := &nodes[i]
+			if n.NetboxRunning != nil && *n.NetboxRunning && n.AgentStatus == "connected" {
+				if primaryNode != nil {
+					return echo.NewHTTPError(http.StatusConflict,
+						"multiple nodes report netbox_running=true — cannot safely determine primary. "+
+							"Stop NetBox on all but one node before configuring failover.")
+				}
+				primaryNode = n
+			}
+		}
+	}
+	if primaryNode == nil {
+		return echo.NewHTTPError(http.StatusConflict,
+			"cannot identify primary node: no connected node reports netbox_running=true or patroni role=primary. "+
+				"Ensure at least one node is connected and running NetBox.")
+	}
+
+	// Build Raft peer list (all nodes participate in Raft consensus)
+	raftPeers := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":5433")
+	}
+
+	// Start witness on conductor (idempotent — no-op if already running)
+	witnessAddr := ""
+	if h.witness != nil {
+		if err := h.witness.Start(clusterID, raftPeers); err != nil {
+			slog.Error("configure-failover: failed to start Patroni witness",
+				"cluster", clusterID, "error", err)
+			warnings = append(warnings, "witness start failed: "+err.Error())
+		} else {
+			witnessAddr = h.witness.Addr(clusterID)
+			slog.Info("configure-failover: Patroni witness started",
+				"cluster", clusterID, "witness_addr", witnessAddr)
+		}
+	}
+
+	type taskRef struct {
+		NodeID   string `json:"node_id"`
+		Hostname string `json:"hostname"`
+		TaskID   string `json:"task_id,omitempty"`
+		Status   string `json:"status"`
+		Error    string `json:"error,omitempty"`
+	}
+
+	// Helper: create + dispatch a task, advance to sent on success.
+	dispatch := func(nodeID uuid.UUID, taskType protocol.TaskType, params []byte, timeoutSecs int) (string, error) {
+		tid := uuid.New()
+		_ = h.taskResults.Create(ctx, nodeID, tid, string(taskType), params)
+		if err := h.dispatcher.Dispatch(nodeID, protocol.TaskDispatchPayload{
+			TaskID:      tid.String(),
+			TaskType:    taskType,
+			Params:      json.RawMessage(params),
+			TimeoutSecs: timeoutSecs,
+		}); err != nil {
+			return "", err
+		}
+		_ = h.taskResults.SetSent(ctx, tid)
+		return tid.String(), nil
+	}
+
+	// Optional database backup before any destructive operations.
+	// Fire-and-forget: the operator can track progress via the task list.
+	// Patroni config dispatch proceeds regardless so the operator isn't
+	// blocked if the backup takes a long time.
+	var backupTask *taskRef
+	if req.SaveBackup {
+		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
+		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"backup dispatch failed (primary not connected?): %v — proceeding without backup", err))
+		} else {
+			backupTask = &taskRef{
+				NodeID:   primaryNode.ID.String(),
+				Hostname: primaryNode.Hostname,
+				TaskID:   tid,
+				Status:   "dispatched",
+			}
+		}
+	}
+
+	// Push patroni.yml to every node, then restart Patroni.
+	// Both tasks are dispatched per-node; Patroni handles leader election
+	// automatically when all nodes start simultaneously with the new config.
+	patroniTasks := make([]taskRef, 0, len(nodes)*2)
+	for _, node := range nodes {
+		nodeIP := stripCIDR(node.IPAddress)
+
+		// Per-node partner list excludes self
+		partners := make([]string, 0, len(raftPeers)-1)
+		for _, p := range raftPeers {
+			if !strings.HasPrefix(p, nodeIP+":") {
+				partners = append(partners, p)
+			}
+		}
+
+		content, err := configgen.RenderPatroni(configgen.PatroniInput{
+			Scope:         cluster.PatroniScope,
+			NodeName:      node.Hostname,
+			NodeAddr:      nodeIP,
+			RaftSelfAddr:  nodeIP + ":5433",
+			RaftPartners:  partners,
+			WitnessAddr:   witnessAddr,
+			RESTUsername:  restUser,
+			RESTPassword:  restPass,
+			DBSuperUser:   superUser,
+			DBSuperPass:   superPass,
+			DBReplicaUser: replicaUser,
+			DBReplicaPass: replicaPass,
+		})
+		if err != nil {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				Status: "error", Error: "render: " + err.Error(),
+			})
+			continue
+		}
+
+		cfgParams, _ := json.Marshal(protocol.PatroniConfigWriteParams{Content: content})
+		if tid, err := dispatch(node.ID, protocol.TaskWritePatroniConf, cfgParams, 30); err != nil {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				Status: "offline", Error: err.Error(),
+			})
+		} else {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				TaskID: tid, Status: "dispatched",
+			})
+		}
+
+		restartParams, _ := json.Marshal(struct{}{})
+		if tid, err := dispatch(node.ID, protocol.TaskRestartPatroni, restartParams, 60); err != nil {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				Status: "offline", Error: "restart: " + err.Error(),
+			})
+		} else {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				TaskID: tid, Status: "dispatched",
+			})
+		}
+	}
+
+	// Push Sentinel config when app tier is always available.
+	// Sentinel auth password (redis_password) is written into sentinel.conf
+	// so all nodes and the Redis client library use the same secret.
+	sentinelTasks := make([]taskRef, 0)
+	if req.AppTierAlwaysAvailable {
+		masterHost := stripCIDR(primaryNode.IPAddress)
+		for _, node := range nodes {
+			nodeIP := stripCIDR(node.IPAddress)
+			content, sha256hex, err := configgen.RenderSentinel(configgen.SentinelInput{
+				Scope:      req.RedisSentinelMaster,
+				MasterHost: masterHost,
+				BindAddr:   nodeIP,
+				Password:   redisPassword,
+			})
+			if err != nil {
+				sentinelTasks = append(sentinelTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					Status: "error", Error: "render: " + err.Error(),
+				})
+				continue
+			}
+			sParams, _ := json.Marshal(protocol.SentinelConfigWriteParams{
+				Content:      content,
+				Sha256:       sha256hex,
+				RestartAfter: true,
+			})
+			if tid, err := dispatch(node.ID, protocol.TaskWriteSentinelConf, sParams, 30); err != nil {
+				sentinelTasks = append(sentinelTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					Status: "offline", Error: err.Error(),
+				})
+			} else {
+				sentinelTasks = append(sentinelTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					TaskID: tid, Status: "dispatched",
+				})
+			}
+		}
+	}
+
+	// For app_tier_always_available clusters, pre-set DATABASE.HOST on every
+	// node to the identified primary's IP. This ensures all NetBox instances
+	// connect to the correct primary before Patroni finishes electing a leader.
+	// RestartAfter=false here — the Patroni restart tasks already trigger a
+	// service restart cascade; NetBox will be started by the failover manager
+	// or the operator as appropriate.
+	if req.AppTierAlwaysAvailable {
+		primaryIP := stripCIDR(primaryNode.IPAddress)
+		dbParams, _ := json.Marshal(protocol.DBHostUpdateParams{
+			Host:         primaryIP,
+			RestartAfter: false,
+		})
+		for _, node := range nodes {
+			tid, err := dispatch(node.ID, protocol.TaskUpdateDBHost, dbParams, 30)
+			if err != nil {
+				slog.Warn("configure-failover: db-host-update dispatch failed",
+					"node", node.Hostname, "error", err)
+				warnings = append(warnings, fmt.Sprintf(
+					"db-host-update dispatch failed for %s: %v", node.Hostname, err))
+			} else {
+				slog.Info("configure-failover: db-host-update dispatched",
+					"node", node.Hostname, "host", primaryIP, "task", tid)
+			}
+		}
+	}
+
+	if err := h.clusters.SetPatroniConfigured(ctx, clusterID); err != nil {
+		slog.Warn("configure-failover: failed to mark cluster as configured",
+			"cluster", clusterID, "error", err)
+	}
+
+	slog.Info("configure-failover: complete",
+		"cluster", clusterID,
+		"primary_node", primaryNode.Hostname,
+		"witness_addr", witnessAddr,
+		"patroni_nodes", len(patroniTasks),
+		"sentinel_nodes", len(sentinelTasks),
+		"warnings", len(warnings),
+	)
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"cluster_id":     clusterID.String(),
+		"witness_addr":   witnessAddr,
+		"primary_node":   primaryNode.Hostname,
+		"backup_task":    backupTask,
+		"patroni_tasks":  patroniTasks,
+		"sentinel_tasks": sentinelTasks,
+		"warnings":       warnings,
+	})
+}
+
+// ListFailoverEvents returns the most recent failover/failback events for a cluster.
+// GET /api/v1/clusters/:id/failover-events
+func (h *PatroniHandler) ListFailoverEvents(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+
+	events, err := h.failoverEvents.ListByCluster(c.Request().Context(), clusterID, 50)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list failover events")
+	}
+	if events == nil {
+		events = []queries.FailoverEvent{}
+	}
+	return c.JSON(http.StatusOK, events)
 }

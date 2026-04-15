@@ -11,18 +11,20 @@ A management platform for orchestrating multi-node [NetBox](https://netboxlabs.c
 No inbound firewall rules are needed on agent hosts — all traffic is agent-initiated.
 
 ```
-┌─────────────────────────────────────────────┐
-│             NetBox Conductor                │
-│  (web UI + API + task dispatcher)           │
-└──────────────┬──────────────────────────────┘
-               │ wss:// (outbound from agent)
-       ┌───────┴────────┐
-       │                │
-┌──────▼──────┐  ┌──────▼──────┐
-│  nbfa-1     │  │  nbfa-2     │
-│  netbox-    │  │  netbox-    │
-│  agent      │  │  agent      │
-└─────────────┘  └─────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                       NetBox Conductor                           │
+│  (web UI + API + task dispatcher + Patroni witness)              │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │ wss:// (outbound from agents)
+          ┌────────┴─────────┐
+          │                  │
+┌─────────▼──────┐  ┌────────▼────────┐
+│    nbfa-1      │  │    nbfa-2       │
+│  netbox-agent  │  │  netbox-agent   │
+│  Patroni       │  │  Patroni        │
+│  PostgreSQL    │  │  PostgreSQL     │
+│  Redis         │  │  Redis          │
+└────────────────┘  └─────────────────┘
 ```
 
 ---
@@ -46,22 +48,68 @@ No inbound firewall rules are needed on agent hosts — all traffic is agent-ini
 - Restart Patroni, Redis, or Redis Sentinel
 - All actions dispatched as WebSocket tasks with full result tracking
 
-### PostgreSQL HA (Patroni)
-- Live cluster topology view
-- Switchover and manual failover from the UI
-- Push `patroni.yml` config to all nodes
-- Install Patroni on a node (dispatches `patroni.install` task)
-- DB Restore: reinitialize replica or pgBackRest point-in-time recovery
-- Retention policy: set retention days and expire command; run expire on demand
-- Built-in witness node (lightweight pysyncobj subprocess on Conductor) for 2-node tie-breaking
+### PostgreSQL HA — Configure Failover
+
+The **Configure Failover** button on a cluster's Settings tab is the single-step HA setup. It:
+
+1. Saves failover settings to the database
+2. Auto-generates any missing credentials (postgres superuser, replication user, Patroni REST password, Redis password)
+3. Starts the Conductor's built-in Patroni witness subprocess — the third Raft voter that gives 2-node clusters quorum without a third data node
+4. Optionally runs `pg_dump` on the primary database before making any changes
+5. Renders and pushes `patroni.yml` to every node (with per-node Raft peer lists and witness address)
+6. Restarts the Patroni service on each node
+7. If `App Tier Always Available` is enabled: renders and pushes Redis Sentinel config to every node, and pre-seeds the correct `DATABASE.HOST` on all nodes
+8. Marks the cluster as configured
+
+**Patroni RAFT consensus** uses the built-in DCS (no external etcd/Consul required). The Conductor acts as the third Raft member via `patroni_raft_controller`, providing quorum in 2-node clusters without a dedicated witness VM.
+
+**`failsafe_mode: true`** is set in all generated configs — the primary continues serving if it loses contact with the standby, preventing a split-brain shutdown in a 2-node cluster.
+
+### Automatic Failover & Failback
+- Triggered by agent disconnect, heartbeat reporting NetBox stopped, or entering maintenance mode
+- Configurable grace period (default 30 s) before failover fires — allows transient outages to self-heal
+- 90-second startup suppression window after Conductor restart (prevents mass-trigger when all agents reconnect)
+- Split-brain prevention: `stop.netbox` is queued for the failed node and executed on reconnect
+- Maintenance-mode failover: moves NetBox off a node the moment it enters maintenance
+- Auto-failback: when a higher-priority node reconnects and is healthy, NetBox moves back after one grace period
+- All events (failover, failback, maintenance moves) are recorded in the **History** tab with trigger, from/to node, and outcome
+
+### App Tier Always Available
+
+When enabled, all nodes always run NetBox — there is no single "active" node. The load balancer steers using `GET /status` and Patroni handles the database primary election independently.
+
+- All nodes' `configuration.py` points `DATABASE.HOST` at the current Patroni primary's IP
+- When Patroni elects a new primary (via `patroni.state` message from the agent), the Conductor automatically dispatches `config.update_db_host` to all connected cluster nodes to update `DATABASE.HOST` and restart NetBox
+- Redis Sentinel provides Redis HA; all nodes connect to the Sentinel master
+
+When disabled (active/standby), `configuration.py` always points `DATABASE.HOST` to `localhost`. Only one node runs NetBox at a time; the LB steers based on `GET /status` alone.
+
+### Health Checks (`GET /status`)
+
+The agent serves a lightweight health endpoint for VIP health checkers and reverse proxies:
+
+| Mode | 200 OK condition |
+|---|---|
+| Patroni not configured | `netbox.service` is active |
+| App tier always available | `netbox.service` is active |
+| Active/standby + Patroni | `netbox.service` active **AND** local Patroni `/primary` returns 200 |
+
+In active/standby mode the `/status` check is gated on Patroni primary status. This ensures the load balancer routes only to the node whose local PostgreSQL is writable — no traffic reaches a replica even if NetBox is still running there during a transition.
+
+Response body always includes `patroni_primary` when relevant:
+```json
+{"status":"ok","netbox":true,"rq":true,"node_id":"<uuid>","patroni_primary":true}
+```
 
 ### Redis Sentinel
 - Push Sentinel configuration across the cluster
 - Sentinel addresses auto-derived from node IPs (port 26379)
+- Auth password stored as an encrypted cluster credential
 
 ### Media Sync
 - Relay NetBox media files between nodes through the Conductor (no direct node-to-node SSH required)
 - Chunked transfer with backpressure
+- Extra sync folders configurable per cluster
 
 ### Agent Pool (Staging)
 - Deploy agents to servers before assigning them to a cluster
@@ -81,6 +129,7 @@ No inbound firewall rules are needed on agent hosts — all traffic is agent-ini
 - Agent log viewer (agent logs + NetBox application logs, per-file selector)
 - Prometheus metrics endpoint (`/metrics`)
 - Server-Sent Events for real-time UI updates
+- **Failover history tab** per cluster: time, type, trigger, from/to node, outcome
 
 ---
 
@@ -92,7 +141,7 @@ No inbound firewall rules are needed on agent hosts — all traffic is agent-ini
 | Frontend | React 18 + TypeScript + Vite + Tailwind CSS v4 |
 | Database | PostgreSQL (pgx/v5 driver) |
 | Agent protocol | WebSocket + JSON envelopes |
-| HA | Patroni (Raft consensus), Redis Sentinel |
+| HA | Patroni (built-in Raft DCS), Redis Sentinel |
 | Auth | JWT (RS256), bcrypt, AES-256-GCM, TOTP |
 
 The server binary embeds the compiled frontend (`go:embed`), so there is only one file to deploy. The agent is a separate static binary compiled for the target platform.
@@ -202,10 +251,6 @@ make build-all
 #   bin/netbox-conductor-linux-arm64
 #   bin/netbox-agent-linux-amd64
 #   bin/netbox-agent-linux-arm64
-
-# Build for development (current OS)
-make build-server   # server for local OS
-make build-agent    # agent for local OS
 ```
 
 ### Server Setup
@@ -360,7 +405,7 @@ There are two ways to install the agent on a managed node:
 1. In the Conductor UI, navigate to your cluster and click **Add Node**
 2. Complete Step 1 (hostname, IP, role) and Step 2 (install agent):
    ```bash
-   curl -fsSL https://your-conductor.example.com:8443/api/v1/downloads/agent-linux-amd64 \
+   curl -fsSLk https://your-conductor.example.com:8443/api/v1/downloads/agent-linux-amd64 \
      -o netbox-agent.tar.gz
    tar -xzf netbox-agent.tar.gz
    sudo bash install.sh
@@ -417,7 +462,7 @@ UPDATE_CERT=true
 NETBOX_CONFIG_PATH=/opt/netbox/netbox/netbox/configuration.py
 NETBOX_MEDIA_ROOT=/opt/netbox/netbox/media
 
-# Patroni (default is fine for standard install)
+# Patroni REST API (default is fine for standard install)
 PATRONI_REST_URL=http://127.0.0.1:8008
 ```
 
@@ -427,6 +472,83 @@ sudo systemctl enable --now netbox-agent
 ```
 
 The node will appear as **Connected** in the Conductor UI once the agent authenticates.
+
+---
+
+### Reverse Proxy Health Checks
+
+The agent exposes a lightweight health check endpoint that reverse proxies and VIP health-checkers use to steer traffic.
+
+```
+GET https://<node>/status
+```
+
+#### Health check logic
+
+| Cluster state | Returns 200 if… |
+|---|---|
+| Patroni not yet configured | `netbox.service` is active |
+| App tier always available | `netbox.service` is active (all nodes eligible) |
+| Active/standby + Patroni configured | `netbox.service` active **AND** `GET http://127.0.0.1:8008/primary` returns 200 |
+
+In active/standby mode the Patroni primary check ensures the load balancer never routes to a replica node, even if NetBox is still in the process of shutting down during a failover transition.
+
+Response body:
+```json
+{"status":"ok","netbox":true,"rq":true,"node_id":"<uuid>","patroni_primary":true}
+```
+`patroni_primary` is omitted when Patroni is not configured or the cluster is always-available.
+
+#### How it works
+
+The agent binds the status server to `127.0.0.1:8081` (loopback only) by default. The node's nginx or Apache reverse proxy exposes `GET /status` on the public HTTPS port. Health checkers probe `https://<node>/status` and never need direct access to the agent port.
+
+**Setup** — copy the provided example config to the node's reverse proxy:
+
+```bash
+# nginx (Debian/Ubuntu)
+sudo cp deployments/agent/nginx-netbox-conductor.conf /etc/nginx/sites-available/netbox
+sudo ln -s /etc/nginx/sites-available/netbox /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# Apache (Debian/Ubuntu)
+sudo cp deployments/agent/apache-netbox-conductor.conf /etc/apache2/sites-available/netbox.conf
+sudo a2enmod proxy proxy_http ssl rewrite headers
+sudo a2ensite netbox
+sudo apache2ctl configtest && sudo systemctl reload apache2
+```
+
+These configs are drop-in replacements for the standard NetBox nginx/Apache configs. They add a single `location = /status` block (nginx) or `<Location /status>` block (Apache) that proxies requests to `127.0.0.1:8081`.
+
+> **SELinux (RHEL/CentOS/Rocky):** if nginx or Apache cannot connect to 127.0.0.1:8081, enable the policy:
+>
+> ```bash
+> sudo setsebool -P httpd_can_network_connect 1
+> ```
+
+> **Direct agent port access:** If your load balancer must probe the agent port directly (e.g. a remote HAProxy with no access to port 443), set `AGENT_STATUS_ADDR=0.0.0.0:8081` in the agent env file. The endpoint is then reachable at `http://<node>:8081/status`.
+
+Controlled by `AGENT_STATUS_ADDR` in the agent env file (default `127.0.0.1:8081`; empty string disables the server). The legacy `AGENT_STATUS_PORT` integer variable is still accepted for backward compatibility.
+
+#### HAProxy
+
+HAProxy checks `https://<node>/status` on port 443 — the same port as application traffic, served by the node's reverse proxy.
+
+```haproxy
+frontend netbox_frontend
+    bind *:443 ssl crt /etc/ssl/certs/haproxy.pem
+    default_backend netbox_backends
+
+backend netbox_backends
+    option httpchk GET /status
+    http-check expect status 200
+
+    # Both nodes checked via HTTPS; nb-2 is standby (backup)
+    server nb-1 nb-1.example.com:443 ssl verify none check inter 10s fall 2 rise 1
+    server nb-2 nb-2.example.com:443 ssl verify none check inter 10s fall 2 rise 1 backup
+```
+
+HAProxy marks a server down after 2 consecutive failed checks (`fall 2`) and brings it back after 1 passing check (`rise 1`). In active/standby mode only `nb-1` receives traffic; `nb-2` takes over automatically when `nb-1` returns 503.
 
 ---
 
@@ -493,10 +615,10 @@ make typecheck  # TypeScript type check
 For the OrbStack dev environment:
 
 ```bash
-# Build and push conductor to nbfa-tool
+# Build and push conductor to nb-conductor@orb
 bash testing/deploy.sh
 
-# Also push agent binary, service file, and sudoers to nbfa-1 and nbfa-2
+# Also push agent binary, service file, and sudoers to nb-1 and nb-2
 bash testing/deploy.sh --agents
 ```
 
@@ -510,17 +632,18 @@ Items are roughly ordered by priority.
 
 | Item | Description |
 |---|---|
+| **Failover outcome verification** | After dispatching `start.netbox` to a candidate, confirm via heartbeat; retry next candidate if the first fails within a configurable window |
+| **Restore from backup** | UI to trigger `pg_dump` restore from a previously saved backup file |
 | **Patroni install UI** | Button on Node Detail to trigger `patroni.install` task; executor already implemented |
-| **Redis Sentinel config editor** | Dedicated UI panel (config push already works, no editor) |
-| **Dashboard live status** | SSE-driven summary cards (connected agents, cluster health) instead of redirect to cluster list |
 
 ### Medium-term
 
 | Item | Description |
 |---|---|
 | **NetBox upgrade orchestration** | One-click rolling upgrade: upgrade standby → validate → migrate primary → upgrade old primary |
-| **Task timeout sweep** | Server background job to move stale `sent`/`ack` tasks to `timeout` status |
-| **ClusterDetail topology graph** | Visual Patroni topology diagram |
+| **Cluster-wide failover freeze** | Operator-toggled flag to suppress all automatic failovers during maintenance windows |
+| **Failback safety checks** | Verify replica lag before failing back to a reconnected node |
+| **Persistent failover history export** | CSV/JSON download of the failover events table |
 
 ### Long-term / Wishlist
 
@@ -528,7 +651,6 @@ Items are roughly ordered by priority.
 |---|---|
 | **OAuth2 / LDAP / SAML** | External identity provider support |
 | **Playwright E2E tests** | Browser-level integration test suite |
-| **Additional media sync folders** | User-defined extra sync paths beyond MEDIA_ROOT |
 | **Graceful shutdown drain** | Close WebSocket sessions cleanly on SIGTERM before process exit |
 
 ---
@@ -547,21 +669,23 @@ netbox-conductor/
 ├── internal/
 │   ├── agent/
 │   │   ├── config/      # Agent env file loading, validation, and cert-learning
-│   │   ├── executor/    # Task implementations (config write, Patroni, media sync, upgrade, etc.)
-│   │   └── ws/          # WebSocket client (connect, reconnect, heartbeat)
+│   │   ├── executor/    # Task implementations (config write, db host update, Patroni, media sync, upgrade, etc.)
+│   │   ├── statusserver/ # Local HTTP health endpoint (Patroni-aware in active/standby mode)
+│   │   └── ws/          # WebSocket client (connect, reconnect, heartbeat, OnServerHello callback)
 │   ├── server/
 │   │   ├── api/
 │   │   │   ├── handlers/ # HTTP endpoint implementations
 │   │   │   ├── middleware/ # Auth, audit, rate limiting
 │   │   │   └── router.go  # All route registrations
-│   │   ├── configgen/   # NetBox configuration.py template renderer
+│   │   ├── configgen/   # NetBox configuration.py and Patroni/Sentinel config renderers
 │   │   ├── crypto/      # AES-256-GCM encryption helpers
 │   │   ├── db/
 │   │   │   ├── migrations/ # SQL migration files (golang-migrate)
-│   │   │   └── queries/    # DB query implementations
+│   │   │   └── queries/    # DB query implementations (clusters, nodes, failover_events, …)
+│   │   ├── failover/    # Automatic failover/failback manager; records events to failover_events table
 │   │   ├── hub/         # WebSocket session registry and dispatcher
 │   │   ├── logging/     # Structured JSON logging, per-agent log files
-│   │   ├── patroni/     # Witness subprocess management
+│   │   ├── patroni/     # Witness subprocess management (patroni_raft_controller)
 │   │   ├── scheduler/   # Background jobs (health checks, task timeouts)
 │   │   ├── sse/         # Server-Sent Events broker
 │   │   └── tlscert/     # TLS cert auto-generation
@@ -573,7 +697,7 @@ netbox-conductor/
     └── src/
         ├── api/         # Axios API client modules
         ├── components/  # Shared React components
-        ├── pages/       # Page-level React components
+        ├── pages/       # Page-level React components (ClusterDetail, Dashboard, …)
         └── store/       # Zustand state stores
 ```
 

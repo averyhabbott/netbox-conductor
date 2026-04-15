@@ -5,7 +5,6 @@ import { clustersApi } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import client from '../api/client'
 import Layout from '../components/Layout'
-import type { Node } from '../api/nodes'
 import { useAuthStore } from '../store/auth'
 
 interface LogsData {
@@ -287,102 +286,6 @@ function DBRestoreModal({
   )
 }
 
-function MediaSyncCard({
-  sourceNodeId,
-  clusterId,
-  currentNode,
-}: {
-  sourceNodeId: string
-  clusterId: string
-  currentNode: Node
-}) {
-  const [targetNodeId, setTargetNodeId] = useState('')
-  const [sourcePath, setSourcePath] = useState('')
-  const [result, setResult] = useState<{ transfer_id: string; task_id: string } | null>(null)
-
-  const { data: siblings } = useQuery({
-    queryKey: ['nodes', clusterId],
-    queryFn: () => nodesApi.list(clusterId),
-    enabled: !!clusterId,
-  })
-
-  const otherNodes = (siblings ?? []).filter((n) => n.id !== sourceNodeId)
-
-  const startSync = useMutation({
-    mutationFn: () =>
-      client
-        .post<{ transfer_id: string; task_id: string }>(
-          `/clusters/${clusterId}/nodes/${sourceNodeId}/media-sync`,
-          {
-            target_node_id: targetNodeId,
-            source_path: sourcePath || undefined,
-          }
-        )
-        .then((r) => r.data),
-    onSuccess: (data) => setResult(data),
-  })
-
-  return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 md:col-span-2">
-      <h3 className="font-medium mb-1">Media Sync</h3>
-      <p className="text-xs text-gray-500 mb-4">
-        Push <code className="font-mono">MEDIA_ROOT</code> from this node to another node in the cluster via the Conductor relay.
-      </p>
-
-      <div className="space-y-3">
-        <div className="flex items-end gap-3">
-          <div className="flex-1">
-            <label className="block text-xs text-gray-400 mb-1">Target node</label>
-            <select
-              value={targetNodeId}
-              onChange={(e) => setTargetNodeId(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-            >
-              <option value="">Select target…</option>
-              {otherNodes.map((n) => (
-                <option key={n.id} value={n.id} disabled={n.agent_status !== 'connected'}>
-                  {n.hostname}
-                  {n.agent_status !== 'connected' ? ' (offline)' : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-          <button
-            onClick={() => { setResult(null); startSync.mutate() }}
-            disabled={!targetNodeId || startSync.isPending || currentNode.agent_status !== 'connected'}
-            className="px-4 py-2 text-sm bg-blue-700 hover:bg-blue-600 disabled:opacity-40 rounded-lg transition-colors"
-          >
-            {startSync.isPending ? 'Starting…' : 'Start sync'}
-          </button>
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">
-            Source path <span className="text-gray-600">(optional — defaults to MEDIA_ROOT)</span>
-          </label>
-          <input
-            type="text"
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-blue-500"
-            placeholder="/opt/netbox/netbox/media"
-            value={sourcePath}
-            onChange={(e) => setSourcePath(e.target.value)}
-          />
-        </div>
-      </div>
-
-      {startSync.isError && (
-        <p className="text-xs text-red-400 mt-2">
-          {(startSync.error as any)?.response?.data?.message ?? 'Sync failed to start'}
-        </p>
-      )}
-      {result && (
-        <div className="mt-3 text-xs text-emerald-400 bg-emerald-900/20 border border-emerald-800 rounded px-3 py-2">
-          Sync started — transfer <span className="font-mono">{result.transfer_id.slice(0, 8)}…</span>
-          {' '}(task <span className="font-mono">{result.task_id.slice(0, 8)}…</span>)
-        </div>
-      )}
-    </div>
-  )
-}
 
 // ── RemoveNodeDialog ───────────────────────────────────────────────────────────
 
@@ -627,6 +530,19 @@ export default function NodeDetail() {
   const [actionResult, setActionResult] = useState<{ success: boolean; message: string } | null>(null)
   const [showDBRestore, setShowDBRestore] = useState(false)
   const [showRemoveNode, setShowRemoveNode] = useState(false)
+  const [showNetboxMenu, setShowNetboxMenu] = useState(false)
+  const netboxMenuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!showNetboxMenu) return
+    const handler = (e: MouseEvent) => {
+      if (netboxMenuRef.current && !netboxMenuRef.current.contains(e.target as HTMLElement)) {
+        setShowNetboxMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showNetboxMenu])
 
   const removeNode = useMutation({
     mutationFn: () => nodesApi.delete(id!, nid!),
@@ -758,7 +674,7 @@ export default function NodeDetail() {
         </div>
 
         {/* Service controls */}
-        <div className="flex gap-2 flex-wrap">
+        <div className="flex gap-2 flex-wrap items-center">
           <button
             onClick={downloadEnv}
             disabled={envDownloading}
@@ -769,28 +685,40 @@ export default function NodeDetail() {
           {userRole === 'admin' && (
             <button
               onClick={() => setShowDBRestore(true)}
-              className="bg-red-900/50 hover:bg-red-900 border border-red-800 text-red-400 hover:text-red-300 text-sm px-3 py-1.5 rounded-lg transition-colors"
+              className="bg-amber-900/40 hover:bg-amber-900/70 border border-amber-800 text-amber-400 hover:text-amber-300 text-sm px-3 py-1.5 rounded-lg transition-colors"
             >
               DB Restore
             </button>
           )}
-          {serviceActions.map(({ label, action }) => (
+          {/* NetBox service actions dropdown */}
+          <div className="relative" ref={netboxMenuRef}>
             <button
-              key={action}
-              onClick={() => serviceAction.mutate(action)}
+              onClick={() => setShowNetboxMenu((v) => !v)}
               disabled={serviceAction.isPending || restartRQ.isPending || node.agent_status !== 'connected'}
               className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
             >
-              {label}
+              NetBox ▾
             </button>
-          ))}
-          <button
-            onClick={() => restartRQ.mutate()}
-            disabled={serviceAction.isPending || restartRQ.isPending || node.agent_status !== 'connected'}
-            className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
-          >
-            Restart RQ
-          </button>
+            {showNetboxMenu && (
+              <div className="absolute right-0 top-full mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-10 min-w-max">
+                {serviceActions.map(({ label, action }) => (
+                  <button
+                    key={action}
+                    onClick={() => { setShowNetboxMenu(false); serviceAction.mutate(action) }}
+                    className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-700 first:rounded-t-lg transition-colors"
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button
+                  onClick={() => { setShowNetboxMenu(false); restartRQ.mutate() }}
+                  className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-700 rounded-b-lg transition-colors"
+                >
+                  Restart RQ
+                </button>
+              </div>
+            )}
+          </div>
           {userRole === 'admin' && (
             <button
               onClick={() => setShowRemoveNode(true)}
@@ -921,9 +849,6 @@ export default function NodeDetail() {
             </table>
           )}
         </div>
-
-        {/* Media Sync */}
-        <MediaSyncCard sourceNodeId={nid!} clusterId={id!} currentNode={node} />
 
         {/* Logs */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 md:col-span-2">

@@ -1,5 +1,5 @@
 import { useReducer, useCallback } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
 import type { ClusterStatus } from '../api/clusters'
@@ -147,7 +147,7 @@ function DonutChart({
   )
 }
 
-// ── Cluster health dot ────────────────────────────────────────────────────────
+// ── Health dot ────────────────────────────────────────────────────────────────
 
 const HEALTH_DOT_BG: Record<HealthStatus, string> = {
   healthy: 'bg-emerald-400',
@@ -155,7 +155,7 @@ const HEALTH_DOT_BG: Record<HealthStatus, string> = {
   offline: 'bg-red-500',
 }
 
-function ClusterHealthDot({ status }: { status: HealthStatus }) {
+function HealthDot({ status }: { status: HealthStatus }) {
   return (
     <span
       className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${HEALTH_DOT_BG[status]}`}
@@ -167,6 +167,7 @@ function ClusterHealthDot({ status }: { status: HealthStatus }) {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
+  const navigate = useNavigate()
   const qc = useQueryClient()
   const [feed, dispatch] = useReducer(feedReducer, [])
 
@@ -224,20 +225,32 @@ export default function Dashboard() {
   const totalClusters = clusters?.length ?? 0
   const totalNodes = nodeHealthCounts.healthy + nodeHealthCounts.degraded + nodeHealthCounts.offline
 
+  // Flat node list for the nodes panel (includes cluster_id from parent status)
+  const allStatusNodes = clusterStatuses?.flatMap((s) =>
+    s.nodes.map((n) => ({ ...n, cluster_id: s.cluster_id }))
+  ) ?? []
+
   return (
     <Layout>
       <h2 className="text-2xl font-semibold mb-6">Dashboard</h2>
 
-      {/* Health pie charts */}
+      {/* Health pie charts — clickable */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 flex items-center justify-center">
+        <div
+          onClick={() => navigate('/clusters')}
+          className="bg-gray-900 border border-gray-800 rounded-xl p-8 flex items-center justify-center cursor-pointer hover:border-gray-700 transition-colors"
+        >
           <DonutChart counts={clusterHealthCounts} total={totalClusters} label="Clusters" />
         </div>
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 flex items-center justify-center">
+        <div
+          onClick={() => navigate('/nodes')}
+          className="bg-gray-900 border border-gray-800 rounded-xl p-8 flex items-center justify-center cursor-pointer hover:border-gray-700 transition-colors"
+        >
           <DonutChart counts={nodeHealthCounts} total={totalNodes} label="Nodes" />
         </div>
       </div>
 
+      {/* Clusters and Nodes lists */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         {/* Clusters list */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
@@ -272,7 +285,7 @@ export default function Dashboard() {
                       to={`/clusters/${c.id}`}
                       className="flex items-center gap-3 px-6 py-3 hover:bg-gray-800/40 transition-colors"
                     >
-                      <ClusterHealthDot status={health} />
+                      <HealthDot status={health} />
                       <span className="font-medium text-sm">{c.name}</span>
                     </Link>
                   </li>
@@ -282,51 +295,87 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Live event feed */}
+        {/* Nodes list */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
-            <div className="flex items-center gap-2">
-              <h3 className="font-medium">Live Events</h3>
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            </div>
-            <button
-              onClick={() => dispatch({ type: 'clear' })}
-              className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
+            <h3 className="font-medium">Nodes</h3>
+            <Link
+              to="/nodes"
+              className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
             >
-              Clear
-            </button>
+              View all →
+            </Link>
           </div>
 
-          {feed.length === 0 ? (
-            <div className="px-6 py-8 text-center text-gray-500 text-sm">
-              Waiting for events…
+          {allStatusNodes.length === 0 ? (
+            <div className="p-8 text-center">
+              <p className="text-gray-500 text-sm">No nodes configured yet.</p>
             </div>
           ) : (
-            <div className="max-h-96 overflow-y-auto divide-y divide-gray-800">
-              {feed.map((entry) => (
-                <div key={entry.id} className="px-6 py-2.5 flex items-start gap-3">
-                  <span
-                    className={`text-xs font-mono mt-0.5 flex-shrink-0 ${eventTypeColor[entry.type] ?? 'text-gray-400'}`}
-                  >
-                    {entry.type}
-                  </span>
-                  <span className="text-xs text-gray-300 flex-1 min-w-0 break-words">
-                    {entry.summary}
-                  </span>
-                  <span className="text-xs text-gray-600 flex-shrink-0">
-                    {entry.ts.toLocaleTimeString()}
-                  </span>
-                </div>
-              ))}
-            </div>
+            <ul className="divide-y divide-gray-800">
+              {allStatusNodes.map((n) => {
+                const health = nodeHealth(n)
+                return (
+                  <li key={n.node_id}>
+                    <Link
+                      to={`/clusters/${n.cluster_id}/nodes/${n.node_id}`}
+                      className="flex items-center gap-3 px-6 py-3 hover:bg-gray-800/40 transition-colors"
+                    >
+                      <HealthDot status={health} />
+                      <span className="font-medium text-sm">{n.hostname}</span>
+                    </Link>
+                  </li>
+                )
+              })}
+            </ul>
           )}
         </div>
       </div>
 
       {/* Active Alerts */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
         <p className="text-sm text-gray-400 mb-1">Active Alerts</p>
         <p className="text-3xl font-semibold">0</p>
+      </div>
+
+      {/* Live event feed — full width */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium">Live Events</h3>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          </div>
+          <button
+            onClick={() => dispatch({ type: 'clear' })}
+            className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
+          >
+            Clear
+          </button>
+        </div>
+
+        {feed.length === 0 ? (
+          <div className="px-6 py-8 text-center text-gray-500 text-sm">
+            Waiting for events…
+          </div>
+        ) : (
+          <div className="max-h-96 overflow-y-auto divide-y divide-gray-800">
+            {feed.map((entry) => (
+              <div key={entry.id} className="px-6 py-2.5 flex items-start gap-3">
+                <span
+                  className={`text-xs font-mono mt-0.5 flex-shrink-0 ${eventTypeColor[entry.type] ?? 'text-gray-400'}`}
+                >
+                  {entry.type}
+                </span>
+                <span className="text-xs text-gray-300 flex-1 min-w-0 break-words">
+                  {entry.summary}
+                </span>
+                <span className="text-xs text-gray-600 flex-shrink-0">
+                  {entry.ts.toLocaleTimeString()}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </Layout>
   )

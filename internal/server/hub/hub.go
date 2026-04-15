@@ -153,6 +153,19 @@ func (h *Hub) IsConnectedStaging(stagingID uuid.UUID) bool {
 	return ok
 }
 
+// NetboxVersionForCluster returns the NetBox version reported by any connected
+// node that belongs to clusterID, or "" if none are connected / reporting.
+func (h *Hub) NetboxVersionForCluster(clusterID uuid.UUID) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, s := range h.sessions {
+		if s.ClusterID == clusterID && s.NetboxVersion != "" {
+			return s.NetboxVersion
+		}
+	}
+	return ""
+}
+
 // UnregisterCluster closes and removes all sessions that belong to clusterID.
 // Used during cluster deletion to disconnect every agent at once.
 func (h *Hub) UnregisterCluster(clusterID uuid.UUID) {

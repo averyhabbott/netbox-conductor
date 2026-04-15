@@ -260,7 +260,7 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
 
               <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre-wrap">
 {`# Download the agent package
-curl -fsSL ${window.location.origin}/api/v1/downloads/agent-linux-${arch} \\
+curl -fsSLk ${window.location.origin}/api/v1/downloads/agent-linux-${arch} \\
   -o netbox-agent.tar.gz
 tar -xzf netbox-agent.tar.gz
 

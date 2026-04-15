@@ -37,6 +37,14 @@ type Config struct {
 
 	// Patroni
 	PatroniRESTURL string
+
+	// Status server
+	// Local HTTP server that returns 200/503 based on whether netbox.service is
+	// active. Binds to loopback by default; accessed through the node's nginx/Apache
+	// reverse proxy which exposes /status on the public HTTPS port.
+	// Empty string disables the server.
+	// Env var: AGENT_STATUS_ADDR (preferred) or legacy AGENT_STATUS_PORT (int).
+	StatusAddr string
 }
 
 // Load reads configuration from the ENV file at path (if set) plus the
@@ -60,6 +68,7 @@ func Load(envFile string) (*Config, error) {
 		NetboxLogPath:         os.Getenv("NETBOX_LOG_PATH"),
 		PatroniRESTURL:        envOr("PATRONI_REST_URL", "http://127.0.0.1:8008"),
 		ReconnectIntervalSecs: envInt("AGENT_RECONNECT_INTERVAL_SECS", 10),
+		StatusAddr:            envStatusAddr(),
 	}
 
 	skipVerify := strings.ToLower(os.Getenv("AGENT_TLS_SKIP_VERIFY"))
@@ -96,6 +105,19 @@ func (c *Config) validate() error {
 // IsRegistered reports whether the agent has a NodeID and Token set.
 func (c *Config) IsRegistered() bool {
 	return c.NodeID != "" && c.Token != ""
+}
+
+// envStatusAddr resolves the status server bind address.
+// Checks AGENT_STATUS_ADDR first (new), then falls back to AGENT_STATUS_PORT
+// (legacy int) for backward compatibility. Default: 127.0.0.1:8081.
+func envStatusAddr() string {
+	if v := os.Getenv("AGENT_STATUS_ADDR"); v != "" {
+		return v
+	}
+	if port := envInt("AGENT_STATUS_PORT", 0); port > 0 {
+		return fmt.Sprintf("127.0.0.1:%d", port)
+	}
+	return "127.0.0.1:8081"
 }
 
 func envOr(key, fallback string) string {

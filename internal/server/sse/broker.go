@@ -16,10 +16,12 @@ import (
 type EventType string
 
 const (
-	EventNodeStatus   EventType = "node.status"    // agent connected/disconnected
-	EventNodeHeartbeat EventType = "node.heartbeat" // heartbeat metrics
-	EventTaskComplete EventType = "task.complete"   // task result received
-	EventPatroniState EventType = "patroni.state"   // patroni role change
+	EventNodeStatus    EventType = "node.status"      // agent connected/disconnected
+	EventNodeHeartbeat EventType = "node.heartbeat"   // heartbeat metrics
+	EventTaskComplete  EventType = "task.complete"    // task result received
+	EventPatroniState  EventType = "patroni.state"    // patroni role change
+	EventFailoverTriggered EventType = "failover.triggered" // automatic failover fired
+	EventFailbackTriggered EventType = "failback.triggered" // automatic failback fired
 )
 
 // Event is a single SSE message.

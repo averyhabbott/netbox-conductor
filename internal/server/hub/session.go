@@ -12,6 +12,16 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
+const (
+	// pingInterval is how often the server sends a WebSocket ping to detect
+	// dead connections. A hard-crashed agent (OOM kill, kernel panic) will not
+	// send a close frame, so without active pings the read deadline is TCP
+	// keepalive — potentially minutes. With pings, detection is
+	// pingInterval + pongDeadline ≈ 40 s.
+	pingInterval = 30 * time.Second
+	pongDeadline = 10 * time.Second
+)
+
 // Session represents a single authenticated agent WebSocket connection.
 type Session struct {
 	NodeID          uuid.UUID
@@ -28,9 +38,10 @@ type Session struct {
 	// The write pump drains it; callers should never block on it.
 	send chan protocol.Envelope
 
-	mu          sync.Mutex
-	connectedAt time.Time
-	lastSeen    time.Time
+	mu             sync.Mutex
+	connectedAt    time.Time
+	lastSeen       time.Time
+	netboxRunning  *bool // last value reported by a heartbeat; nil = not yet seen
 }
 
 // NewSession creates a new authenticated agent session.
@@ -93,4 +104,44 @@ func (s *Session) WritePump(ctx context.Context) {
 			cancel()
 		}
 	}
+}
+
+// PingLoop sends a WebSocket ping every pingInterval and waits up to pongDeadline
+// for a pong response. If the pong times out (e.g. agent hard-crashed), the
+// connection is force-closed so readPump exits and the disconnect path fires.
+// Runs in its own goroutine alongside WritePump.
+func (s *Session) PingLoop(ctx context.Context) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, pongDeadline)
+			err := s.conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				// Pong timed out or connection already closed. Force close so
+				// readPump exits and the normal disconnect handling fires.
+				s.conn.CloseNow()
+				return
+			}
+		}
+	}
+}
+
+// SetNetboxRunning records the latest netbox_running value from a heartbeat.
+// Returns (previousValue, changed) so callers can detect true↔false transitions.
+// prev is nil when no heartbeat has been seen yet (first update).
+func (s *Session) SetNetboxRunning(running *bool) (prev *bool, changed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.netboxRunning
+	// Detect value change — treat nil as "unknown" (not equal to true or false).
+	oldVal := old != nil && *old
+	newVal := running != nil && *running
+	changed = (old == nil) != (running == nil) || oldVal != newVal
+	s.netboxRunning = running
+	return old, changed
 }

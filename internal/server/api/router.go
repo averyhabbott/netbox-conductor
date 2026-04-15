@@ -99,6 +99,8 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/clusters", cfg.ClusterHandler.Create, mw.RequireRole("operator"))
 	protected.GET("/clusters/:id", cfg.ClusterHandler.Get)
 	protected.PATCH("/clusters/:id/failover-settings", cfg.ClusterHandler.UpdateFailoverSettings, mw.RequireRole("operator"))
+	protected.PATCH("/clusters/:id/media-sync-settings", cfg.ClusterHandler.UpdateMediaSyncSettings, mw.RequireRole("operator"))
+	protected.POST("/clusters/:id/media-sync", cfg.AgentHandler.ClusterMediaSync, mw.RequireRole("operator"))
 	protected.DELETE("/clusters/:id", cfg.ClusterHandler.Delete, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/status", cfg.ClusterHandler.Status)
 
@@ -133,6 +135,8 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.GET("/clusters/:id/patroni/topology", cfg.PatroniHandler.Topology)
 	protected.POST("/clusters/:id/patroni/switchover", cfg.PatroniHandler.Switchover, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/patroni/failover", cfg.PatroniHandler.Failover, mw.RequireRole("admin"))
+	protected.POST("/clusters/:id/configure-failover", cfg.PatroniHandler.ConfigureFailover, mw.RequireRole("admin"))
+	protected.GET("/clusters/:id/failover-events", cfg.PatroniHandler.ListFailoverEvents)
 	protected.POST("/clusters/:id/patroni/push-config", cfg.PatroniHandler.PushPatroniConfig, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/patroni/witness/start", cfg.PatroniHandler.StartWitness, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/patroni/history", cfg.PatroniHandler.History)
@@ -262,6 +266,7 @@ func New(cfg RouterConfig) *echo.Echo {
 	v1.POST("/agent/register", cfg.AgentHandler.Register)
 	v1.POST("/agent/staging-register", cfg.AgentHandler.StagingRegister)
 	v1.GET("/agent/connect", cfg.AgentHandler.Connect)
+	v1.GET("/agent/sync-config", cfg.AgentHandler.SyncConfig)
 
 	// ── Binary downloads (unauthenticated) ─────────────────────────────────
 	e.GET("/api/v1/downloads/agent-linux-amd64", cfg.DownloadHandler.AgentBinary("amd64"))

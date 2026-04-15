@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
+import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import type { Node } from '../api/nodes'
 import { credentialsApi, credentialLabels } from '../api/credentials'
@@ -73,6 +74,7 @@ function ServiceBadge({ running, label }: { running: boolean | null; label: stri
 }
 
 function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
+  const navigate = useNavigate()
   const qc = useQueryClient()
   const upgrade = useMutation({
     mutationFn: () => nodesApi.upgradeAgent(clusterId, node.id),
@@ -84,16 +86,14 @@ function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
     node.agent_version !== CURRENT_AGENT_VERSION
 
   return (
-    <tr className="border-b border-gray-800 last:border-0 hover:bg-gray-800/40">
+    <tr
+      onClick={() => navigate(`/clusters/${clusterId}/nodes/${node.id}`)}
+      className="border-b border-gray-800 last:border-0 hover:bg-gray-800/40 cursor-pointer"
+    >
       <td className="px-6 py-4">
         <div className="flex items-center gap-2">
           <HealthDot status={node.health_status} />
-          <Link
-            to={`/clusters/${clusterId}/nodes/${node.id}`}
-            className="font-medium hover:text-blue-400 transition-colors"
-          >
-            {node.hostname}
-          </Link>
+          <span className="font-medium">{node.hostname}</span>
           {node.maintenance_mode && (
             <span className="text-xs px-1.5 py-0.5 rounded bg-amber-900/50 text-amber-400 border border-amber-800">
               maintenance
@@ -112,7 +112,7 @@ function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
             v{node.agent_version}
             {upgradeAvailable && (
               <button
-                onClick={() => upgrade.mutate()}
+                onClick={(e) => { e.stopPropagation(); upgrade.mutate() }}
                 disabled={upgrade.isPending}
                 className="ml-2 text-amber-400 hover:text-amber-300 disabled:opacity-40"
                 title={`Upgrade from v${node.agent_version} to v${CURRENT_AGENT_VERSION}`}
@@ -466,7 +466,7 @@ function RetentionCard({ clusterId }: { clusterId: string }) {
   )
 }
 
-// ── Patroni tab ───────────────────────────────────────────────────────────────
+// ── Shared push-result list ───────────────────────────────────────────────────
 
 function PushResultList({ results }: { results: PushResult[] }) {
   if (!results.length) return null
@@ -491,10 +491,9 @@ function PushResultList({ results }: { results: PushResult[] }) {
   )
 }
 
-function PatroniTab({ clusterId }: { clusterId: string }) {
-  const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
-  const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)
-  const [sentinelRestart, setSentinelRestart] = useState(false)
+// ── Database tab (topology, history, failover ops, retention) ─────────────────
+
+function DatabaseTab({ clusterId }: { clusterId: string }) {
   const [failoverMsg, setFailoverMsg] = useState<string | null>(null)
 
   const { data: topology, isLoading: topoLoading, refetch: refetchTopo } = useQuery({
@@ -507,16 +506,6 @@ function PatroniTab({ clusterId }: { clusterId: string }) {
     queryKey: ['patroni-history', clusterId],
     queryFn: () => patroniApi.history(clusterId),
     refetchInterval: 30_000,
-  })
-
-  const pushPatroni = useMutation({
-    mutationFn: () => patroniApi.pushPatroniConfig(clusterId),
-    onSuccess: (data) => setPatroniPushResult(data.nodes),
-  })
-
-  const pushSentinel = useMutation({
-    mutationFn: () => patroniApi.pushSentinelConfig(clusterId, sentinelRestart),
-    onSuccess: (data) => setSentinelPushResult(data.nodes),
   })
 
   const switchover = useMutation({
@@ -538,7 +527,7 @@ function PatroniTab({ clusterId }: { clusterId: string }) {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {/* Topology */}
+      {/* Topology + History */}
       <div className="lg:col-span-2 space-y-4">
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
@@ -590,7 +579,6 @@ function PatroniTab({ clusterId }: { clusterId: string }) {
           )}
         </div>
 
-        {/* History */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <h3 className="font-medium mb-3">Task History</h3>
           {histLoading ? (
@@ -628,50 +616,8 @@ function PatroniTab({ clusterId }: { clusterId: string }) {
         </div>
       </div>
 
-      {/* Actions panel */}
+      {/* Actions */}
       <div className="space-y-4">
-        {/* Push Patroni config */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <h3 className="font-medium mb-1">Push Patroni Config</h3>
-          <p className="text-xs text-gray-500 mb-3">
-            Renders and writes <code className="font-mono">patroni.yml</code> to all DB/hyperconverged nodes.
-          </p>
-          <button
-            onClick={() => { setPatroniPushResult(null); pushPatroni.mutate() }}
-            disabled={pushPatroni.isPending}
-            className="w-full text-sm py-2 bg-blue-700 hover:bg-blue-600 disabled:opacity-40 rounded-lg transition-colors"
-          >
-            {pushPatroni.isPending ? 'Pushing…' : 'Push patroni.yml'}
-          </button>
-          {patroniPushResult && <PushResultList results={patroniPushResult} />}
-        </div>
-
-        {/* Push Sentinel config */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <h3 className="font-medium mb-1">Push Sentinel Config</h3>
-          <p className="text-xs text-gray-500 mb-3">
-            Renders and writes <code className="font-mono">sentinel.conf</code> to all nodes using the Redis password credential.
-          </p>
-          <label className="flex items-center gap-2 text-xs text-gray-400 mb-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={sentinelRestart}
-              onChange={(e) => setSentinelRestart(e.target.checked)}
-              className="rounded border-gray-600"
-            />
-            Restart redis-sentinel after write
-          </label>
-          <button
-            onClick={() => { setSentinelPushResult(null); pushSentinel.mutate() }}
-            disabled={pushSentinel.isPending}
-            className="w-full text-sm py-2 bg-purple-700 hover:bg-purple-600 disabled:opacity-40 rounded-lg transition-colors"
-          >
-            {pushSentinel.isPending ? 'Pushing…' : 'Push sentinel.conf'}
-          </button>
-          {sentinelPushResult && <PushResultList results={sentinelPushResult} />}
-        </div>
-
-        {/* Switchover */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <h3 className="font-medium mb-1">Switchover</h3>
           <p className="text-xs text-gray-500 mb-3">
@@ -694,7 +640,6 @@ function PatroniTab({ clusterId }: { clusterId: string }) {
           )}
         </div>
 
-        {/* Failover */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <h3 className="font-medium mb-1">Manual Failover</h3>
           <p className="text-xs text-gray-500 mb-3">
@@ -714,8 +659,84 @@ function PatroniTab({ clusterId }: { clusterId: string }) {
           )}
         </div>
 
-        {/* Retention */}
         <RetentionCard clusterId={clusterId} />
+      </div>
+    </div>
+  )
+}
+
+// ── Deployment tab (config editor + push Patroni + push Sentinel) ─────────────
+
+function DeploymentTab({ clusterId }: { clusterId: string }) {
+  const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
+  const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)
+  const [sentinelRestart, setSentinelRestart] = useState(false)
+
+  const pushPatroni = useMutation({
+    mutationFn: () => patroniApi.pushPatroniConfig(clusterId),
+    onSuccess: (data) => setPatroniPushResult(data.nodes),
+  })
+
+  const pushSentinel = useMutation({
+    mutationFn: () => patroniApi.pushSentinelConfig(clusterId, sentinelRestart),
+    onSuccess: (data) => setSentinelPushResult(data.nodes),
+  })
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+      {/* NetBox configuration.py */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h3 className="font-medium mb-1">NetBox Configuration</h3>
+        <p className="text-xs text-gray-500 mb-4">
+          Edit and push <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">configuration.py</code> to all nodes in this cluster.
+        </p>
+        <Link
+          to={`/clusters/${clusterId}/config`}
+          className="inline-block bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+        >
+          Open Config Editor →
+        </Link>
+      </div>
+
+      {/* Push Patroni config */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h3 className="font-medium mb-1">Push Patroni Config</h3>
+        <p className="text-xs text-gray-500 mb-4">
+          Renders and writes <code className="font-mono text-xs">patroni.yml</code> to all DB/hyperconverged nodes.
+        </p>
+        <button
+          onClick={() => { setPatroniPushResult(null); pushPatroni.mutate() }}
+          disabled={pushPatroni.isPending}
+          className="w-full text-sm py-2 bg-blue-700 hover:bg-blue-600 disabled:opacity-40 rounded-lg transition-colors"
+        >
+          {pushPatroni.isPending ? 'Pushing…' : 'Push patroni.yml'}
+        </button>
+        {patroniPushResult && <PushResultList results={patroniPushResult} />}
+      </div>
+
+      {/* Push Sentinel config */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h3 className="font-medium mb-1">Push Sentinel Config</h3>
+        <p className="text-xs text-gray-500 mb-4">
+          Renders and writes <code className="font-mono text-xs">sentinel.conf</code> to all nodes using the Redis password credential.
+        </p>
+        <label className="flex items-center gap-2 text-xs text-gray-400 mb-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={sentinelRestart}
+            onChange={(e) => setSentinelRestart(e.target.checked)}
+            className="rounded border-gray-600"
+          />
+          Restart redis-sentinel after write
+        </label>
+        <button
+          onClick={() => { setSentinelPushResult(null); pushSentinel.mutate() }}
+          disabled={pushSentinel.isPending}
+          className="w-full text-sm py-2 bg-purple-700 hover:bg-purple-600 disabled:opacity-40 rounded-lg transition-colors"
+        >
+          {pushSentinel.isPending ? 'Pushing…' : 'Push sentinel.conf'}
+        </button>
+        {sentinelPushResult && <PushResultList results={sentinelPushResult} />}
       </div>
     </div>
   )
@@ -804,7 +825,551 @@ function AuditTab({ clusterId }: { clusterId: string }) {
   )
 }
 
-type Tab = 'nodes' | 'configuration' | 'patroni' | 'settings' | 'audit'
+// ── Failover card ─────────────────────────────────────────────────────────────
+
+function FailoverToggle({
+  label,
+  description,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string
+  description: string
+  checked: boolean
+  onChange: (v: boolean) => void
+  disabled?: boolean
+}) {
+  return (
+    <label className="flex items-start justify-between gap-4 py-3 border-b border-gray-800 cursor-pointer last:border-0">
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-gray-200">{label}</p>
+        <p className="text-xs text-gray-500 mt-0.5">{description}</p>
+      </div>
+      <button
+        role="switch"
+        aria-checked={checked}
+        onClick={() => onChange(!checked)}
+        disabled={disabled}
+        className={`relative shrink-0 mt-0.5 w-10 h-5 rounded-full transition-colors ${checked ? 'bg-blue-600' : 'bg-gray-700'} disabled:opacity-40 disabled:cursor-not-allowed`}
+      >
+        <span
+          className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${checked ? 'translate-x-5' : 'translate-x-0'}`}
+        />
+      </button>
+    </label>
+  )
+}
+
+function FailoverCard({ cluster }: { cluster: Cluster }) {
+  const qc = useQueryClient()
+
+  const [autoFailover, setAutoFailover] = useState(cluster.auto_failover)
+  const [autoFailback, setAutoFailback] = useState(cluster.auto_failback)
+  const [appTierAlwaysAvailable, setAppTierAlwaysAvailable] = useState(cluster.app_tier_always_available)
+  const [failoverOnMaintenance, setFailoverOnMaintenance] = useState(cluster.failover_on_maintenance)
+  const [delaySecs, setDelaySecs] = useState(String(cluster.failover_delay_secs || 30))
+  const [sentinelMaster, setSentinelMaster] = useState(cluster.redis_sentinel_master || 'netbox')
+  const [saveBackup, setSaveBackup] = useState(true)
+
+  // Warning modal state (shown when Patroni is already configured)
+  const [showWarning, setShowWarning] = useState(false)
+
+  // Result panel shown after a successful configure
+  const [result, setResult] = useState<ConfigureFailoverResult | null>(null)
+
+  // Stay in sync if parent cluster data refreshes
+  useEffect(() => {
+    setAutoFailover(cluster.auto_failover)
+    setAutoFailback(cluster.auto_failback)
+    setAppTierAlwaysAvailable(cluster.app_tier_always_available)
+    setFailoverOnMaintenance(cluster.failover_on_maintenance)
+    setDelaySecs(String(cluster.failover_delay_secs || 30))
+    setSentinelMaster(cluster.redis_sentinel_master || 'netbox')
+  }, [
+    cluster.auto_failover,
+    cluster.auto_failback,
+    cluster.app_tier_always_available,
+    cluster.failover_on_maintenance,
+    cluster.failover_delay_secs,
+    cluster.redis_sentinel_master,
+  ])
+
+  const configure = useMutation({
+    mutationFn: () =>
+      clustersApi.configureFailover(cluster.id, {
+        auto_failover: autoFailover,
+        auto_failback: autoFailback,
+        app_tier_always_available: appTierAlwaysAvailable,
+        failover_on_maintenance: failoverOnMaintenance,
+        failover_delay_secs: Math.max(1, parseInt(delaySecs, 10) || 30),
+        vip: cluster.vip ?? null,
+        redis_sentinel_master: sentinelMaster,
+        save_backup: saveBackup,
+      }),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['cluster', cluster.id] })
+      setShowWarning(false)
+      setResult(data)
+    },
+  })
+
+  const isActiveStandby = cluster.mode === 'active_standby'
+  const isPending = configure.isPending
+
+  function handleConfigureClick() {
+    if (cluster.patroni_configured) {
+      setShowWarning(true)
+    } else {
+      configure.mutate()
+    }
+  }
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 col-span-full">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="font-medium">Failover</h3>
+        {!isActiveStandby && (
+          <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">active/standby only</span>
+        )}
+      </div>
+      <p className="text-xs text-gray-500 mb-4">
+        Configure how Conductor responds to node outages and maintenance events.
+        Clicking <strong className="text-gray-300">Configure Failover</strong> pushes Patroni and
+        (if enabled) Sentinel configs to all nodes and starts the Patroni witness on the conductor.
+      </p>
+
+      <FailoverToggle
+        label="App tier is always available"
+        description="All nodes run NetBox pointed at the current Patroni primary. A reverse proxy health check steers traffic to healthy nodes automatically. Redis Sentinel handles Redis HA."
+        checked={appTierAlwaysAvailable}
+        onChange={setAppTierAlwaysAvailable}
+        disabled={!isActiveStandby || isPending}
+      />
+
+      {/* Sentinel master name — only relevant when app tier is always available */}
+      {appTierAlwaysAvailable && (
+        <div className="flex items-center justify-between py-3 pl-10">
+          <div>
+            <p className="text-sm font-medium text-gray-300">Redis Sentinel master name</p>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Must match the <code className="text-gray-400">sentinel monitor</code> name in your Sentinel config.
+            </p>
+          </div>
+          <input
+            type="text"
+            value={sentinelMaster}
+            onChange={(e) => setSentinelMaster(e.target.value)}
+            disabled={isPending}
+            placeholder="netbox"
+            className="w-36 text-sm bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
+          />
+        </div>
+      )}
+
+      <FailoverToggle
+        label="Automatic failover"
+        description="When the active node disconnects, Conductor starts NetBox on the highest-priority standby after the delay below."
+        checked={autoFailover}
+        onChange={setAutoFailover}
+        disabled={!isActiveStandby || isPending}
+      />
+      <FailoverToggle
+        label="Automatic failback"
+        description="When a higher-priority node reconnects and is healthy, Conductor moves NetBox back to it automatically."
+        checked={autoFailback}
+        onChange={setAutoFailback}
+        disabled={!isActiveStandby || !autoFailover || isPending}
+      />
+      <FailoverToggle
+        label="Failover on maintenance mode"
+        description="When a node is put into maintenance mode while running NetBox, Conductor immediately moves it to the next candidate."
+        checked={failoverOnMaintenance}
+        onChange={setFailoverOnMaintenance}
+        disabled={!isActiveStandby || !autoFailover || isPending}
+      />
+
+      {/* Failover delay */}
+      <div className="flex items-center justify-between py-3">
+        <div>
+          <p className="text-sm font-medium text-gray-200">Failover delay</p>
+          <p className="text-xs text-gray-500 mt-0.5">
+            Seconds Conductor waits for a disconnected node to reconnect before triggering failover.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <input
+            type="number"
+            min={1}
+            max={300}
+            value={delaySecs}
+            onChange={(e) => setDelaySecs(e.target.value)}
+            disabled={!isActiveStandby || !autoFailover || isPending}
+            className="w-20 text-sm text-right bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
+          />
+          <span className="text-xs text-gray-500">seconds</span>
+        </div>
+      </div>
+
+      {/* Standby-mode notice */}
+      {!appTierAlwaysAvailable && isActiveStandby && (
+        <p className="text-xs text-amber-500/80 bg-amber-950/30 border border-amber-900/40 rounded px-3 py-2 mt-1">
+          Standby nodes will return database errors for write operations. Only the active
+          (Patroni-primary) node serves traffic. Clients must be pointed at the active node directly.
+        </p>
+      )}
+
+      {/* Backup checkbox */}
+      {isActiveStandby && (
+        <label className="flex items-start gap-3 py-3 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={saveBackup}
+            onChange={(e) => setSaveBackup(e.target.checked)}
+            disabled={isPending}
+            className="mt-0.5 accent-blue-500"
+          />
+          <div>
+            <p className="text-sm font-medium text-gray-200">Back up primary database before configuring</p>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Runs <code className="text-gray-400">pg_dump</code> on the primary node and saves the dump to{' '}
+              <code className="text-gray-400">/var/lib/postgresql/backups/</code>. Recommended on first setup.
+            </p>
+          </div>
+        </label>
+      )}
+
+      {/* Result panel */}
+      {result && (
+        <div className="mt-4 p-4 bg-gray-800/60 border border-gray-700 rounded-lg text-xs space-y-2">
+          <p className="text-emerald-400 font-medium">Configuration dispatched</p>
+          <p className="text-gray-400">Primary: <span className="text-gray-200">{result.primary_node}</span></p>
+          {result.witness_addr && (
+            <p className="text-gray-400">Witness: <span className="text-gray-200">{result.witness_addr}</span></p>
+          )}
+          {result.backup_task && (
+            <p className="text-gray-400">
+              Backup task: <span className="text-gray-200">{result.backup_task.task_id}</span>
+              {' '}on {result.backup_task.hostname}
+            </p>
+          )}
+          <p className="text-gray-400">
+            Patroni tasks: <span className="text-gray-200">{result.patroni_tasks.length}</span>
+            {result.sentinel_tasks.length > 0 && (
+              <>, Sentinel tasks: <span className="text-gray-200">{result.sentinel_tasks.length}</span></>
+            )}
+          </p>
+          {result.warnings.length > 0 && (
+            <ul className="text-amber-400 space-y-0.5">
+              {result.warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
+            </ul>
+          )}
+          <button
+            onClick={() => setResult(null)}
+            className="text-gray-500 hover:text-gray-300 text-xs mt-1"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Action row */}
+      <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-800">
+        {configure.isError && (
+          <p className="text-xs text-red-400">
+            {(configure.error as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Configuration failed — check node connectivity and try again'}
+          </p>
+        )}
+        {!configure.isError && <span />}
+        <button
+          onClick={handleConfigureClick}
+          disabled={!isActiveStandby || isPending}
+          className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-1.5 rounded-lg transition-colors font-medium"
+        >
+          {isPending ? 'Configuring…' : 'Configure Failover'}
+        </button>
+      </div>
+
+      {/* Restart warning modal */}
+      {showWarning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-md w-full shadow-2xl">
+            <h4 className="font-semibold text-gray-100 mb-2">Reconfigure Patroni?</h4>
+            <p className="text-sm text-gray-400 mb-4">
+              Patroni has already been configured for this cluster. Proceeding will push a new{' '}
+              <code className="text-gray-300">patroni.yml</code> and restart Patroni on all nodes
+              simultaneously. This causes a brief outage while a new primary is elected.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowWarning(false)}
+                className="text-sm px-4 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => configure.mutate()}
+                className="text-sm px-4 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white transition-colors font-medium"
+              >
+                Reconfigure anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Media sync card ───────────────────────────────────────────────────────────
+
+function MediaSyncCard({ cluster }: { cluster: Cluster }) {
+  const qc = useQueryClient()
+
+  // rows mirrors the editable folder list; always has at least one row
+  const serverFolders = cluster.extra_sync_folders ?? []
+  const [rows, setRows] = useState<string[]>(() =>
+    serverFolders.length > 0 ? serverFolders : ['']
+  )
+  const [dirty, setDirty] = useState(false)
+  const [syncResult, setSyncResult] = useState<ClusterSyncResult | null>(null)
+  const [syncError, setSyncError] = useState<string | null>(null)
+
+  // Sync rows back from server after a successful save
+  useEffect(() => {
+    const f = cluster.extra_sync_folders ?? []
+    setRows(f.length > 0 ? f : [''])
+    setDirty(false)
+  }, [cluster.extra_sync_folders])
+
+  const updateSettings = useMutation({
+    mutationFn: (body: { media_sync_enabled: boolean; extra_folders_sync_enabled: boolean; extra_sync_folders: string[] }) =>
+      clustersApi.updateMediaSyncSettings(cluster.id, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['cluster', cluster.id] }),
+  })
+
+  const syncNow = useMutation({
+    mutationFn: () => clustersApi.syncMedia(cluster.id),
+    onSuccess: (data) => { setSyncResult(data); setSyncError(null) },
+    onError: (e: unknown) => {
+      const msg = (e as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Sync failed'
+      setSyncError(msg)
+      setSyncResult(null)
+    },
+  })
+
+  function toggle(field: 'media_sync_enabled' | 'extra_folders_sync_enabled') {
+    updateSettings.mutate({
+      media_sync_enabled: cluster.media_sync_enabled,
+      extra_folders_sync_enabled: cluster.extra_folders_sync_enabled,
+      extra_sync_folders: rows.filter((r) => r.trim() !== ''),
+      [field]: !cluster[field],
+    })
+  }
+
+  function updateRow(i: number, value: string) {
+    setRows((prev) => prev.map((r, idx) => (idx === i ? value : r)))
+    setDirty(true)
+  }
+
+  function removeRow(i: number) {
+    setRows((prev) => {
+      const next = prev.filter((_, idx) => idx !== i)
+      return next.length > 0 ? next : ['']
+    })
+    setDirty(true)
+  }
+
+  function addRow() {
+    setRows((prev) => [...prev, ''])
+  }
+
+  function saveFolders() {
+    updateSettings.mutate({
+      media_sync_enabled: cluster.media_sync_enabled,
+      extra_folders_sync_enabled: cluster.extra_folders_sync_enabled,
+      extra_sync_folders: rows.filter((r) => r.trim() !== ''),
+    })
+  }
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 col-span-full">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="font-medium">Media Sync</h3>
+        <button
+          onClick={() => { setSyncResult(null); setSyncError(null); syncNow.mutate() }}
+          disabled={!cluster.media_sync_enabled || syncNow.isPending}
+          className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-1.5 rounded-lg transition-colors"
+          title={!cluster.media_sync_enabled ? 'Enable media sync first' : 'Pull from active node, push to others'}
+        >
+          {syncNow.isPending ? 'Syncing…' : 'Sync Now'}
+        </button>
+      </div>
+
+      <p className="text-xs text-gray-500 mb-4">
+        When triggered, the conductor pulls from the most recently active app-tier or hyperconverged
+        node and pushes to all other connected nodes of the same type.
+      </p>
+
+      {/* Toggle: Sync Media */}
+      <label className="flex items-center justify-between py-2 border-b border-gray-800 cursor-pointer">
+        <span className="text-sm">Sync Media Root (<code className="text-xs text-gray-400">NETBOX_MEDIA_ROOT</code>)</span>
+        <button
+          role="switch"
+          aria-checked={cluster.media_sync_enabled}
+          onClick={() => toggle('media_sync_enabled')}
+          disabled={updateSettings.isPending}
+          className={`relative w-10 h-5 rounded-full transition-colors ${cluster.media_sync_enabled ? 'bg-blue-600' : 'bg-gray-700'}`}
+        >
+          <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${cluster.media_sync_enabled ? 'translate-x-5' : 'translate-x-0'}`} />
+        </button>
+      </label>
+
+      {/* Toggle: Sync Additional Folders */}
+      <label className="flex items-center justify-between py-2 border-b border-gray-800 cursor-pointer">
+        <span className="text-sm text-gray-300">Sync Additional Folders</span>
+        <button
+          role="switch"
+          aria-checked={cluster.extra_folders_sync_enabled}
+          onClick={() => toggle('extra_folders_sync_enabled')}
+          disabled={updateSettings.isPending || !cluster.media_sync_enabled}
+          className={`relative w-10 h-5 rounded-full transition-colors ${cluster.extra_folders_sync_enabled && cluster.media_sync_enabled ? 'bg-blue-600' : 'bg-gray-700'} disabled:opacity-40`}
+        >
+          <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${cluster.extra_folders_sync_enabled && cluster.media_sync_enabled ? 'translate-x-5' : 'translate-x-0'}`} />
+        </button>
+      </label>
+
+      {/* Editable folder rows */}
+      {cluster.extra_folders_sync_enabled && cluster.media_sync_enabled && (
+        <div className="mt-3 space-y-1.5">
+          {rows.map((row, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={row}
+                onChange={(e) => updateRow(i, e.target.value)}
+                placeholder="/opt/netbox/custom-path"
+                className="flex-1 text-xs font-mono bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-gray-500"
+              />
+              <button
+                onClick={() => removeRow(i)}
+                className="text-gray-500 hover:text-red-400 text-xs transition-colors shrink-0"
+              >
+                remove
+              </button>
+            </div>
+          ))}
+          <div className="flex items-center justify-between mt-2">
+            <button
+              onClick={addRow}
+              className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
+            >
+              + Add Row
+            </button>
+            <button
+              onClick={saveFolders}
+              disabled={!dirty || updateSettings.isPending}
+              className="text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1 rounded transition-colors"
+            >
+              {updateSettings.isPending ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Sync result / error */}
+      {syncResult && (
+        <div className="mt-4 text-xs text-emerald-400 bg-emerald-900/20 border border-emerald-800 rounded-lg p-3">
+          <p className="font-medium mb-1">Sync started — source: <span className="font-mono">{syncResult.source_hostname}</span></p>
+          <ul className="space-y-0.5 text-emerald-300">
+            {syncResult.syncs.map((s) => (
+              <li key={s.transfer_id}>
+                → <span className="font-mono">{s.target_hostname}</span>
+                {s.source_path && <span className="text-emerald-500"> ({s.source_path})</span>}
+                <span className="text-emerald-600 ml-1">task {s.task_id.slice(0, 8)}…</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {syncError && (
+        <p className="mt-3 text-xs text-red-400">{syncError}</p>
+      )}
+    </div>
+  )
+}
+
+function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
+  if (events.length === 0) {
+    return (
+      <div className="text-center py-16 text-gray-500 text-sm">
+        No failover events recorded yet. Events appear here when automatic
+        failover, failback, or maintenance-triggered moves occur.
+      </div>
+    )
+  }
+
+  const eventLabel: Record<string, string> = {
+    failover: 'Failover',
+    failback: 'Failback',
+    maintenance_failover: 'Maintenance',
+  }
+  const triggerLabel: Record<string, string> = {
+    disconnect: 'Agent disconnected',
+    heartbeat: 'NetBox stopped',
+    maintenance: 'Maintenance mode',
+    reconnect: 'Node reconnected',
+  }
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-gray-800 text-gray-400">
+            <th className="text-left px-6 py-3 font-medium">Time</th>
+            <th className="text-left px-6 py-3 font-medium">Type</th>
+            <th className="text-left px-6 py-3 font-medium">Trigger</th>
+            <th className="text-left px-6 py-3 font-medium">From</th>
+            <th className="text-left px-6 py-3 font-medium">To</th>
+            <th className="text-left px-6 py-3 font-medium">Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          {events.map((ev) => (
+            <tr key={ev.id} className="border-b border-gray-800 last:border-0 hover:bg-gray-800/30">
+              <td className="px-6 py-3 text-gray-400 whitespace-nowrap">
+                {new Date(ev.occurred_at).toLocaleString()}
+              </td>
+              <td className="px-6 py-3 font-medium">
+                {eventLabel[ev.event_type] ?? ev.event_type}
+              </td>
+              <td className="px-6 py-3 text-gray-400">
+                {triggerLabel[ev.trigger] ?? ev.trigger}
+              </td>
+              <td className="px-6 py-3 text-gray-300">
+                {ev.failed_node_name || '—'}
+              </td>
+              <td className="px-6 py-3 text-gray-300">
+                {ev.target_node_name || '—'}
+              </td>
+              <td className="px-6 py-3">
+                {ev.success ? (
+                  <span className="text-emerald-400 font-medium">Success</span>
+                ) : (
+                  <span className="text-red-400 font-medium" title={ev.reason ?? ''}>
+                    Failed{ev.reason ? ` — ${ev.reason}` : ''}
+                  </span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+type Tab = 'nodes' | 'database' | 'settings' | 'deployment' | 'history' | 'audit'
 
 export default function ClusterDetail() {
   const { id } = useParams<{ id: string }>()
@@ -832,6 +1397,7 @@ export default function ClusterDetail() {
     queryKey: ['cluster', id],
     queryFn: () => clustersApi.get(id!),
     enabled: !!id,
+    refetchInterval: 30_000,
   })
 
   const { data: nodes, isLoading: loadingNodes, refetch: refetchNodes } = useQuery({
@@ -845,6 +1411,13 @@ export default function ClusterDetail() {
     queryKey: ['credentials', id],
     queryFn: () => credentialsApi.list(id!),
     enabled: !!id && tab === 'settings',
+  })
+
+  const { data: failoverEvents } = useQuery({
+    queryKey: ['failover-events', id],
+    queryFn: () => clustersApi.failoverEvents(id!),
+    enabled: !!id && tab === 'history',
+    refetchInterval: tab === 'history' ? 15_000 : false,
   })
 
   const deleteCluster = useMutation({
@@ -881,6 +1454,12 @@ export default function ClusterDetail() {
 
   const connectedCount = nodes?.filter((n) => n.agent_status === 'connected').length ?? 0
 
+  // Prefer the live version reported by any connected node over the DB-stored cluster field,
+  // which may still be the coarse "4.x" value set at cluster creation.
+  const netboxVersion =
+    nodes?.find((n) => n.agent_status === 'connected' && n.netbox_version)?.netbox_version
+    ?? cluster.netbox_version
+
   return (
     <Layout>
       {/* Breadcrumb */}
@@ -901,7 +1480,7 @@ export default function ClusterDetail() {
             <span>·</span>
             <span>Patroni scope: <code className="font-mono text-xs">{cluster.patroni_scope}</code></span>
             <span>·</span>
-            <span>NetBox {cluster.netbox_version}</span>
+            <span>NetBox {netboxVersion}</span>
             <span>·</span>
             <span className={cluster.auto_failover ? 'text-emerald-400' : 'text-gray-500'}>
               Auto-failover {cluster.auto_failover ? 'on' : 'off'}
@@ -932,7 +1511,7 @@ export default function ClusterDetail() {
 
       {/* Tabs */}
       <div className="border-b border-gray-800 mb-6">
-        {(['nodes', 'configuration', 'patroni', 'settings', 'audit'] as Tab[]).map((t) => (
+        {(['nodes', 'database', 'settings', 'deployment', 'history', 'audit'] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -1026,24 +1605,14 @@ export default function ClusterDetail() {
         </div>
       )}
 
-      {/* Configuration tab */}
-      {tab === 'configuration' && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 text-center">
-          <p className="text-gray-400 mb-4">
-            Edit and push <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">configuration.py</code> to all nodes in this cluster.
-          </p>
-          <Link
-            to={`/clusters/${id}/config`}
-            className="inline-block bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-          >
-            Open Config Editor →
-          </Link>
-        </div>
+      {/* Database tab */}
+      {tab === 'database' && id && (
+        <DatabaseTab clusterId={id} />
       )}
 
-      {/* Patroni tab */}
-      {tab === 'patroni' && id && (
-        <PatroniTab clusterId={id} />
+      {/* Deployment tab */}
+      {tab === 'deployment' && id && (
+        <DeploymentTab clusterId={id} />
       )}
 
       {/* Settings tab */}
@@ -1056,10 +1625,8 @@ export default function ClusterDetail() {
               {[
                 { label: 'Mode', value: cluster.mode === 'active_standby' ? 'Active / Standby' : 'HA' },
                 { label: 'Patroni Scope', value: cluster.patroni_scope },
-                { label: 'NetBox Version', value: cluster.netbox_version },
+                { label: 'NetBox Version', value: netboxVersion },
                 { label: 'VIP', value: cluster.vip ?? '—' },
-                { label: 'Auto Failover', value: cluster.auto_failover ? 'Enabled' : 'Disabled' },
-                { label: 'Auto Failback', value: cluster.auto_failback ? 'Enabled' : 'Disabled' },
                 { label: 'Created', value: new Date(cluster.created_at).toLocaleDateString() },
               ].map(({ label, value }) => (
                 <div key={label} className="flex justify-between">
@@ -1094,7 +1661,17 @@ export default function ClusterDetail() {
               />
             ))}
           </div>
+
+          {/* Failover */}
+          <FailoverCard cluster={cluster} />
+
+          {/* Media Sync */}
+          <MediaSyncCard cluster={cluster} />
         </div>
+      )}
+
+      {tab === 'history' && (
+        <FailoverHistoryTab events={failoverEvents ?? []} />
       )}
 
       {tab === 'audit' && id && <AuditTab clusterId={id} />}

@@ -97,6 +97,11 @@ bootstrap:
     loop_wait: 10
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
+    # failsafe_mode keeps the primary serving if it loses contact with the
+    # standby, preventing a network partition from taking down the entire
+    # app tier in a 2-node cluster. The conductor witness provides the
+    # third Raft vote needed to maintain quorum on either side of a split.
+    failsafe_mode: true
     postgresql:
       use_pg_rewind: true
       use_slots: true
