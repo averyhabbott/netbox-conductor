@@ -20,14 +20,15 @@ func InstallPatroni(params protocol.PatroniInstallParams) (string, error) {
 		pm = detectPackageManager()
 	}
 
+	// Install commands require root; the agent runs as netbox-agent so we use sudo.
 	var cmd *exec.Cmd
 	switch pm {
 	case "apt", "apt-get":
-		cmd = exec.Command("apt-get", "install", "-y", "patroni")
+		cmd = exec.Command("sudo", "apt-get", "install", "-y", "patroni")
 	case "yum":
-		cmd = exec.Command("yum", "install", "-y", "patroni")
+		cmd = exec.Command("sudo", "yum", "install", "-y", "patroni")
 	case "dnf":
-		cmd = exec.Command("dnf", "install", "-y", "patroni")
+		cmd = exec.Command("sudo", "dnf", "install", "-y", "patroni")
 	default:
 		return "", fmt.Errorf("unsupported package manager %q — set install_cmd to override", pm)
 	}

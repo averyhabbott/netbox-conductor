@@ -1182,11 +1182,28 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 
 	// Push patroni.yml to every node, then restart Patroni.
-	// Both tasks are dispatched per-node; Patroni handles leader election
-	// automatically when all nodes start simultaneously with the new config.
-	patroniTasks := make([]taskRef, 0, len(nodes)*2)
+	// Tasks are dispatched in order: install → write_config → restart.
+	// The agent serializes tasks in a queue, so each step completes before the
+	// next begins — install finishes before write_config, write_config before restart.
+	patroniTasks := make([]taskRef, 0, len(nodes)*3)
 	for _, node := range nodes {
 		nodeIP := stripCIDR(node.IPAddress)
+
+		// Step 1: Install Patroni (idempotent — apt/yum no-ops if already installed).
+		// Uses a generous 5-minute timeout; package installs can be slow.
+		installParams, _ := json.Marshal(protocol.PatroniInstallParams{})
+		if tid, err := dispatch(node.ID, protocol.TaskInstallPatroni, installParams, 300); err != nil {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				Status: "offline", Error: "install dispatch: " + err.Error(),
+			})
+			continue // skip write_config and restart if node is unreachable
+		} else {
+			patroniTasks = append(patroniTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				TaskID: tid, Status: "dispatched",
+			})
+		}
 
 		// Per-node partner list excludes self
 		partners := make([]string, 0, len(raftPeers)-1)

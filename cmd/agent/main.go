@@ -109,11 +109,21 @@ func main() {
 		})
 	})
 
+	// Serial task queue — tasks execute one at a time, in the order received.
+	// This is critical for Configure Failover where patroni.install must complete
+	// before patroni.write_config and service.restart.patroni run.
+	taskQueue := make(chan func(), 64)
+	go func() {
+		for fn := range taskQueue {
+			fn()
+		}
+	}()
+
 	// Message handler for inbound server commands
 	onMessage := func(ctx context.Context, env protocol.Envelope) error {
 		switch env.Type {
 		case protocol.TypeTaskDispatch:
-			handleTaskDispatch(ctx, cfg, wsClient, env)
+			handleTaskDispatch(ctx, cfg, wsClient, env, taskQueue)
 		case protocol.TypeMediaChunk:
 			// Server is forwarding a media chunk to us (pull_from_server mode).
 			go func() {
@@ -228,7 +238,7 @@ func setupLogging(level slog.Level) {
 }
 
 // handleTaskDispatch routes an inbound task to the appropriate executor.
-func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope) {
+func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope, taskQueue chan<- func()) {
 	var task protocol.TaskDispatchPayload
 	if err := json.Unmarshal(env.Payload, &task); err != nil {
 		slog.Error("malformed task dispatch", "error", err)
@@ -247,8 +257,8 @@ func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws
 		Payload: json.RawMessage(ackPayload),
 	})
 
-	// Execute task in background so we don't block the read loop
-	go executeTask(ctx, cfg, client, task)
+	// Enqueue task for serial execution — tasks run one at a time in receive order.
+	taskQueue <- func() { executeTask(ctx, cfg, client, task) }
 }
 
 func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, task protocol.TaskDispatchPayload) {
@@ -326,6 +336,11 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartPatroni:
+		// Enable the unit first (idempotent — no-op if already enabled).
+		// Required on first run: apt installs patroni but does not enable the service.
+		if out, err := exec.Command("sudo", "systemctl", "enable", "patroni").CombinedOutput(); err != nil {
+			slog.Warn("patroni enable failed (non-fatal)", "error", err, "output", string(out))
+		}
 		cmd := exec.Command("sudo", "systemctl", "restart", "patroni")
 		out, err := cmd.CombinedOutput()
 		output = string(out)

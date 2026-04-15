@@ -5,9 +5,9 @@ netbox-4.5.7/
 testing/
 planning/
 
-# Build artifacts
+# Build artifacts (anchored to repo root so they don't match subdirectories)
 bin/
-server
-agent
+/server
+/agent
 web/dist/
 web/node_modules/

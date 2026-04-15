@@ -39,20 +39,21 @@ func RunDBBackup(params protocol.DBBackupParams) (string, error) {
 		outputDir = defaultBackupDir
 	}
 
-	if err := os.MkdirAll(outputDir, backupDirPerm); err != nil {
-		return "", fmt.Errorf("creating backup directory %s: %w", outputDir, err)
+	// Create the backup directory as the postgres OS user so peer auth works and
+	// the directory lands in postgres-owned space.
+	if mkdirOut, err := exec.Command("sudo", "-u", "postgres", "mkdir", "-p", outputDir).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("creating backup directory %s: %w\n%s", outputDir, err, mkdirOut)
 	}
 
 	timestamp := time.Now().UTC().Format("20060102-150405")
 	filename := fmt.Sprintf("%s-%s.dump", dbName, timestamp)
 	destPath := filepath.Join(outputDir, filename)
 
-	// pg_dump flags:
-	//   -Fc  custom format (compressed, supports parallel pg_restore)
-	//   -U   connect as this role
-	//   -f   write output to this file
-	//   -v   verbose — progress lines go to stderr, captured in output
+	// Run pg_dump as the postgres OS user so peer authentication works without
+	// needing a password. The -U flag selects the Postgres role; peer auth maps
+	// the OS user (postgres) to that role when they match.
 	cmd := exec.Command(
+		"sudo", "-u", "postgres",
 		"pg_dump",
 		"-Fc",
 		"-U", dbUser,
@@ -60,11 +61,6 @@ func RunDBBackup(params protocol.DBBackupParams) (string, error) {
 		"-v",
 		dbName,
 	)
-	// pg_dump connects via peer auth or PGPASSWORD; the postgres superuser can
-	// connect via peer auth when run as the postgres OS user (sudo -u postgres).
-	// The agent task is dispatched as root via sudo; set PGPASSWORD only if
-	// PGPASSWORD is already in the environment (set by the conductor via the task
-	// params in a future credential-injection feature).
 	cmd.Env = os.Environ()
 
 	out, err := cmd.CombinedOutput()
