@@ -1,0 +1,26 @@
+[Unit]
+Description=NetBox Failover Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netbox-agent
+Group=netbox-agent
+EnvironmentFile=/etc/netbox-agent/netbox-agent.env
+ExecStart=/usr/local/bin/netbox-agent
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netbox-agent
+
+# Harden the service
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/netbox/netbox/netbox /opt/netbox/netbox/media /var/log/netbox-agent
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

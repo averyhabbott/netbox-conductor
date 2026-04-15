@@ -1,0 +1,71 @@
+import client from './client'
+
+export interface NetboxConfig {
+  id: string
+  cluster_id: string
+  version: number
+  config_template: string
+  rendered_hash?: string
+  pushed_at?: string
+  push_status?: string
+  created_at: string
+}
+
+export interface ConfigOverride {
+  config_id: string
+  node_id: string
+  key: string
+  value: string
+}
+
+export interface ConfigWithOverrides {
+  config: NetboxConfig
+  overrides: ConfigOverride[]
+}
+
+export interface PushNodeResult {
+  node_id: string
+  hostname: string
+  task_id?: string
+  status: 'dispatched' | 'offline' | 'error'
+  error?: string
+}
+
+export interface PushResult {
+  config_id: string
+  version: number
+  status: string
+  nodes: PushNodeResult[]
+}
+
+export const configsApi = {
+  getOrCreate: (clusterId: string) =>
+    client.get<ConfigWithOverrides>(`/clusters/${clusterId}/config`).then((r) => r.data),
+
+  save: (clusterId: string, configTemplate: string) =>
+    client
+      .post<NetboxConfig>(`/clusters/${clusterId}/config`, { config_template: configTemplate })
+      .then((r) => r.data),
+
+  preview: (clusterId: string, nodeId?: string, configTemplate?: string) =>
+    client
+      .post<{ content: string; sha256: string; char_count: number }>(
+        `/clusters/${clusterId}/config/preview`,
+        { node_id: nodeId, config_template: configTemplate }
+      )
+      .then((r) => r.data),
+
+  push: (clusterId: string, version: number, restartAfter = false) =>
+    client
+      .post<PushResult>(`/clusters/${clusterId}/config/${version}/push`, {
+        restart_after: restartAfter,
+      })
+      .then((r) => r.data),
+
+  pushStatus: (clusterId: string, version: number) =>
+    client
+      .get<{ config_id: string; version: number; push_status?: string; pushed_at?: string }>(
+        `/clusters/${clusterId}/config/${version}/push-status`
+      )
+      .then((r) => r.data),
+}
