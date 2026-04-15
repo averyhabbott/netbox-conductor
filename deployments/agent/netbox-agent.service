@@ -1,5 +1,5 @@
 [Unit]
-Description=NetBox Failover Agent
+Description=NetBox Conductor Agent
 After=network-online.target
 Wants=network-online.target
 

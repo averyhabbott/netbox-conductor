@@ -1,0 +1,26 @@
+[Unit]
+Description=NetBox Conductor Server
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netbox-conductor
+Group=netbox-conductor
+WorkingDirectory=/opt/netbox-conductor
+EnvironmentFile=/etc/netbox-conductor/netbox-conductor.env
+ExecStart=/opt/netbox-conductor/bin/netbox-conductor
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netbox-conductor
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/netbox-conductor /var/log/netbox-conductor
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

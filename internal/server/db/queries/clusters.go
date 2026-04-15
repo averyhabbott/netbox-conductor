@@ -118,3 +118,9 @@ func (q *ClusterQuerier) Delete(ctx context.Context, id uuid.UUID) error {
 	_, err := q.pool.Exec(ctx, `DELETE FROM clusters WHERE id = $1`, id)
 	return err
 }
+
+func (q *ClusterQuerier) CountClusters(ctx context.Context) (int, error) {
+	var n int
+	err := q.pool.QueryRow(ctx, `SELECT COUNT(*) FROM clusters`).Scan(&n)
+	return n, err
+}

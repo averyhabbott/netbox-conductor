@@ -1,0 +1,20 @@
+// Package agentbundle embeds the static agent support files so the conductor
+// can bundle them into downloadable tarballs without needing them on disk.
+package agentbundle
+
+import _ "embed"
+
+// EnvExample is the contents of netbox-agent.env.example.
+//
+//go:embed netbox-agent.env.example
+var EnvExample []byte
+
+// ServiceFile is the contents of netbox-agent.service.
+//
+//go:embed netbox-agent.service
+var ServiceFile []byte
+
+// InstallScript is the contents of install.sh.
+//
+//go:embed install.sh
+var InstallScript []byte

@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abottVU/netbox-failover/internal/server/configgen"
-	"github.com/abottVU/netbox-failover/internal/server/crypto"
-	"github.com/abottVU/netbox-failover/internal/server/db/queries"
-	"github.com/abottVU/netbox-failover/internal/server/hub"
-	"github.com/abottVU/netbox-failover/internal/server/sse"
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 )

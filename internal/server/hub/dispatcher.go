@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
 // Dispatcher wraps the Hub and provides typed task-dispatch methods.

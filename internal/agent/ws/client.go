@@ -7,7 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
@@ -17,8 +17,8 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 
-	"github.com/abottVU/netbox-failover/internal/agent/config"
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	"github.com/averyhabbott/netbox-conductor/internal/agent/config"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
 const (
@@ -64,7 +64,7 @@ func (c *Client) Send(env protocol.Envelope) {
 	select {
 	case c.outbound <- env:
 	default:
-		log.Println("outbound buffer full, dropping message")
+		slog.Warn("outbound buffer full, dropping message")
 	}
 }
 
@@ -77,9 +77,9 @@ func (c *Client) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return // context cancelled — clean shutdown
 			}
-			log.Printf("connection error: %v — reconnecting in %s", err, backoff)
+			slog.Info("connection error, reconnecting", "error", err, "backoff", backoff.String())
 		} else {
-			log.Println("disconnected — reconnecting...")
+			slog.Info("disconnected, reconnecting")
 			backoff = minBackoff // reset on clean disconnect
 		}
 
@@ -110,7 +110,7 @@ func (c *Client) connect(ctx context.Context) error {
 	conn.SetReadLimit(4 * 1024 * 1024) // 4MB max message
 	defer conn.CloseNow()
 
-	log.Printf("connected to %s", c.cfg.ServerURL)
+	slog.Info("connected", "server", c.cfg.ServerURL)
 
 	// Send agent.hello
 	hostname, _ := os.Hostname()
@@ -149,7 +149,7 @@ func (c *Client) connect(ctx context.Context) error {
 	if !serverHello.Accepted {
 		return fmt.Errorf("rejected by server: %s", serverHello.RejectReason)
 	}
-	log.Printf("authenticated (server version %s)", serverHello.ServerVersion)
+	slog.Info("authenticated", "server_version", serverHello.ServerVersion)
 
 	// Run pumps
 	connCtx, connCancel := context.WithCancel(ctx)
@@ -194,7 +194,7 @@ func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) error {
 		}
 		if c.onMessage != nil {
 			if err := c.onMessage(ctx, env); err != nil {
-				log.Printf("message handler error: %v", err)
+				slog.Error("message handler error", "error", err)
 			}
 		}
 	}
@@ -213,7 +213,7 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 			}
 			hb, err := c.HeartbeatFn()
 			if err != nil {
-				log.Printf("heartbeat metrics error: %v", err)
+				slog.Error("heartbeat metrics error", "error", err)
 				continue
 			}
 			hb.NodeID = c.cfg.NodeID
@@ -252,7 +252,6 @@ func buildHTTPClient(cfg *config.Config) (*http.Client, error) {
 }
 
 func newID() string {
-	// Simple random hex ID — good enough for correlation
 	b := make([]byte, 8)
 	rand.Read(b) //nolint:gosec
 	return fmt.Sprintf("%x", b)

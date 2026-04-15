@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
 // WriteConfig atomically writes configuration.py and optionally restarts NetBox.

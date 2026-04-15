@@ -3,17 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
+	"log/slog"
+	"log/syslog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
 
-	agentconfig "github.com/abottVU/netbox-failover/internal/agent/config"
-	"github.com/abottVU/netbox-failover/internal/agent/executor"
-	"github.com/abottVU/netbox-failover/internal/agent/ws"
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	agentconfig "github.com/averyhabbott/netbox-conductor/internal/agent/config"
+	"github.com/averyhabbott/netbox-conductor/internal/agent/executor"
+	"github.com/averyhabbott/netbox-conductor/internal/agent/ws"
+	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
 )
 
@@ -34,7 +38,13 @@ func main() {
 		log.Fatalf("agent is not registered: AGENT_NODE_ID and AGENT_TOKEN must be set in %s", envFile)
 	}
 
-	log.Printf("netbox-agent starting | node=%s server=%s", cfg.NodeID, cfg.ServerURL)
+	// Set up structured logging.
+	// Writes to stderr (captured by journald) and also to the local syslog socket
+	// so events appear in /var/log/messages (or equivalent) on the managed host.
+	// Heartbeats are at Debug level and are suppressed at the default Info level.
+	setupLogging(logging.ParseLevel(cfg.LogLevel))
+
+	slog.Info("netbox-agent starting", "node", cfg.NodeID, "server", cfg.ServerURL)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -45,7 +55,7 @@ func main() {
 	// Patroni role watcher (fires when role changes; sends a proactive patroni.state message)
 	var wsClient *ws.Client // set after creation below
 	roleWatcher := executor.NewPatroniRoleWatcher(metrics, func(newRole, prevRole string, stateJSON []byte) {
-		log.Printf("patroni role change: %s -> %s", prevRole, newRole)
+		slog.Info("patroni role change", "prev_role", prevRole, "role", newRole)
 		if wsClient == nil {
 			return
 		}
@@ -67,8 +77,31 @@ func main() {
 		switch env.Type {
 		case protocol.TypeTaskDispatch:
 			handleTaskDispatch(ctx, cfg, wsClient, env)
+		case protocol.TypeMediaChunk:
+			// Server is forwarding a media chunk to us (pull_from_server mode).
+			go func() {
+				var chunk protocol.MediaChunkPayload
+				if err := json.Unmarshal(env.Payload, &chunk); err != nil {
+					slog.Warn("malformed media.chunk", "error", err)
+					return
+				}
+				if err := executor.WriteMediaChunk(chunk, cfg.NetboxMediaRoot); err != nil {
+					slog.Warn("writing media chunk", "path", chunk.RelativePath, "error", err)
+					return
+				}
+				// Send ack for backpressure
+				ack, _ := json.Marshal(protocol.MediaChunkAckPayload{
+					TransferID: chunk.TransferID,
+					ChunkIndex: chunk.ChunkIndex,
+				})
+				wsClient.Send(protocol.Envelope{
+					ID:      uuid.New().String(),
+					Type:    protocol.TypeMediaChunkAck,
+					Payload: json.RawMessage(ack),
+				})
+			}()
 		default:
-			log.Printf("unhandled server message type: %s", env.Type)
+			slog.Warn("unhandled server message type", "type", env.Type)
 		}
 		return nil
 	}
@@ -76,7 +109,8 @@ func main() {
 	// WebSocket client
 	client, err := ws.New(cfg, onMessage)
 	if err != nil {
-		log.Fatalf("creating WS client: %v", err)
+		slog.Error("creating WS client", "error", err)
+		os.Exit(1)
 	}
 	wsClient = client
 
@@ -99,20 +133,61 @@ func main() {
 		}
 	}()
 
+	// Tail NetBox application logs and forward to server.
+	// Discovers log files from LOGGING section in configuration.py; falls back to
+	// NETBOX_LOG_PATH if no file-based handlers are found.
+	go func() {
+		executor.TailNetboxLogs(ctx, cfg.NetboxConfigPath, cfg.NetboxLogPath, func(logName string, lines []string) {
+			if wsClient == nil {
+				return
+			}
+			payload, _ := json.Marshal(protocol.NetboxLogPayload{
+				NodeID:  cfg.NodeID,
+				LogName: logName,
+				Lines:   lines,
+			})
+			wsClient.Send(protocol.Envelope{
+				ID:      uuid.New().String(),
+				Type:    protocol.TypeNetboxLog,
+				Payload: json.RawMessage(payload),
+			})
+		})
+	}()
+
 	// Run WebSocket client (blocks until ctx cancelled)
 	client.Run(ctx)
-	log.Println("agent stopped")
+	slog.Info("agent stopped")
+}
+
+// setupLogging configures the default slog logger and routes the stdlib log
+// package through it. Writes to stderr (journald) and the local syslog socket.
+func setupLogging(level slog.Level) {
+	writers := []io.Writer{os.Stderr}
+
+	// Best-effort syslog — skip silently if the socket is unavailable (e.g. in
+	// containers or non-Linux environments).
+	if sw, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "netbox-agent"); err == nil {
+		writers = append(writers, sw)
+	}
+
+	h := slog.NewTextHandler(
+		io.MultiWriter(writers...),
+		&slog.HandlerOptions{Level: level},
+	)
+	logger := slog.New(h)
+	slog.SetDefault(logger)
+	// Route stdlib log.Printf calls through slog at Info level.
+	log.SetOutput(io.Discard) // slog.SetDefault already redirects; silence duplicate output
 }
 
 // handleTaskDispatch routes an inbound task to the appropriate executor.
-// Full task execution is implemented in Phase 3+; this logs and acks for now.
 func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope) {
 	var task protocol.TaskDispatchPayload
 	if err := json.Unmarshal(env.Payload, &task); err != nil {
-		log.Printf("malformed task dispatch: %v", err)
+		slog.Error("malformed task dispatch", "error", err)
 		return
 	}
-	log.Printf("received task: id=%s type=%s", task.TaskID, task.TaskType)
+	slog.Info("task received", "task_id", task.TaskID, "type", task.TaskType)
 
 	// Send ack immediately
 	ackPayload, _ := json.Marshal(protocol.TaskAckPayload{
@@ -213,6 +288,103 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			success = true
 		}
 
+	case protocol.TaskRestartRedis:
+		cmd := exec.Command("systemctl", "restart", "redis")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
+	case protocol.TaskRestartSentinel:
+		cmd := exec.Command("systemctl", "restart", "redis-sentinel")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
+	case protocol.TaskWriteSentinelConf:
+		var params protocol.SentinelConfigWriteParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.WriteSentinelConfig(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskDBRestore:
+		var params protocol.DBRestoreParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunDBRestore(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskInstallPatroni:
+		var params protocol.PatroniInstallParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.InstallPatroni(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskEnforceRetention:
+		var params protocol.EnforceRetentionParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.EnforceRetention(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskMediaSync:
+		var params protocol.MediaSyncParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else if params.Direction == "push_to_server" {
+			err := executor.PushMediaRoot(params, cfg.NetboxMediaRoot, func(env protocol.Envelope) {
+				client.Send(env)
+			})
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				output = "media push complete"
+				success = true
+			}
+		} else {
+			// pull_from_server: chunks arrive via TypeMediaChunk messages; this task
+			// just signals readiness — actual writing happens in the message handler.
+			output = "pull mode: ready to receive chunks"
+			success = true
+		}
+
 	case protocol.TaskRunCommand:
 		var params protocol.RunCommandParams
 		if err := json.Unmarshal(task.Params, &params); err != nil {
@@ -231,8 +403,12 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		errMsg = "unknown task type: " + string(task.TaskType)
 	}
 
-	log.Printf("task done: id=%s type=%s success=%v duration=%dms",
-		task.TaskID, task.TaskType, success, time.Since(start).Milliseconds())
+	slog.Info("task done",
+		"task_id", task.TaskID,
+		"type", task.TaskType,
+		"success", success,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
 
 	sendResult(client, task.TaskID, success, output, errMsg, time.Since(start).Milliseconds())
 }

@@ -1,11 +1,15 @@
+import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { useThemeStore } from './store/theme'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import ClusterList from './pages/ClusterList'
 import ClusterDetail from './pages/ClusterDetail'
 import NodeDetail from './pages/NodeDetail'
 import ConfigEditor from './pages/ConfigEditor'
+import Settings from './pages/Settings'
+import AvailableAgents from './pages/AvailableAgents'
 import ProtectedRoute from './components/ProtectedRoute'
 
 const queryClient = new QueryClient({
@@ -18,6 +22,16 @@ const queryClient = new QueryClient({
 })
 
 export default function App() {
+  const dark = useThemeStore((s) => s.dark)
+
+  useEffect(() => {
+    if (dark) {
+      document.documentElement.classList.add('dark')
+    } else {
+      document.documentElement.classList.remove('dark')
+    }
+  }, [dark])
+
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
@@ -60,6 +74,22 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <ConfigEditor />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/settings"
+            element={
+              <ProtectedRoute>
+                <Settings />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/available-agents"
+            element={
+              <ProtectedRoute>
+                <AvailableAgents />
               </ProtectedRoute>
             }
           />

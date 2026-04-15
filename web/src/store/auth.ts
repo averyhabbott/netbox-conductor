@@ -7,7 +7,8 @@ interface AuthState {
   refreshToken: string | null
   user: { id: string; username: string; role: string } | null
 
-  login: (username: string, password: string) => Promise<void>
+  login: (username: string, password: string) => Promise<{ requiresTOTP: boolean; totpToken?: string }>
+  verifyTOTP: (totpToken: string, code: string) => Promise<void>
   refresh: () => Promise<boolean>
   logout: () => void
   fetchMe: () => Promise<void>
@@ -22,6 +23,16 @@ export const useAuthStore = create<AuthState>()(
 
       login: async (username, password) => {
         const { data } = await authApi.login(username, password)
+        if (data.requires_totp) {
+          return { requiresTOTP: true, totpToken: data.totp_token }
+        }
+        set({ accessToken: data.access_token, refreshToken: data.refresh_token })
+        await get().fetchMe()
+        return { requiresTOTP: false }
+      },
+
+      verifyTOTP: async (totpToken, code) => {
+        const { data } = await authApi.verifyTOTP(totpToken, code)
         set({ accessToken: data.access_token, refreshToken: data.refresh_token })
         await get().fetchMe()
       },

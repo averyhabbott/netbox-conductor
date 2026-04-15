@@ -1,10 +1,18 @@
-import { useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useState, useRef, useEffect } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import client from '../api/client'
 import Layout from '../components/Layout'
+import type { Node } from '../api/nodes'
+import { useAuthStore } from '../store/auth'
+
+interface LogsData {
+  lines: string[]
+  path: string
+  node: string
+}
 
 const serviceActions = [
   { label: 'Start NetBox', action: 'start' as const },
@@ -27,6 +35,81 @@ const taskStatusColor: Record<string, string> = {
   sent: 'text-yellow-400',
   queued: 'text-gray-400',
 }
+
+// ── Sparkline ─────────────────────────────────────────────────────────────────
+
+const MAX_SAMPLES = 24 // ~6 minutes at 15s refetch
+
+interface Sample {
+  ts: number
+  netbox: boolean | null
+  rq: boolean | null
+  lag: number | null // patroni xlog lag seconds, if available
+}
+
+function useSampleHistory(node: import('../api/nodes').Node | undefined) {
+  const historyRef = useRef<Sample[]>([])
+
+  useEffect(() => {
+    if (!node) return
+    const lag = (() => {
+      try {
+        const s = node.patroni_state as any
+        return typeof s?.xlog?.received_location === 'number' ? s.xlog.received_location : null
+      } catch { return null }
+    })()
+    historyRef.current = [
+      ...historyRef.current,
+      { ts: Date.now(), netbox: node.netbox_running ?? null, rq: node.rq_running ?? null, lag },
+    ].slice(-MAX_SAMPLES)
+  }, [node])
+
+  return historyRef.current
+}
+
+interface SparklineProps {
+  samples: (boolean | null | number)[]
+  color?: string
+  height?: number
+  width?: number
+}
+
+function Sparkline({ samples, color = '#34d399', height = 24, width = 80 }: SparklineProps) {
+  if (samples.length < 2) {
+    return <span className="text-xs text-gray-600">collecting…</span>
+  }
+
+  const nums = samples.map((v) => {
+    if (v === null || v === undefined) return 0.5
+    if (typeof v === 'boolean') return v ? 1 : 0
+    return v
+  })
+
+  const min = Math.min(...nums)
+  const max = Math.max(...nums)
+  const range = max - min || 1
+
+  const pts = nums.map((v, i) => {
+    const x = (i / (nums.length - 1)) * width
+    const y = height - ((v - min) / range) * (height - 4) - 2
+    return `${x},${y}`
+  })
+
+  return (
+    <svg width={width} height={height} className="inline-block align-middle">
+      <polyline
+        points={pts.join(' ')}
+        fill="none"
+        stroke={color}
+        strokeWidth={1.5}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
+// ── Status row ────────────────────────────────────────────────────────────────
 
 function StatusRow({ label, value }: { label: string; value?: string | number | boolean | null }) {
   const display =
@@ -62,10 +145,470 @@ function AgentBadge({ status }: { status: string }) {
   )
 }
 
+// ── DB Restore modal ──────────────────────────────────────────────────────────
+
+function DBRestoreModal({
+  clusterId,
+  nodeId,
+  hostname,
+  onClose,
+}: {
+  clusterId: string
+  nodeId: string
+  hostname: string
+  onClose: () => void
+}) {
+  const [method, setMethod] = useState<'reinitialize' | 'pitr'>('reinitialize')
+  const [targetTime, setTargetTime] = useState('')
+  const [restoreCmd, setRestoreCmd] = useState('')
+  const [result, setResult] = useState<string | null>(null)
+
+  const restore = useMutation({
+    mutationFn: () =>
+      client
+        .post(`/clusters/${clusterId}/nodes/${nodeId}/db-restore`, {
+          method,
+          target_time: targetTime || undefined,
+          restore_cmd: restoreCmd || undefined,
+        })
+        .then((r) => r.data as { task_id: string }),
+    onSuccess: (data) => setResult(data.task_id),
+  })
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md">
+        <h3 className="text-lg font-semibold text-red-400 mb-1">DB Restore / PITR</h3>
+        <p className="text-xs text-gray-400 mb-4">
+          Target: <span className="font-mono text-white">{hostname}</span>
+        </p>
+
+        {result ? (
+          <div className="space-y-4">
+            <div className="bg-emerald-900/30 border border-emerald-700 rounded px-3 py-2 text-sm text-emerald-300">
+              Restore dispatched — task <span className="font-mono">{result.slice(0, 8)}…</span>
+            </div>
+            <button
+              onClick={onClose}
+              className="w-full py-2 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg"
+            >
+              Close
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Method</label>
+              <select
+                value={method}
+                onChange={(e) => setMethod(e.target.value as 'reinitialize' | 'pitr')}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+              >
+                <option value="reinitialize">Reinitialize (clone from primary)</option>
+                <option value="pitr">Point-in-Time Recovery (pgBackRest / custom)</option>
+              </select>
+            </div>
+
+            {method === 'pitr' && (
+              <>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">
+                    Target time (RFC3339, e.g. 2024-01-15T14:30:00Z)
+                  </label>
+                  <input
+                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
+                    value={targetTime}
+                    onChange={(e) => setTargetTime(e.target.value)}
+                    placeholder="2024-01-15T14:30:00Z"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">
+                    Custom restore command (optional — overrides pgBackRest default)
+                  </label>
+                  <input
+                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
+                    value={restoreCmd}
+                    onChange={(e) => setRestoreCmd(e.target.value)}
+                    placeholder="pgbackrest --stanza=main restore …"
+                  />
+                </div>
+              </>
+            )}
+
+            {restore.isError && (
+              <p className="text-xs text-red-400">
+                {(restore.error as any)?.response?.data?.message ?? 'Restore failed'}
+              </p>
+            )}
+
+            <div className="flex gap-3 justify-end pt-2">
+              <button
+                onClick={onClose}
+                className="px-4 py-2 text-sm text-gray-400 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => restore.mutate()}
+                disabled={restore.isPending || (method === 'pitr' && !targetTime)}
+                className="px-4 py-2 text-sm bg-red-700 hover:bg-red-600 disabled:opacity-40 rounded-lg"
+              >
+                {restore.isPending ? 'Dispatching…' : 'Run restore'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function MediaSyncCard({
+  sourceNodeId,
+  clusterId,
+  currentNode,
+}: {
+  sourceNodeId: string
+  clusterId: string
+  currentNode: Node
+}) {
+  const [targetNodeId, setTargetNodeId] = useState('')
+  const [sourcePath, setSourcePath] = useState('')
+  const [result, setResult] = useState<{ transfer_id: string; task_id: string } | null>(null)
+
+  const { data: siblings } = useQuery({
+    queryKey: ['nodes', clusterId],
+    queryFn: () => nodesApi.list(clusterId),
+    enabled: !!clusterId,
+  })
+
+  const otherNodes = (siblings ?? []).filter((n) => n.id !== sourceNodeId)
+
+  const startSync = useMutation({
+    mutationFn: () =>
+      client
+        .post<{ transfer_id: string; task_id: string }>(
+          `/clusters/${clusterId}/nodes/${sourceNodeId}/media-sync`,
+          {
+            target_node_id: targetNodeId,
+            source_path: sourcePath || undefined,
+          }
+        )
+        .then((r) => r.data),
+    onSuccess: (data) => setResult(data),
+  })
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 md:col-span-2">
+      <h3 className="font-medium mb-1">Media Sync</h3>
+      <p className="text-xs text-gray-500 mb-4">
+        Push <code className="font-mono">MEDIA_ROOT</code> from this node to another node in the cluster via the Conductor relay.
+      </p>
+
+      <div className="space-y-3">
+        <div className="flex items-end gap-3">
+          <div className="flex-1">
+            <label className="block text-xs text-gray-400 mb-1">Target node</label>
+            <select
+              value={targetNodeId}
+              onChange={(e) => setTargetNodeId(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+            >
+              <option value="">Select target…</option>
+              {otherNodes.map((n) => (
+                <option key={n.id} value={n.id} disabled={n.agent_status !== 'connected'}>
+                  {n.hostname}
+                  {n.agent_status !== 'connected' ? ' (offline)' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button
+            onClick={() => { setResult(null); startSync.mutate() }}
+            disabled={!targetNodeId || startSync.isPending || currentNode.agent_status !== 'connected'}
+            className="px-4 py-2 text-sm bg-blue-700 hover:bg-blue-600 disabled:opacity-40 rounded-lg transition-colors"
+          >
+            {startSync.isPending ? 'Starting…' : 'Start sync'}
+          </button>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">
+            Source path <span className="text-gray-600">(optional — defaults to MEDIA_ROOT)</span>
+          </label>
+          <input
+            type="text"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-blue-500"
+            placeholder="/opt/netbox/netbox/media"
+            value={sourcePath}
+            onChange={(e) => setSourcePath(e.target.value)}
+          />
+        </div>
+      </div>
+
+      {startSync.isError && (
+        <p className="text-xs text-red-400 mt-2">
+          {(startSync.error as any)?.response?.data?.message ?? 'Sync failed to start'}
+        </p>
+      )}
+      {result && (
+        <div className="mt-3 text-xs text-emerald-400 bg-emerald-900/20 border border-emerald-800 rounded px-3 py-2">
+          Sync started — transfer <span className="font-mono">{result.transfer_id.slice(0, 8)}…</span>
+          {' '}(task <span className="font-mono">{result.task_id.slice(0, 8)}…</span>)
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── RemoveNodeDialog ───────────────────────────────────────────────────────────
+
+type RemoveMode = 'decommission' | 'force_remove'
+
+function RemoveNodeDialog({
+  hostname,
+  agentStatus,
+  onConfirm,
+  onCancel,
+  isPending,
+}: {
+  hostname: string
+  agentStatus: string
+  onConfirm: () => void
+  onCancel: () => void
+  isPending: boolean
+}) {
+  const [dialogStep, setDialogStep] = useState<1 | 2>(1)
+  const [mode, setMode] = useState<RemoveMode | null>(null)
+  const [hostnameInput, setHostnameInput] = useState('')
+  const [copied, setCopied] = useState(false)
+
+  const cleanupCommands = [
+    'sudo systemctl stop netbox-agent',
+    'sudo systemctl disable netbox-agent',
+    'sudo rm /etc/systemd/system/netbox-agent.service',
+    'sudo rm /usr/local/bin/netbox-agent',
+    'sudo rm -rf /etc/netbox-agent/',
+  ].join('\n')
+
+  const copyCleanup = async () => {
+    await navigator.clipboard.writeText(cleanupCommands)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-lg">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+          <div>
+            <h3 className="font-semibold text-red-400">
+              {dialogStep === 1
+                ? 'Remove Node'
+                : mode === 'decommission'
+                ? 'Decommission Node'
+                : 'Force Remove Node'}
+            </h3>
+            <p className="text-xs text-gray-500 font-mono mt-0.5">{hostname}</p>
+          </div>
+          {/* Step indicator */}
+          <div className="flex items-center gap-2">
+            {([1, 2] as const).map((s) => (
+              <div
+                key={s}
+                className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${
+                  dialogStep === s
+                    ? 'bg-red-700 text-white'
+                    : dialogStep > s
+                    ? 'bg-gray-600 text-white'
+                    : 'bg-gray-800 text-gray-500'
+                }`}
+              >
+                {dialogStep > s ? '✓' : s}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="px-6 py-5 space-y-4">
+          {/* ── Step 1: Choose mode ── */}
+          {dialogStep === 1 && (
+            <>
+              <p className="text-sm text-gray-400">Choose how to remove this node:</p>
+              <div className="grid grid-cols-2 gap-3">
+                {/* Decommission */}
+                <button
+                  type="button"
+                  onClick={() => setMode('decommission')}
+                  className={`text-left p-4 rounded-lg border transition-colors ${
+                    mode === 'decommission'
+                      ? 'border-red-600 bg-red-900/20'
+                      : 'border-gray-700 bg-gray-800 hover:border-gray-600'
+                  }`}
+                >
+                  <p className="text-sm font-medium text-gray-200">Decommission</p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    Full removal with agent cleanup guidance. Use when permanently retiring this node.
+                  </p>
+                  <p className="text-xs text-emerald-500 mt-2">Recommended</p>
+                </button>
+                {/* Force Remove */}
+                <button
+                  type="button"
+                  onClick={() => setMode('force_remove')}
+                  className={`text-left p-4 rounded-lg border transition-colors ${
+                    mode === 'force_remove'
+                      ? 'border-amber-600 bg-amber-900/20'
+                      : 'border-gray-700 bg-gray-800 hover:border-gray-600'
+                  }`}
+                >
+                  <p className="text-sm font-medium text-gray-200">Force Remove</p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    Removes node from the conductor only. Agent process on the host is not stopped.
+                  </p>
+                  <p className="text-xs text-amber-500 mt-2">Use when node is already gone</p>
+                </button>
+              </div>
+              <div className="flex justify-end gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={onCancel}
+                  className="text-sm text-gray-400 hover:text-gray-200 px-4 py-2"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDialogStep(2)}
+                  disabled={mode === null}
+                  className="bg-red-700 hover:bg-red-600 disabled:opacity-40 text-sm px-4 py-2 rounded-lg transition-colors"
+                >
+                  Continue →
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* ── Step 2: Confirm ── */}
+          {dialogStep === 2 && mode && (
+            <>
+              {/* Irreversibility banner */}
+              <div className="bg-red-900/30 border border-red-800 rounded-lg px-4 py-3">
+                <p className="text-sm font-semibold text-red-400">
+                  This action is permanent and cannot be undone.
+                </p>
+                <p className="text-xs text-red-300/80 mt-1">
+                  You chose{' '}
+                  <span className="font-semibold">
+                    {mode === 'decommission' ? 'Decommission' : 'Force Remove'}
+                  </span>
+                  . All node records, tokens, task history, and config overrides will be deleted
+                  from the conductor.
+                </p>
+              </div>
+
+              {mode === 'decommission' && (
+                <>
+                  {/* Agent connection status note */}
+                  <p className="text-sm text-gray-300">
+                    {agentStatus === 'connected'
+                      ? 'The agent is currently connected and will be disconnected immediately. Its token will be invalidated.'
+                      : 'The agent process may still be running on the host — run the cleanup commands below after decommissioning.'}
+                  </p>
+
+                  {/* Manual cleanup */}
+                  <div>
+                    <p className="text-xs text-gray-400 mb-1">
+                      Run on <span className="font-mono text-gray-300">{hostname}</span> after decommissioning:
+                    </p>
+                    <div className="relative">
+                      <pre className="bg-gray-950 border border-gray-800 rounded-lg p-3 text-xs font-mono text-gray-300 whitespace-pre">
+{cleanupCommands}
+                      </pre>
+                      <button
+                        type="button"
+                        onClick={copyCleanup}
+                        className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
+                      >
+                        {copied ? '✓ Copied' : 'Copy'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Hostname confirmation */}
+                  <div>
+                    <p className="text-sm text-gray-400 mb-1">
+                      Type <span className="font-mono text-white">{hostname}</span> to confirm:
+                    </p>
+                    <input
+                      className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-red-600"
+                      value={hostnameInput}
+                      onChange={(e) => setHostnameInput(e.target.value)}
+                      placeholder={hostname}
+                      autoFocus
+                    />
+                  </div>
+                </>
+              )}
+
+              {mode === 'force_remove' && (
+                <p className="text-sm text-gray-300">
+                  The agent process on <span className="font-mono text-gray-100">{hostname}</span> will
+                  not be stopped. If the agent is still running, it will attempt to reconnect but its
+                  token will be invalidated and reconnection will fail.
+                </p>
+              )}
+
+              <div className="flex justify-end gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setDialogStep(1); setHostnameInput('') }}
+                  className="text-sm text-gray-400 hover:text-gray-200 px-4 py-2"
+                >
+                  ← Back
+                </button>
+                <button
+                  type="button"
+                  onClick={onConfirm}
+                  disabled={
+                    isPending ||
+                    (mode === 'decommission' && hostnameInput !== hostname)
+                  }
+                  className={`disabled:opacity-40 text-sm px-4 py-2 rounded-lg transition-colors ${
+                    mode === 'decommission'
+                      ? 'bg-red-700 hover:bg-red-600'
+                      : 'bg-amber-700 hover:bg-amber-600'
+                  }`}
+                >
+                  {isPending
+                    ? 'Removing…'
+                    : mode === 'decommission'
+                    ? 'Decommission Node'
+                    : 'Remove from Conductor'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function NodeDetail() {
   const { id, nid } = useParams<{ id: string; nid: string }>()
+  const navigate = useNavigate()
   const qc = useQueryClient()
+  const userRole = useAuthStore((s) => s.user?.role)
   const [actionResult, setActionResult] = useState<{ success: boolean; message: string } | null>(null)
+  const [showDBRestore, setShowDBRestore] = useState(false)
+  const [showRemoveNode, setShowRemoveNode] = useState(false)
+
+  const removeNode = useMutation({
+    mutationFn: () => nodesApi.delete(id!, nid!),
+    onSuccess: () => navigate(`/clusters/${id}`),
+  })
 
   const { data: cluster } = useQuery({
     queryKey: ['cluster', id],
@@ -112,10 +655,20 @@ export default function NodeDetail() {
     },
   })
 
-  const toggleSuppress = useMutation({
-    mutationFn: (suppress: boolean) => nodesApi.update(id!, nid!, { suppress_auto_start: suppress }),
+  const toggleMaintenance = useMutation({
+    mutationFn: (enabled: boolean) => nodesApi.setMaintenance(id!, nid!, enabled),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['node', nid] }),
   })
+
+  const [envDownloading, setEnvDownloading] = useState(false)
+  const downloadEnv = async () => {
+    setEnvDownloading(true)
+    try {
+      await nodesApi.downloadAgentEnv(id!, nid!, node?.hostname ?? nid!)
+    } finally {
+      setEnvDownloading(false)
+    }
+  }
 
   const { data: tasksData } = useQuery({
     queryKey: ['node-tasks', nid],
@@ -126,6 +679,29 @@ export default function NodeDetail() {
     enabled: !!id && !!nid,
     refetchInterval: 10_000,
   })
+
+  const [logSource, setLogSource] = useState<'agent' | 'netbox'>('agent')
+  const [netboxLogName, setNetboxLogName] = useState<string>('')
+
+  const { data: netboxLogNamesData } = useQuery({
+    queryKey: ['netbox-log-names', nid],
+    queryFn: () => nodesApi.getNetboxLogNames(id!, nid!),
+    enabled: !!id && !!nid && logSource === 'netbox',
+    refetchInterval: 30_000,
+  })
+
+  const availableLogNames = netboxLogNamesData?.names ?? []
+  // Auto-select first available name when the list changes and nothing is selected
+  const effectiveLogName = netboxLogName || availableLogNames[0] || ''
+
+  const { data: logsData, refetch: refetchLogs, isFetching: logsFetching } = useQuery<LogsData>({
+    queryKey: ['node-logs', nid, logSource, effectiveLogName],
+    queryFn: () => nodesApi.getLogs(id!, nid!, 200, logSource, logSource === 'netbox' ? effectiveLogName || undefined : undefined),
+    enabled: !!id && !!nid,
+    refetchInterval: 30_000,
+  })
+
+  const history = useSampleHistory(node)
 
   if (isLoading) {
     return <Layout><div className="text-gray-500 text-sm">Loading…</div></Layout>
@@ -159,6 +735,21 @@ export default function NodeDetail() {
 
         {/* Service controls */}
         <div className="flex gap-2 flex-wrap">
+          <button
+            onClick={downloadEnv}
+            disabled={envDownloading}
+            className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
+          >
+            {envDownloading ? 'Generating…' : 'Download agent .env'}
+          </button>
+          {userRole === 'admin' && (
+            <button
+              onClick={() => setShowDBRestore(true)}
+              className="bg-red-900/50 hover:bg-red-900 border border-red-800 text-red-400 hover:text-red-300 text-sm px-3 py-1.5 rounded-lg transition-colors"
+            >
+              DB Restore
+            </button>
+          )}
           {serviceActions.map(({ label, action }) => (
             <button
               key={action}
@@ -176,8 +767,26 @@ export default function NodeDetail() {
           >
             Restart RQ
           </button>
+          {userRole === 'admin' && (
+            <button
+              onClick={() => setShowRemoveNode(true)}
+              className="bg-red-900/40 hover:bg-red-900/70 border border-red-800 text-red-400 hover:text-red-300 text-sm px-3 py-1.5 rounded-lg transition-colors"
+            >
+              Remove Node
+            </button>
+          )}
         </div>
       </div>
+
+      {showRemoveNode && (
+        <RemoveNodeDialog
+          hostname={node.hostname}
+          agentStatus={node.agent_status}
+          onConfirm={() => removeNode.mutate()}
+          onCancel={() => setShowRemoveNode(false)}
+          isPending={removeNode.isPending}
+        />
+      )}
 
       {actionResult && (
         <div className={`mb-6 p-3 rounded-lg text-sm ${actionResult.success ? 'bg-emerald-900/30 text-emerald-300 border border-emerald-800' : 'bg-red-900/30 text-red-300 border border-red-800'}`}>
@@ -201,26 +810,43 @@ export default function NodeDetail() {
         {/* Services */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
           <h3 className="font-medium mb-4">Services</h3>
-          <StatusRow label="NetBox" value={node.netbox_running} />
-          <StatusRow label="NetBox-RQ" value={node.rq_running} />
+          <div className="flex items-center justify-between py-3 border-b border-gray-800">
+            <span className="text-sm text-gray-400">NetBox</span>
+            <div className="flex items-center gap-3">
+              <Sparkline samples={history.map((s) => s.netbox)} color={node.netbox_running ? '#34d399' : '#f87171'} />
+              <span className={`text-sm font-medium ${node.netbox_running ? 'text-emerald-400' : node.netbox_running === false ? 'text-red-400' : 'text-gray-600'}`}>
+                {node.netbox_running ? 'Running' : node.netbox_running === false ? 'Stopped' : '—'}
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between py-3 border-b border-gray-800">
+            <span className="text-sm text-gray-400">NetBox-RQ</span>
+            <div className="flex items-center gap-3">
+              <Sparkline samples={history.map((s) => s.rq)} color={node.rq_running ? '#34d399' : '#f87171'} />
+              <span className={`text-sm font-medium ${node.rq_running ? 'text-emerald-400' : node.rq_running === false ? 'text-red-400' : 'text-gray-600'}`}>
+                {node.rq_running ? 'Running' : node.rq_running === false ? 'Stopped' : '—'}
+              </span>
+            </div>
+          </div>
 
-          {/* Suppress auto-start toggle */}
+          {/* Maintenance mode toggle */}
           <div className="flex items-center justify-between py-3 border-t border-gray-800 mt-1">
             <div>
-              <p className="text-sm text-gray-400">Suppress Auto-Start</p>
+              <p className="text-sm text-gray-400">Maintenance Mode</p>
               <p className="text-xs text-gray-600 mt-0.5">
-                Prevent agent from auto-starting NetBox on Patroni promotion
+                Suppresses auto-start and excludes node from failover target selection
               </p>
             </div>
             <button
-              onClick={() => toggleSuppress.mutate(!node.suppress_auto_start)}
-              className={`relative w-10 h-6 rounded-full transition-colors ${
-                node.suppress_auto_start ? 'bg-yellow-600' : 'bg-gray-700'
+              onClick={() => toggleMaintenance.mutate(!node.maintenance_mode)}
+              disabled={toggleMaintenance.isPending}
+              className={`relative w-10 h-6 rounded-full transition-colors disabled:opacity-40 ${
+                node.maintenance_mode ? 'bg-amber-600' : 'bg-gray-700'
               }`}
             >
               <span
                 className={`absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all ${
-                  node.suppress_auto_start ? 'left-5' : 'left-1'
+                  node.maintenance_mode ? 'left-5' : 'left-1'
                 }`}
               />
             </button>
@@ -271,7 +897,77 @@ export default function NodeDetail() {
             </table>
           )}
         </div>
+
+        {/* Media Sync */}
+        <MediaSyncCard sourceNodeId={nid!} clusterId={id!} currentNode={node} />
+
+        {/* Logs */}
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 md:col-span-2">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="font-medium">Logs</h3>
+                <div className="flex text-xs border border-gray-700 rounded-lg overflow-hidden">
+                  {(['agent', 'netbox'] as const).map((src) => (
+                    <button
+                      key={src}
+                      onClick={() => setLogSource(src)}
+                      className={`px-2.5 py-1 transition-colors ${
+                        logSource === src
+                          ? 'bg-blue-600 text-white'
+                          : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      {src === 'agent' ? 'Agent' : 'NetBox'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {logSource === 'netbox' && availableLogNames.length > 1 && (
+                <select
+                  value={effectiveLogName}
+                  onChange={(e) => setNetboxLogName(e.target.value)}
+                  className="mt-1.5 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
+                >
+                  {availableLogNames.map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              )}
+              {logsData?.path && (
+                <p className="text-xs text-gray-600 mt-0.5 font-mono">{logsData.path}</p>
+              )}
+            </div>
+            <button
+              onClick={() => refetchLogs()}
+              disabled={logsFetching}
+              className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 px-3 py-1.5 rounded-lg transition-colors"
+            >
+              {logsFetching ? 'Refreshing…' : 'Refresh'}
+            </button>
+          </div>
+          {!logsData?.lines?.length ? (
+            <p className="text-sm text-gray-500">
+              {logSource === 'netbox'
+                ? 'No NetBox log entries yet. The agent discovers log files from the LOGGING section in configuration.py and forwards them automatically. Set NETBOX_LOG_PATH as a fallback if no LOGGING section is configured.'
+                : 'No log entries yet. Logs appear once the agent connects and the log file is created on the Conductor node.'}
+            </p>
+          ) : (
+            <pre className="text-xs font-mono text-gray-400 bg-gray-950 rounded-lg p-4 overflow-auto max-h-96 leading-5">
+              {logsData.lines.join('\n')}
+            </pre>
+          )}
+        </div>
       </div>
+
+      {showDBRestore && id && nid && node && (
+        <DBRestoreModal
+          clusterId={id}
+          nodeId={nid}
+          hostname={node.hostname}
+          onClose={() => setShowDBRestore(false)}
+        />
+      )}
     </Layout>
   )
 }

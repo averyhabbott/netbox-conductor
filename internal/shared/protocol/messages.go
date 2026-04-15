@@ -14,6 +14,7 @@ const (
 	TypeTaskResult     MessageType = "task.result"
 	TypeMediaChunk     MessageType = "media.chunk"
 	TypeMediaChunkAck  MessageType = "media.chunk.ack"
+	TypeNetboxLog      MessageType = "netbox.log"
 
 	// Server → Agent
 	TypeServerHello  MessageType = "server.hello"
@@ -35,8 +36,11 @@ const (
 	TaskRestartPatroni    TaskType = "service.restart.patroni"
 	TaskRestartRedis      TaskType = "service.restart.redis"
 	TaskRestartSentinel   TaskType = "service.restart.redis-sentinel"
+	TaskWriteSentinelConf TaskType = "sentinel.write_config"
 	TaskMediaSync         TaskType = "media.sync"
-	TaskRunCommand        TaskType = "exec.run" // admin-only ad-hoc
+	TaskDBRestore         TaskType = "db.restore"   // reinitialize a replica or restore from backup
+	TaskRunCommand        TaskType = "exec.run"      // admin-only ad-hoc
+	TaskEnforceRetention  TaskType = "backup.expire" // run pgbackrest expire / retention enforcement
 )
 
 // Envelope wraps every WebSocket message.
@@ -116,6 +120,13 @@ type MediaChunkAckPayload struct {
 	ChunkIndex int    `json:"chunk_index"`
 }
 
+// NetboxLogPayload carries a batch of NetBox application log lines from the agent.
+type NetboxLogPayload struct {
+	NodeID  string   `json:"node_id"`
+	LogName string   `json:"log_name"` // base filename, e.g. "netbox.log"; empty → treated as "netbox.log"
+	Lines   []string `json:"lines"`
+}
+
 // ────────────────────────────────────────────────────────────────
 // Server → Agent payloads
 // ────────────────────────────────────────────────────────────────
@@ -167,10 +178,41 @@ type RunCommandParams struct {
 	Args    []string `json:"args"`
 }
 
+// SentinelConfigWriteParams are the params for TaskWriteSentinelConf.
+type SentinelConfigWriteParams struct {
+	Content      string `json:"content"`
+	Sha256       string `json:"sha256"`
+	RestartAfter bool   `json:"restart_after"`
+}
+
+// DBRestoreParams are the params for TaskDBRestore.
+// Method selects the restore strategy:
+//   - "reinitialize": run `patronictl reinitialize` (re-clones replica from primary)
+//   - "pitr": run a custom restore command with a target recovery time (requires pgBackRest/WAL-E)
+type DBRestoreParams struct {
+	Method        string `json:"method"`          // "reinitialize" | "pitr"
+	TargetTime    string `json:"target_time"`     // ISO8601 — used for pitr
+	RestoreCmd    string `json:"restore_command"` // optional: override default restore command
+	PatroniScope  string `json:"patroni_scope"`   // cluster scope for patronictl
+}
+
 // MediaSyncParams are the params for TaskMediaSync.
 type MediaSyncParams struct {
 	Direction    string `json:"direction"`      // "push_to_server" | "pull_from_server"
-	RelativePath string `json:"relative_path"`  // "" = full sync
+	RelativePath string `json:"relative_path"`  // "" = full sync within SourcePath
+	SourcePath   string `json:"source_path"`    // absolute path override; "" = use MEDIA_ROOT
 	ChunkSizeB   int    `json:"chunk_size"`
 	TransferID   string `json:"transfer_id"`
+}
+
+// PatroniInstallParams are the params for TaskInstallPatroni.
+type PatroniInstallParams struct {
+	PackageManager string `json:"package_manager"` // "apt-get" | "yum" | "dnf" — auto-detected if empty
+	InstallCmd     string `json:"install_cmd"`     // optional full override command
+}
+
+// EnforceRetentionParams are the params for TaskEnforceRetention.
+type EnforceRetentionParams struct {
+	PatroniScope string `json:"patroni_scope"` // pgBackRest stanza name (defaults to "main")
+	ExpireCmd    string `json:"expire_cmd"`    // optional override for the expire command
 }

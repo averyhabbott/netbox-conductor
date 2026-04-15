@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/abottVU/netbox-failover/internal/server/api/jwtutil"
+	"github.com/averyhabbott/netbox-conductor/internal/server/api/jwtutil"
 	"github.com/labstack/echo/v4"
 )
 

@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/abottVU/netbox-failover/internal/server/crypto"
-	"github.com/abottVU/netbox-failover/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 )
@@ -78,6 +78,69 @@ var validCredKinds = map[string]bool{
 	"netbox_db_user":         true,
 	"redis_password":         true,
 	"patroni_rest_password":  true,
+}
+
+// autoGenDefaults maps credential kind → default username (and optional db name).
+var autoGenDefaults = []struct {
+	Kind     string
+	Username string
+	DBName   *string
+}{
+	{Kind: "postgres_replication", Username: "replicator"},
+	{Kind: "netbox_db_user", Username: "netbox", DBName: strPtr("netbox")},
+	{Kind: "redis_password", Username: "redis"},
+	{Kind: "patroni_rest_password", Username: "patroni"},
+}
+
+func strPtr(s string) *string { return &s }
+
+// GenerateCredentials auto-generates secure random passwords for all
+// non-superuser credential kinds. Returns the plaintext values once.
+// POST /api/v1/clusters/:id/credentials/generate
+func (h *CredentialHandler) GenerateCredentials(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+
+	type generated struct {
+		Kind     string  `json:"kind"`
+		Username string  `json:"username"`
+		Password string  `json:"password"`
+		DBName   *string `json:"db_name,omitempty"`
+	}
+	results := make([]generated, 0, len(autoGenDefaults))
+
+	for _, def := range autoGenDefaults {
+		rawPassword, err := crypto.GenerateToken(32)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate password")
+		}
+		encPassword, err := h.enc.Encrypt([]byte(rawPassword))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt password")
+		}
+		if err := h.creds.Upsert(c.Request().Context(), queries.UpsertCredentialParams{
+			ClusterID:   clusterID,
+			Kind:        def.Kind,
+			Username:    def.Username,
+			PasswordEnc: encPassword,
+			DBName:      def.DBName,
+		}); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to save credential")
+		}
+		results = append(results, generated{
+			Kind:     def.Kind,
+			Username: def.Username,
+			Password: rawPassword,
+			DBName:   def.DBName,
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"generated": results,
+		"warning":   "These passwords will not be shown again. Copy them now.",
+	})
 }
 
 // Upsert godoc

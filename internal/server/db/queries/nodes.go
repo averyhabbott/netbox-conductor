@@ -23,6 +23,7 @@ type Node struct {
 	NetboxRunning     *bool
 	RQRunning         *bool
 	SuppressAutoStart bool
+	MaintenanceMode   bool
 	SSHPort           int
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
@@ -60,7 +61,7 @@ func NewNodeQuerier(pool *pgxpool.Pool) *NodeQuerier {
 const nodeColumns = `
 	id, cluster_id, hostname, ip_address::text, role, failover_priority,
 	agent_status, last_seen_at, patroni_state, netbox_running, rq_running,
-	suppress_auto_start, ssh_port, created_at, updated_at`
+	suppress_auto_start, maintenance_mode, ssh_port, created_at, updated_at`
 
 func scanNode(row interface {
 	Scan(...any) error
@@ -70,7 +71,7 @@ func scanNode(row interface {
 		&n.ID, &n.ClusterID, &n.Hostname, &n.IPAddress, &n.Role,
 		&n.FailoverPriority, &n.AgentStatus, &n.LastSeenAt,
 		&n.PatroniState, &n.NetboxRunning, &n.RQRunning,
-		&n.SuppressAutoStart, &n.SSHPort,
+		&n.SuppressAutoStart, &n.MaintenanceMode, &n.SSHPort,
 		&n.CreatedAt, &n.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -80,7 +81,7 @@ func scanNode(row interface {
 
 func (q *NodeQuerier) ListByCluster(ctx context.Context, clusterID uuid.UUID) ([]Node, error) {
 	rows, err := q.pool.Query(ctx,
-		`SELECT`+nodeColumns+` FROM nodes WHERE cluster_id = $1 ORDER BY failover_priority, hostname`,
+		`SELECT`+nodeColumns+` FROM nodes WHERE cluster_id = $1 ORDER BY failover_priority DESC, hostname`,
 		clusterID)
 	if err != nil {
 		return nil, err
@@ -159,9 +160,26 @@ func (q *NodeQuerier) SetSuppressAutoStart(ctx context.Context, id uuid.UUID, su
 	return err
 }
 
+func (q *NodeQuerier) SetMaintenanceMode(ctx context.Context, id uuid.UUID, enabled bool) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE nodes
+		SET maintenance_mode = $2,
+		    suppress_auto_start = $2,
+		    updated_at = now()
+		WHERE id = $1
+	`, id, enabled)
+	return err
+}
+
 func (q *NodeQuerier) Delete(ctx context.Context, id uuid.UUID) error {
 	_, err := q.pool.Exec(ctx, `DELETE FROM nodes WHERE id = $1`, id)
 	return err
+}
+
+func (q *NodeQuerier) CountNodes(ctx context.Context) (int, error) {
+	var n int
+	err := q.pool.QueryRow(ctx, `SELECT COUNT(*) FROM nodes`).Scan(&n)
+	return n, err
 }
 
 // ── Agent tokens ──────────────────────────────────────────────────────────────

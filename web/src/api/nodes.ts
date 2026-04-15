@@ -11,6 +11,7 @@ export interface Node {
   netbox_running: boolean | null
   rq_running: boolean | null
   suppress_auto_start: boolean
+  maintenance_mode: boolean
   ssh_port: number
   last_seen_at?: string
   patroni_state?: Record<string, unknown>
@@ -73,5 +74,44 @@ export const nodesApi = {
       .post<{ task_id: string; status: string }>(
         `/clusters/${clusterId}/nodes/${nodeId}/restart-rq`
       )
+      .then((r) => r.data),
+
+  downloadAgentEnv: async (clusterId: string, nodeId: string, hostname: string) => {
+    const response = await client.post(
+      `/clusters/${clusterId}/nodes/${nodeId}/agent-env`,
+      {},
+      { responseType: 'blob' }
+    )
+    const url = window.URL.createObjectURL(response.data as Blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `netbox-agent-${hostname}.env`
+    a.click()
+    window.URL.revokeObjectURL(url)
+  },
+
+  setMaintenance: (clusterId: string, nodeId: string, enabled: boolean) =>
+    client
+      .put<Node>(`/clusters/${clusterId}/nodes/${nodeId}/maintenance`, { enabled })
+      .then((r) => r.data),
+
+  getLogs: (clusterId: string, nodeId: string, lines = 200, source: 'agent' | 'netbox' = 'agent', logName?: string) =>
+    client
+      .get<{ lines: string[]; path: string; node: string }>(
+        `/clusters/${clusterId}/nodes/${nodeId}/logs`,
+        {
+          params: {
+            lines,
+            ...(source === 'netbox'
+              ? { source: 'netbox', ...(logName ? { log_name: logName } : {}) }
+              : {}),
+          },
+        }
+      )
+      .then((r) => r.data),
+
+  getNetboxLogNames: (clusterId: string, nodeId: string) =>
+    client
+      .get<{ names: string[] }>(`/clusters/${clusterId}/nodes/${nodeId}/netbox-log-names`)
       .then((r) => r.data),
 }

@@ -11,15 +11,15 @@ import (
 
 // AuditLog represents a row in the audit_logs table.
 type AuditLog struct {
-	ID               int64
-	ActorUserID      *uuid.UUID
-	ActorAgentNodeID *uuid.UUID
-	Action           string
-	TargetType       *string
-	TargetID         *uuid.UUID
-	Detail           json.RawMessage
-	Outcome          *string
-	CreatedAt        time.Time
+	ID               int64           `json:"id"`
+	ActorUserID      *uuid.UUID      `json:"actor_user_id"`
+	ActorAgentNodeID *uuid.UUID      `json:"actor_agent_node_id"`
+	Action           string          `json:"action"`
+	TargetType       *string         `json:"target_type"`
+	TargetID         *uuid.UUID      `json:"target_id"`
+	Detail           json.RawMessage `json:"detail"`
+	Outcome          *string         `json:"outcome"`
+	CreatedAt        time.Time       `json:"created_at"`
 }
 
 // AuditQuerier handles audit log operations.
@@ -54,6 +54,40 @@ type ListAuditParams struct {
 	TargetID *uuid.UUID
 	Limit    int
 	Offset   int
+}
+
+// ListByCluster returns audit logs scoped to a cluster: entries targeting the cluster
+// itself or any node that belongs to it.
+func (q *AuditQuerier) ListByCluster(ctx context.Context, clusterID uuid.UUID, limit int) ([]AuditLog, error) {
+	if limit == 0 {
+		limit = 200
+	}
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, actor_user_id, actor_agent_node_id, action, target_type, target_id,
+		       detail, outcome, created_at
+		FROM audit_logs
+		WHERE target_id = $1
+		   OR target_id IN (SELECT id FROM nodes WHERE cluster_id = $1)
+		ORDER BY created_at DESC
+		LIMIT $2
+	`, clusterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []AuditLog
+	for rows.Next() {
+		var l AuditLog
+		if err := rows.Scan(
+			&l.ID, &l.ActorUserID, &l.ActorAgentNodeID, &l.Action,
+			&l.TargetType, &l.TargetID, &l.Detail, &l.Outcome, &l.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		logs = append(logs, l)
+	}
+	return logs, rows.Err()
 }
 
 func (q *AuditQuerier) List(ctx context.Context, p ListAuditParams) ([]AuditLog, error) {

@@ -9,14 +9,18 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
 // Session represents a single authenticated agent WebSocket connection.
 type Session struct {
-	NodeID    uuid.UUID
-	ClusterID uuid.UUID
-	conn      *websocket.Conn
+	NodeID          uuid.UUID
+	ClusterID       uuid.UUID
+	// NetboxLogPathFn derives the on-disk path for a forwarded NetBox log file.
+	// logFilename is the base name as reported by the agent, e.g. "netbox.log".
+	// Nil when the node was connected before log-forwarding was configured.
+	NetboxLogPathFn func(logFilename string) string
+	conn            *websocket.Conn
 
 	// send is a buffered channel of outbound envelopes.
 	// The write pump drains it; callers should never block on it.

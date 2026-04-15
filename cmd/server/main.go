@@ -4,20 +4,24 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/abottVU/netbox-failover/internal/server/api"
-	"github.com/abottVU/netbox-failover/internal/server/api/handlers"
-	"github.com/abottVU/netbox-failover/internal/server/crypto"
-	"github.com/abottVU/netbox-failover/internal/server/db"
-	"github.com/abottVU/netbox-failover/internal/server/db/queries"
-	"github.com/abottVU/netbox-failover/internal/server/hub"
-	"github.com/abottVU/netbox-failover/internal/server/patroni"
-	"github.com/abottVU/netbox-failover/internal/server/sse"
+	"github.com/averyhabbott/netbox-conductor/internal/server/api"
+	"github.com/averyhabbott/netbox-conductor/internal/server/api/handlers"
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
+	"github.com/averyhabbott/netbox-conductor/internal/server/db"
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
+	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
+	"github.com/averyhabbott/netbox-conductor/internal/server/scheduler"
+	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
+	"github.com/averyhabbott/netbox-conductor/internal/server/tlscert"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -42,8 +46,31 @@ func run(ctx context.Context) error {
 	jwtSecret := []byte(requireEnv("JWT_SECRET"))
 	addr := envOr("LISTEN_ADDR", ":8080")
 	migrationPath := envOr("MIGRATION_PATH", "file://internal/server/db/migrations")
-	serverURL := envOr("SERVER_URL", "")    // base URL shown in agent ENV snippets
-	serverBindIP := envOr("SERVER_BIND_IP", "") // IP for witness to listen on
+	serverURL := envOr("SERVER_URL", "")         // base URL shown in agent ENV snippets
+	serverBindIP := envOr("SERVER_BIND_IP", "")  // IP for witness to listen on
+	logDir := envOr("LOG_DIR", "/var/log")
+	logName := envOr("LOG_NAME", "netbox-conductor")
+	logLevel := envOr("LOG_LEVEL", "info")
+	agentBinDir := envOr("AGENT_BIN_DIR", "/var/lib/netbox-conductor/bin") // directory holding pre-built agent binaries
+	tlsCertFile := envOr("TLS_CERT_FILE", "/etc/netbox-conductor/tls.crt")
+	tlsKeyFile := envOr("TLS_KEY_FILE", "/etc/netbox-conductor/tls.key")
+
+	// Structured logging — routes all log.Printf calls through slog at Info level.
+	logger := logging.Setup(logDir, logName, logLevel)
+	slog.SetDefault(logger)
+
+	// TLS — generate self-signed ECDSA cert on first run (or when expiring).
+	// Falls back to plain HTTP if the cert directory is not writable (e.g. dev).
+	dnsNames, ipAddrs := tlscert.SANsFromServerURL(serverURL)
+	if generated, err := tlscert.EnsureExists(tlsCertFile, tlsKeyFile, dnsNames, ipAddrs); err != nil {
+		slog.Warn("TLS cert generation failed — falling back to plain HTTP (not recommended for production)", "error", err)
+		tlsCertFile = ""
+		tlsKeyFile = ""
+	} else if generated {
+		slog.Info("generated new TLS certificate", "cert", tlsCertFile)
+	} else {
+		slog.Info("TLS certificate loaded", "cert", tlsCertFile)
+	}
 
 	// Master encryption key
 	mk, err := crypto.LoadMasterKey(true)
@@ -72,6 +99,9 @@ func run(ctx context.Context) error {
 	nodeQ := queries.NewNodeQuerier(store.Pool())
 	agentTokQ := queries.NewAgentTokenQuerier(store.Pool())
 	regTokQ := queries.NewRegistrationTokenQuerier(store.Pool())
+	stagingTokQ := queries.NewStagingTokenQuerier(store.Pool())
+	stagingAgentQ := queries.NewStagingAgentQuerier(store.Pool())
+	retentionQ := queries.NewRetentionQuerier(store.Pool())
 	clusterQ := queries.NewClusterQuerier(store.Pool())
 	credQ := queries.NewCredentialQuerier(store.Pool())
 	auditQ := queries.NewAuditQuerier(store.Pool())
@@ -88,19 +118,26 @@ func run(ctx context.Context) error {
 	dispatcher := hub.NewDispatcher(h)
 	broker := sse.New()
 
+	// Background task sweeper — times out stuck tasks
+	taskSweeper := scheduler.NewTaskSweeper(taskQ)
+	go taskSweeper.Run(ctx)
+
 	// Patroni witness manager
 	witnessManager := patroni.NewWitnessManager(patroni.WitnessConfig{
 		ServerAddr: serverBindIP,
 	})
 
 	// Handlers
-	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret)
-	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, taskQ, enc)
-	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, enc)
-	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, h, serverURL)
+	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, enc)
+	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, logDir, logName)
+	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
+	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, enc, witnessManager)
+	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, broker, serverURL, logDir, logName)
 	credHandler := handlers.NewCredentialHandler(credQ, enc)
+	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker)
-	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, taskQ, enc, dispatcher, witnessManager)
+	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, taskQ, retentionQ, enc, dispatcher, witnessManager)
+	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)
 
 	// Router
 	e := api.New(api.RouterConfig{
@@ -109,8 +146,11 @@ func run(ctx context.Context) error {
 		ClusterHandler:    clusterHandler,
 		NodeHandler:       nodeHandler,
 		CredentialHandler: credHandler,
+		DownloadHandler:   downloadHandler,
 		ConfigHandler:     configHandler,
 		PatroniHandler:    patroniHandler,
+		StagingHandler:    stagingHandler,
+		MetricsHandler:    metricsHandler,
 		TaskResultQuerier: taskQ,
 		SSEBroker:         broker,
 		AuditQuerier:      auditQ,
@@ -128,9 +168,16 @@ func run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("server listening on %s", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+		if tlsCertFile != "" {
+			slog.Info("server listening (HTTPS)", "addr", addr, "cert", tlsCertFile)
+			if err := srv.ListenAndServeTLS(tlsCertFile, tlsKeyFile); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
+		} else {
+			slog.Warn("server listening (HTTP — TLS disabled, not recommended for production)", "addr", addr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
 		}
 	}()
 
@@ -138,7 +185,8 @@ func run(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		log.Println("shutting down...")
+		slog.Info("shutting down — draining agent connections")
+		h.DrainAll() // send close frame to all connected agents before HTTP shutdown
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)

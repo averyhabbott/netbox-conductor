@@ -4,20 +4,27 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/abottVU/netbox-failover/internal/server/crypto"
-	"github.com/abottVU/netbox-failover/internal/server/db/queries"
-	"github.com/abottVU/netbox-failover/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 )
 
+// WitnessManager is the subset of patroni.WitnessManager used by ClusterHandler.
+type WitnessManager interface {
+	Stop(clusterID uuid.UUID)
+}
+
 // ClusterHandler handles cluster CRUD endpoints.
 type ClusterHandler struct {
-	clusters *queries.ClusterQuerier
-	nodes    *queries.NodeQuerier
-	regToks  *queries.RegistrationTokenQuerier
-	hub      *hub.Hub
-	enc      *crypto.Encryptor
+	clusters  *queries.ClusterQuerier
+	nodes     *queries.NodeQuerier
+	regToks   *queries.RegistrationTokenQuerier
+	hub       *hub.Hub
+	enc       *crypto.Encryptor
+	witnesses WitnessManager
 }
 
 func NewClusterHandler(
@@ -26,13 +33,15 @@ func NewClusterHandler(
 	regToks *queries.RegistrationTokenQuerier,
 	h *hub.Hub,
 	enc *crypto.Encryptor,
+	witnesses *patroni.WitnessManager,
 ) *ClusterHandler {
 	return &ClusterHandler{
-		clusters: clusters,
-		nodes:    nodes,
-		regToks:  regToks,
-		hub:      h,
-		enc:      enc,
+		clusters:  clusters,
+		nodes:     nodes,
+		regToks:   regToks,
+		hub:       h,
+		enc:       enc,
+		witnesses: witnesses,
 	}
 }
 
@@ -198,14 +207,28 @@ func (h *ClusterHandler) UpdateFailoverSettings(c echo.Context) error {
 
 // Delete godoc
 // DELETE /api/v1/clusters/:id
+// Disconnects all connected agents, stops the Patroni witness, then deletes
+// the cluster and all child records (cascaded in DB).
 func (h *ClusterHandler) Delete(c echo.Context) error {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
 	}
 
-	if err := h.clusters.Delete(c.Request().Context(), id); err != nil {
+	// Verify cluster exists before doing anything destructive
+	if _, err := h.clusters.GetByID(c.Request().Context(), id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	}
+
+	// Disconnect all agents in this cluster
+	h.hub.UnregisterCluster(id)
+
+	// Stop the Patroni witness subprocess (no-op if none running)
+	h.witnesses.Stop(id)
+
+	// Delete from DB — CASCADE handles nodes, credentials, configs, tokens, tasks, audit logs
+	if err := h.clusters.Delete(c.Request().Context(), id); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete cluster")
 	}
 
 	return c.NoContent(http.StatusNoContent)

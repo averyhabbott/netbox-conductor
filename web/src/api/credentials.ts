@@ -17,6 +17,18 @@ export interface Credential {
   rotated_at?: string
 }
 
+export interface GeneratedCredential {
+  kind: CredentialKind
+  username: string
+  password: string
+  db_name?: string
+}
+
+export interface GenerateCredentialsResponse {
+  generated: GeneratedCredential[]
+  warning: string
+}
+
 export const credentialsApi = {
   list: (clusterId: string) =>
     client.get<Credential[]>(`/clusters/${clusterId}/credentials`).then((r) => r.data),
@@ -28,6 +40,11 @@ export const credentialsApi = {
   ) =>
     client
       .put<Credential>(`/clusters/${clusterId}/credentials/${kind}`, body)
+      .then((r) => r.data),
+
+  generateCredentials: (clusterId: string) =>
+    client
+      .post<GenerateCredentialsResponse>(`/clusters/${clusterId}/credentials/generate`)
       .then((r) => r.data),
 }
 

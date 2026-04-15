@@ -28,6 +28,7 @@ type Config struct {
 	// NetBox paths
 	NetboxConfigPath string
 	NetboxMediaRoot  string
+	NetboxLogPath    string
 
 	// Patroni
 	PatroniRESTURL string
@@ -51,6 +52,7 @@ func Load(envFile string) (*Config, error) {
 		LogLevel:              envOr("AGENT_LOG_LEVEL", "info"),
 		NetboxConfigPath:      envOr("NETBOX_CONFIG_PATH", "/opt/netbox/netbox/netbox/configuration.py"),
 		NetboxMediaRoot:       envOr("NETBOX_MEDIA_ROOT", "/opt/netbox/netbox/media"),
+		NetboxLogPath:         os.Getenv("NETBOX_LOG_PATH"),
 		PatroniRESTURL:        envOr("PATRONI_REST_URL", "http://127.0.0.1:8008"),
 		ReconnectIntervalSecs: envInt("AGENT_RECONNECT_INTERVAL_SECS", 10),
 	}
@@ -65,8 +67,13 @@ func (c *Config) validate() error {
 	if c.ServerURL == "" {
 		return fmt.Errorf("AGENT_SERVER_URL is required")
 	}
+	// Accept https:// and http:// by converting to the WebSocket equivalents.
+	c.ServerURL = strings.NewReplacer(
+		"https://", "wss://",
+		"http://", "ws://",
+	).Replace(c.ServerURL)
 	if !strings.HasPrefix(c.ServerURL, "wss://") && !strings.HasPrefix(c.ServerURL, "ws://") {
-		return fmt.Errorf("AGENT_SERVER_URL must start with wss:// or ws://")
+		return fmt.Errorf("AGENT_SERVER_URL must start with https://, wss://, http://, or ws://")
 	}
 	if strings.HasPrefix(c.ServerURL, "ws://") && !c.TLSSkipVerify {
 		return fmt.Errorf("unencrypted ws:// requires AGENT_TLS_SKIP_VERIFY=true (development only)")

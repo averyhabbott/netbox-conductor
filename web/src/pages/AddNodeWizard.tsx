@@ -1,7 +1,10 @@
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { nodesApi } from '../api/nodes'
+import client from '../api/client'
 import type { CreateNodeBody, Node, RegTokenResponse } from '../api/nodes'
+
+type Arch = 'amd64' | 'arm64'
 
 interface Props {
   clusterId: string
@@ -17,14 +20,33 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
   const [regToken, setRegToken] = useState<RegTokenResponse | null>(null)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState('')
+  const [arch, setArch] = useState<Arch>('amd64')
 
   const [form, setForm] = useState<CreateNodeBody>({
     hostname: '',
     ip_address: '',
     role: 'hyperconverged',
-    failover_priority: 100,
+    failover_priority: 50,
     ssh_port: 22,
   })
+  const [resolving, setResolving] = useState(false)
+  const [resolveError, setResolveError] = useState('')
+
+  const resolveHostname = async () => {
+    if (!form.hostname) return
+    setResolving(true)
+    setResolveError('')
+    try {
+      const { data } = await client.get<{ ip: string }>(
+        `/resolve?hostname=${encodeURIComponent(form.hostname)}`
+      )
+      setForm((f) => ({ ...f, ip_address: data.ip }))
+    } catch (e: any) {
+      setResolveError(e.response?.data?.message ?? 'Could not resolve hostname')
+    } finally {
+      setResolving(false)
+    }
+  }
 
   const createNode = useMutation({
     mutationFn: (body: CreateNodeBody) => nodesApi.create(clusterId, body),
@@ -91,6 +113,13 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
             <form
               onSubmit={(e) => {
                 e.preventDefault()
+                // If the user went Back from step 2, the node is already created.
+                // Skip the API call and advance directly.
+                if (node && node.hostname === form.hostname) {
+                  setStep(2)
+                  setError('')
+                  return
+                }
                 createNode.mutate(form)
               }}
               className="space-y-4"
@@ -98,28 +127,38 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
               <p className="text-sm text-gray-400 mb-4">
                 Enter the node's details. The agent binary will be installed manually.
               </p>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
+              <div className="flex items-end gap-2">
+                <div className="flex-1">
                   <label className="block text-xs text-gray-400 mb-1">Hostname</label>
                   <input
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-                    placeholder="nbfa-1"
+                    placeholder="netbox.example.com"
                     value={form.hostname}
-                    onChange={(e) => setForm({ ...form, hostname: e.target.value })}
+                    onChange={(e) => { setForm({ ...form, hostname: e.target.value }); setResolveError('') }}
                     required
                   />
                 </div>
-                <div>
+                <button
+                  type="button"
+                  onClick={resolveHostname}
+                  disabled={resolving || !form.hostname}
+                  className="shrink-0 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-xs px-3 py-2 rounded-lg transition-colors whitespace-nowrap"
+                  title="Resolve hostname to IP address"
+                >
+                  {resolving ? '…' : 'Resolve →'}
+                </button>
+                <div className="flex-1">
                   <label className="block text-xs text-gray-400 mb-1">IP Address</label>
                   <input
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-                    placeholder="192.168.1.10"
+                    placeholder="198.51.100.1"
                     value={form.ip_address}
                     onChange={(e) => setForm({ ...form, ip_address: e.target.value })}
                     required
                   />
                 </div>
               </div>
+              {resolveError && <p className="text-xs text-red-400 -mt-2">{resolveError}</p>}
               <div>
                 <label className="block text-xs text-gray-400 mb-1">Role</label>
                 <select
@@ -145,8 +184,9 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
                       setForm({ ...form, failover_priority: Number(e.target.value) })
                     }
                     min={1}
+                    max={100}
                   />
-                  <p className="text-xs text-gray-600 mt-1">Lower = preferred primary</p>
+                  <p className="text-xs text-gray-600 mt-1">Higher = preferred primary (1–100)</p>
                 </div>
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">SSH Port</label>
@@ -191,27 +231,46 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
               </div>
 
               <p className="text-sm text-gray-300 font-medium">
-                Step 2: Install the agent binary on the node
+                Step 2: Install the agent on the node
               </p>
               <p className="text-sm text-gray-400">
-                SSH into <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">{node.hostname}</code> and run:
+                SSH into{' '}
+                <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">{node.hostname}</code>{' '}
+                and run the following as a user with <strong className="text-gray-300">sudo</strong> access:
               </p>
 
+              {/* Arch selector */}
+              <div className="flex items-center gap-2 text-xs text-gray-400">
+                <span>Architecture:</span>
+                {(['amd64', 'arm64'] as Arch[]).map((a) => (
+                  <button
+                    key={a}
+                    type="button"
+                    onClick={() => setArch(a)}
+                    className={`px-2.5 py-1 rounded font-mono transition-colors ${
+                      arch === a
+                        ? 'bg-blue-700 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                    }`}
+                  >
+                    {a}
+                  </button>
+                ))}
+              </div>
+
               <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre-wrap">
-{`# Download and install the agent
-curl -fsSL https://your-tool-server/api/v1/downloads/agent-linux-arm64 \\
-  -o /usr/local/bin/netbox-agent
-chmod +x /usr/local/bin/netbox-agent
+{`# Download the agent package
+curl -fsSL ${window.location.origin}/api/v1/downloads/agent-linux-${arch} \\
+  -o netbox-agent.tar.gz
+tar -xzf netbox-agent.tar.gz
 
-# Create dedicated service user
-useradd -r -s /bin/false -G netbox netbox-agent
-
-# Create config directory
-mkdir -p /etc/netbox-agent`}
+# Run the installer — creates user/group, installs binary,
+# copies env file, installs and enables the systemd service
+sudo bash install.sh`}
               </pre>
 
               <p className="text-xs text-gray-500">
-                Once the binary is installed, click Continue to get the registration token.
+                Once installation is complete, click Continue to generate the registration token.
               </p>
 
               {error && <p className="text-sm text-red-400">{error}</p>}
@@ -222,10 +281,11 @@ mkdir -p /etc/netbox-agent`}
                   disabled={generateToken.isPending}
                   className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-medium transition-colors"
                 >
-                  {generateToken.isPending ? 'Generating…' : 'Generate Token →'}
+                  {generateToken.isPending ? 'Generating…' : 'Continue →'}
                 </button>
                 <button
-                  onClick={() => setStep(1)}
+                  type="button"
+                  onClick={() => { setStep(1); setError('') }}
                   className="bg-gray-800 hover:bg-gray-700 rounded-lg px-4 py-2 text-sm transition-colors"
                 >
                   Back
@@ -241,8 +301,10 @@ mkdir -p /etc/netbox-agent`}
                 Step 3: Configure and start the agent
               </p>
               <p className="text-sm text-gray-400">
-                On <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">{node.hostname}</code>,
-                create <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">/etc/netbox-agent/netbox-agent.env</code> with:
+                On{' '}
+                <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">{node.hostname}</code>,
+                save the following to{' '}
+                <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">/etc/netbox-agent/netbox-agent.env</code>:
               </p>
 
               <div className="relative">
@@ -258,15 +320,12 @@ mkdir -p /etc/netbox-agent`}
               </div>
 
               <p className="text-xs text-yellow-500/80">
-                ⚠ This token expires at {new Date(regToken.expires_at).toLocaleTimeString()} —
+                This token expires at {new Date(regToken.expires_at).toLocaleTimeString()} —
                 start the agent before then.
               </p>
 
               <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300">
-{`# Install and start the systemd service
-# (see deployments/agent/netbox-agent.service)
-systemctl daemon-reload
-systemctl enable --now netbox-agent`}
+{`sudo systemctl start netbox-agent`}
               </pre>
 
               <p className="text-sm text-gray-400">
@@ -274,12 +333,21 @@ systemctl enable --now netbox-agent`}
                 on the cluster page once the agent connects.
               </p>
 
-              <button
-                onClick={onClose}
-                className="w-full bg-emerald-700 hover:bg-emerald-600 rounded-lg py-2 text-sm font-medium transition-colors"
-              >
-                Done — Back to Cluster
-              </button>
+              <div className="flex gap-3">
+                <button
+                  onClick={onClose}
+                  className="flex-1 bg-emerald-700 hover:bg-emerald-600 rounded-lg py-2 text-sm font-medium transition-colors"
+                >
+                  Done — Back to Cluster
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  className="bg-gray-800 hover:bg-gray-700 rounded-lg px-4 py-2 text-sm transition-colors"
+                >
+                  Back
+                </button>
+              </div>
             </div>
           )}
         </div>

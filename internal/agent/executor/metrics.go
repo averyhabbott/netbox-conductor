@@ -15,7 +15,7 @@ import (
 	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
 
-	"github.com/abottVU/netbox-failover/internal/shared/protocol"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
 // MetricsCollector gathers system metrics and service state for heartbeats.

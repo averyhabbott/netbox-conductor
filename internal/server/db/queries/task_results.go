@@ -110,6 +110,79 @@ func (q *TaskResultQuerier) ListByNode(ctx context.Context, nodeID uuid.UUID, li
 	return results, rows.Err()
 }
 
+// TimeoutStale marks tasks that have been stuck in "sent" or "ack" status longer
+// than the given durations as "timeout". Returns the number of rows affected.
+func (q *TaskResultQuerier) TimeoutStale(ctx context.Context, sentTimeout, ackTimeout time.Duration) (int64, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE task_results
+		SET status = 'timeout', completed_at = now()
+		WHERE (status = 'sent' AND queued_at < now() - $1::interval)
+		   OR (status = 'ack'  AND queued_at < now() - $2::interval)`,
+		sentTimeout.String(), ackTimeout.String())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ListPendingByNode returns tasks in "sent" state for a node. These are tasks
+// that were dispatched before a disconnect and can safely be re-sent on reconnect.
+func (q *TaskResultQuerier) ListPendingByNode(ctx context.Context, nodeID uuid.UUID) ([]TaskResult, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, node_id, task_id, task_type, status,
+		       request_payload, response_payload, queued_at, completed_at
+		FROM task_results
+		WHERE node_id = $1 AND status = 'sent'
+		ORDER BY queued_at`,
+		nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []TaskResult
+	for rows.Next() {
+		var t TaskResult
+		if err := rows.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
+			&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, t)
+	}
+	return results, rows.Err()
+}
+
+// ListByNodeIDs returns recent tasks for a set of nodes, ordered newest first.
+// Used for cluster-level history views (e.g. Patroni history across all nodes).
+func (q *TaskResultQuerier) ListByNodeIDs(ctx context.Context, nodeIDs []uuid.UUID, limit int) ([]TaskResult, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, node_id, task_id, task_type, status,
+		       request_payload, response_payload, queued_at, completed_at
+		FROM task_results
+		WHERE node_id = ANY($1)
+		ORDER BY queued_at DESC
+		LIMIT $2`,
+		nodeIDs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []TaskResult
+	for rows.Next() {
+		var t TaskResult
+		if err := rows.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
+			&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, t)
+	}
+	return results, rows.Err()
+}
+
 // ListByConfigPush returns all task results for a given set of task IDs (e.g. a push batch).
 func (q *TaskResultQuerier) ListByTaskIDs(ctx context.Context, taskIDs []uuid.UUID) ([]TaskResult, error) {
 	if len(taskIDs) == 0 {

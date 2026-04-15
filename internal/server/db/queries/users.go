@@ -10,13 +10,14 @@ import (
 
 // User represents a row in the users table.
 type User struct {
-	ID           uuid.UUID
-	Username     string
-	PasswordHash string
-	Role         string
+	ID            uuid.UUID
+	Username      string
+	PasswordHash  string
+	Role          string
 	TOTPSecretEnc []byte
-	CreatedAt    time.Time
-	LastLoginAt  *time.Time
+	TOTPEnabled   bool
+	CreatedAt     time.Time
+	LastLoginAt   *time.Time
 }
 
 // RefreshToken represents a row in the refresh_tokens table.
@@ -40,14 +41,14 @@ func NewUserQuerier(pool *pgxpool.Pool) *UserQuerier {
 
 func (q *UserQuerier) GetByUsername(ctx context.Context, username string) (*User, error) {
 	row := q.pool.QueryRow(ctx, `
-		SELECT id, username, password_hash, role, totp_secret_enc, created_at, last_login_at
+		SELECT id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
 		FROM users WHERE username = $1
 	`, username)
 
 	var u User
 	if err := row.Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-		&u.TOTPSecretEnc, &u.CreatedAt, &u.LastLoginAt,
+		&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
 	); err != nil {
 		return nil, err
 	}
@@ -56,14 +57,14 @@ func (q *UserQuerier) GetByUsername(ctx context.Context, username string) (*User
 
 func (q *UserQuerier) GetByID(ctx context.Context, id uuid.UUID) (*User, error) {
 	row := q.pool.QueryRow(ctx, `
-		SELECT id, username, password_hash, role, totp_secret_enc, created_at, last_login_at
+		SELECT id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
 		FROM users WHERE id = $1
 	`, id)
 
 	var u User
 	if err := row.Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-		&u.TOTPSecretEnc, &u.CreatedAt, &u.LastLoginAt,
+		&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
 	); err != nil {
 		return nil, err
 	}
@@ -74,13 +75,13 @@ func (q *UserQuerier) Create(ctx context.Context, username, passwordHash, role s
 	row := q.pool.QueryRow(ctx, `
 		INSERT INTO users (username, password_hash, role)
 		VALUES ($1, $2, $3)
-		RETURNING id, username, password_hash, role, totp_secret_enc, created_at, last_login_at
+		RETURNING id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
 	`, username, passwordHash, role)
 
 	var u User
 	if err := row.Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-		&u.TOTPSecretEnc, &u.CreatedAt, &u.LastLoginAt,
+		&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
 	); err != nil {
 		return nil, err
 	}
@@ -89,7 +90,7 @@ func (q *UserQuerier) Create(ctx context.Context, username, passwordHash, role s
 
 func (q *UserQuerier) List(ctx context.Context) ([]User, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, username, password_hash, role, totp_secret_enc, created_at, last_login_at
+		SELECT id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
 		FROM users ORDER BY username
 	`)
 	if err != nil {
@@ -102,7 +103,7 @@ func (q *UserQuerier) List(ctx context.Context) ([]User, error) {
 		var u User
 		if err := rows.Scan(
 			&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-			&u.TOTPSecretEnc, &u.CreatedAt, &u.LastLoginAt,
+			&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
 		); err != nil {
 			return nil, err
 		}
@@ -119,6 +120,30 @@ func (q *UserQuerier) UpdateLastLogin(ctx context.Context, id uuid.UUID) error {
 
 func (q *UserQuerier) Delete(ctx context.Context, id uuid.UUID) error {
 	_, err := q.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, id)
+	return err
+}
+
+func (q *UserQuerier) UpdateRole(ctx context.Context, id uuid.UUID, role string) error {
+	_, err := q.pool.Exec(ctx, `UPDATE users SET role = $2 WHERE id = $1`, id, role)
+	return err
+}
+
+func (q *UserQuerier) UpdatePassword(ctx context.Context, id uuid.UUID, passwordHash string) error {
+	_, err := q.pool.Exec(ctx, `UPDATE users SET password_hash = $2 WHERE id = $1`, id, passwordHash)
+	return err
+}
+
+// SetTOTP stores an encrypted TOTP secret and marks TOTP as enabled.
+func (q *UserQuerier) SetTOTP(ctx context.Context, id uuid.UUID, secretEnc []byte) error {
+	_, err := q.pool.Exec(ctx,
+		`UPDATE users SET totp_secret_enc = $2, totp_enabled = TRUE WHERE id = $1`, id, secretEnc)
+	return err
+}
+
+// ClearTOTP removes the TOTP secret and disables TOTP for the user.
+func (q *UserQuerier) ClearTOTP(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx,
+		`UPDATE users SET totp_secret_enc = NULL, totp_enabled = FALSE WHERE id = $1`, id)
 	return err
 }
 
