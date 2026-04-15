@@ -16,10 +16,11 @@ StandardError=journal
 SyslogIdentifier=netbox-agent
 
 # Harden the service
-NoNewPrivileges=yes
+# Note: NoNewPrivileges is intentionally omitted — the agent needs to invoke
+# sudo to manage systemd services (netbox, patroni, redis, etc.).
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/netbox/netbox/netbox /opt/netbox/netbox/media /var/log/netbox-agent
+ReadWritePaths=/opt/netbox/netbox/netbox /opt/netbox/netbox/media /etc/patroni /etc/redis /var/log/netbox-agent
 PrivateTmp=yes
 
 [Install]

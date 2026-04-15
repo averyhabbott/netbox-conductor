@@ -68,6 +68,13 @@ func (s *Session) LastSeen() time.Time {
 	return s.lastSeen
 }
 
+// Close forces the underlying WebSocket connection closed without a close
+// handshake. Called by Hub.Register when a new connection for the same node
+// evicts this session, so readPump exits promptly instead of blocking.
+func (s *Session) Close() {
+	s.conn.CloseNow()
+}
+
 // WritePump drains the send channel and writes to the WebSocket.
 // Runs in its own goroutine; exits when ctx is cancelled or send is closed.
 func (s *Session) WritePump(ctx context.Context) {

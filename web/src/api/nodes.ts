@@ -29,7 +29,6 @@ export interface CreateNodeBody {
 
 export interface RegTokenResponse {
   token: string
-  expires_at: string
   env_snippet: string
   node_id: string
   hostname: string

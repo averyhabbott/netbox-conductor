@@ -18,3 +18,9 @@ var ServiceFile []byte
 //
 //go:embed install.sh
 var InstallScript []byte
+
+// SudoersFile is the contents of netbox-agent-sudoers, installed to
+// /etc/sudoers.d/netbox-agent during agent setup.
+//
+//go:embed netbox-agent-sudoers
+var SudoersFile []byte

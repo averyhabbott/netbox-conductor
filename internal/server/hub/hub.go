@@ -23,23 +23,41 @@ func New() *Hub {
 }
 
 // Register adds a session. If a session for the same NodeID already exists
-// (stale connection), it is evicted first.
+// (stale connection), it is evicted first: its send channel is closed so the
+// write pump exits, and the WebSocket is force-closed so readPump exits too.
 func (h *Hub) Register(s *Session) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if old, ok := h.sessions[s.NodeID]; ok {
 		close(old.send) // signal the old write pump to exit
+		old.Close()     // force readPump to exit so connectNode can clean up
 	}
 	h.sessions[s.NodeID] = s
 }
 
-// Unregister removes a session by NodeID.
+// Unregister removes a session by NodeID. Used for forced removal (e.g. node
+// deletion). For normal session teardown in connectNode, use UnregisterIfSame
+// to avoid accidentally evicting a replacement session.
 func (h *Hub) Unregister(nodeID uuid.UUID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s, ok := h.sessions[nodeID]; ok {
 		close(s.send)
 		delete(h.sessions, nodeID)
+	}
+}
+
+// UnregisterIfSame removes the session for nodeID only when the currently
+// registered session is the same object as s. This prevents a connectNode
+// defer from evicting a replacement session that was registered after this
+// one was evicted by Hub.Register.
+func (h *Hub) UnregisterIfSame(nodeID uuid.UUID, s *Session) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if existing, ok := h.sessions[nodeID]; ok && existing == s {
+		delete(h.sessions, nodeID)
+		// send is already closed (by Register's eviction or WritePump exit).
+		// pumpCtx will be cancelled by connectNode's defer pumpCancel().
 	}
 }
 

@@ -225,7 +225,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartNetbox:
-		cmd := exec.Command("systemctl", "restart", "netbox", "netbox-rq")
+		cmd := exec.Command("sudo", "systemctl", "restart", "netbox", "netbox-rq")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -235,7 +235,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskStartNetbox:
-		cmd := exec.Command("systemctl", "start", "netbox", "netbox-rq")
+		cmd := exec.Command("sudo", "systemctl", "start", "netbox", "netbox-rq")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -245,7 +245,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskStopNetbox:
-		cmd := exec.Command("systemctl", "stop", "netbox", "netbox-rq")
+		cmd := exec.Command("sudo", "systemctl", "stop", "netbox", "netbox-rq")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -255,7 +255,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartRQ:
-		cmd := exec.Command("systemctl", "restart", "netbox-rq")
+		cmd := exec.Command("sudo", "systemctl", "restart", "netbox-rq")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -279,7 +279,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartPatroni:
-		cmd := exec.Command("systemctl", "restart", "patroni")
+		cmd := exec.Command("sudo", "systemctl", "restart", "patroni")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -289,7 +289,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartRedis:
-		cmd := exec.Command("systemctl", "restart", "redis")
+		cmd := exec.Command("sudo", "systemctl", "restart", "redis")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -299,7 +299,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartSentinel:
-		cmd := exec.Command("systemctl", "restart", "redis-sentinel")
+		cmd := exec.Command("sudo", "systemctl", "restart", "redis-sentinel")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {

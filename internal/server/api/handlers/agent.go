@@ -270,7 +270,7 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	defer func() {
 		agentLog.Logger.Info("agent disconnected")
 		agentLog.Close()
-		h.hub.Unregister(nodeID)
+		h.hub.UnregisterIfSame(nodeID, sess)
 		_ = h.nodes.UpdateAgentStatus(context.Background(), nodeID, "disconnected")
 		h.broker.Publish(sse.Event{
 			Type:   sse.EventNodeStatus,

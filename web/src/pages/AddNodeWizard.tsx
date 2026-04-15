@@ -319,11 +319,6 @@ sudo bash install.sh`}
                 </button>
               </div>
 
-              <p className="text-xs text-yellow-500/80">
-                This token expires at {new Date(regToken.expires_at).toLocaleTimeString()} —
-                start the agent before then.
-              </p>
-
               <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300">
 {`sudo systemctl start netbox-agent`}
               </pre>

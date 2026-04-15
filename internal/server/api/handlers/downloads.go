@@ -56,6 +56,7 @@ func (h *DownloadHandler) AgentBinary(arch string) echo.HandlerFunc {
 			{"netbox-agent", 0755, binData},
 			{"netbox-agent.env.example", 0644, agentbundle.EnvExample},
 			{"netbox-agent.service", 0644, agentbundle.ServiceFile},
+			{"netbox-agent-sudoers", 0440, agentbundle.SudoersFile},
 			{"install.sh", 0755, agentbundle.InstallScript},
 		}
 
