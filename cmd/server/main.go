@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -44,10 +46,25 @@ func main() {
 func run(ctx context.Context) error {
 	dsn := requireEnv("DATABASE_URL")
 	jwtSecret := []byte(requireEnv("JWT_SECRET"))
-	addr := envOr("LISTEN_ADDR", ":8080")
+	addr := envOr("LISTEN_ADDR", ":8443")
 	migrationPath := envOr("MIGRATION_PATH", "file://internal/server/db/migrations")
 	serverURL := envOr("SERVER_URL", "")         // base URL shown in agent ENV snippets
 	serverBindIP := envOr("SERVER_BIND_IP", "")  // IP for witness to listen on
+
+	// If SERVER_URL has no explicit port, append the port from LISTEN_ADDR so
+	// that generated agent env snippets connect on the right port without
+	// requiring the operator to duplicate it in both env vars.
+	if serverURL != "" {
+		if u, err := url.Parse(serverURL); err == nil && u.Port() == "" {
+			if _, port, err := net.SplitHostPort(addr); err == nil && port != "" {
+				isDefault := (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80")
+				if !isDefault {
+					u.Host = u.Hostname() + ":" + port
+					serverURL = u.String()
+				}
+			}
+		}
+	}
 	logDir := envOr("LOG_DIR", "/var/log")
 	logName := envOr("LOG_NAME", "netbox-conductor")
 	logLevel := envOr("LOG_LEVEL", "info")

@@ -105,6 +105,20 @@ The server binary embeds the compiled frontend (`go:embed`), so there is only on
 
 The conductor server and build toolchain are tested on **Linux (arm64/amd64)** and **macOS**. The agent binary targets Linux only.
 
+#### Git and Make
+
+**macOS:**
+
+```bash
+brew install git make
+```
+
+**Linux (Ubuntu/Debian):**
+
+```bash
+sudo apt-get install -y git make
+```
+
 #### Go 1.25+
 
 **macOS:**
@@ -170,6 +184,14 @@ git clone https://github.com/averyhabbott/netbox-conductor.git
 cd netbox-conductor
 ```
 
+### Install Frontend Dependencies
+
+```bash
+cd web && npm install && cd ..
+```
+
+This only needs to be run once after cloning (and again after pulling changes that update `web/package.json`).
+
 ### Build
 
 ```bash
@@ -223,56 +245,9 @@ sudo cp bin/netbox-agent-linux-arm64 /var/lib/netbox-conductor/bin/
 sudo chmod +x /var/lib/netbox-conductor/bin/netbox-agent-linux-*
 ```
 
-**4. Configure the environment:**
+**4. Create the database user and database:**
 
-```bash
-sudo cp deployments/server/netbox-conductor.env.example /etc/netbox-conductor/netbox-conductor.env
-sudo chown root:netbox-conductor /etc/netbox-conductor/netbox-conductor.env
-sudo chmod 640 /etc/netbox-conductor/netbox-conductor.env
-```
-
-Generate a JWT signing secret:
-
-```bash
-openssl rand -hex 32
-```
-
-Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required values:
-
-```bash
-# PostgreSQL connection string — use the user/password created in Step 6
-DATABASE_URL=postgres://netbox_conductor:<password>@localhost:5432/netbox_conductor?sslmode=disable
-
-# Paste the output of: openssl rand -hex 32
-JWT_SECRET=<openssl output>
-
-# Public base URL — must include the port if the conductor is not on 443
-SERVER_URL=https://your-conductor.example.com:8443
-
-LISTEN_ADDR=:8443
-LOG_DIR=/var/log
-LOG_NAME=netbox-conductor
-LOG_LEVEL=info
-
-# Uncomment and set the master key path (key is generated in Step 5)
-NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
-
-# TLS cert paths — auto-generated on first start if absent
-TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
-TLS_KEY_FILE=/etc/netbox-conductor/tls.key
-```
-
-**5. Generate the master key** (encrypts credentials at rest):
-
-```bash
-openssl rand -hex 32 | sudo tee /etc/netbox-conductor/master.key
-sudo chmod 400 /etc/netbox-conductor/master.key
-sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor/master.key
-```
-
-**6. Create the database user and database:**
-
-First, generate a strong database password and save it — you will need it in the `DATABASE_URL` in Step 4:
+Generate a strong database password and save it — you will need it in the next step:
 
 ```bash
 openssl rand -hex 16
@@ -293,6 +268,55 @@ sudo -u postgres createdb -O netbox_conductor netbox_conductor
 ```
 
 Migrations run automatically on first startup — no manual migration step needed.
+
+**5. Generate the master key** (encrypts credentials at rest):
+
+```bash
+openssl rand -hex 32 | sudo tee /etc/netbox-conductor/master.key
+sudo chmod 400 /etc/netbox-conductor/master.key
+sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor/master.key
+```
+
+**6. Configure the environment:**
+
+```bash
+sudo cp deployments/server/netbox-conductor.env.example /etc/netbox-conductor/netbox-conductor.env
+sudo chown root:netbox-conductor /etc/netbox-conductor/netbox-conductor.env
+sudo chmod 640 /etc/netbox-conductor/netbox-conductor.env
+```
+
+Generate a JWT signing secret:
+
+```bash
+openssl rand -hex 32
+```
+
+Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required values:
+
+```bash
+# PostgreSQL connection string — use the password generated in Step 4
+DATABASE_URL=postgres://netbox_conductor:<password>@localhost:5432/netbox_conductor?sslmode=disable
+
+# Paste the output of: openssl rand -hex 32
+JWT_SECRET=<openssl output>
+
+# Public base URL — port is taken from LISTEN_ADDR automatically
+SERVER_URL=https://your-conductor.example.com
+
+# Port 8443 is the default. Port 443 (standard HTTPS) requires root or CAP_NET_BIND_SERVICE;
+# the netbox-conductor service user has neither, so 8443 is used instead.
+LISTEN_ADDR=:8443
+LOG_DIR=/var/log
+LOG_NAME=netbox-conductor
+LOG_LEVEL=info
+
+# Uncomment and set the master key path (generated in Step 5)
+NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
+
+# TLS cert paths — auto-generated on first start if absent
+TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
+TLS_KEY_FILE=/etc/netbox-conductor/tls.key
+```
 
 **7. Install and start the systemd service:**
 
@@ -426,7 +450,7 @@ createdb netbox_conductor_dev
 # 2. Copy and edit the server env
 cp deployments/server/netbox-conductor.env.example .env
 # Edit DATABASE_URL, JWT_SECRET
-# Set SERVER_URL=https://localhost:8443  (must include port for agent env snippets)
+# Set SERVER_URL=https://localhost  (port is taken from LISTEN_ADDR automatically)
 
 # 3. Start the backend (auto-runs migrations, serves API on :8443 by default)
 make dev
