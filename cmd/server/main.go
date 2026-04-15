@@ -17,6 +17,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/handlers"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db"
+	dbmigrations "github.com/averyhabbott/netbox-conductor/internal/server/db/migrations"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
@@ -26,7 +27,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/tlscert"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
@@ -47,7 +48,6 @@ func run(ctx context.Context) error {
 	dsn := requireEnv("DATABASE_URL")
 	jwtSecret := []byte(requireEnv("JWT_SECRET"))
 	addr := envOr("LISTEN_ADDR", ":8443")
-	migrationPath := envOr("MIGRATION_PATH", "file://internal/server/db/migrations")
 	serverURL := envOr("SERVER_URL", "")         // base URL shown in agent ENV snippets
 	serverBindIP := envOr("SERVER_BIND_IP", "")  // IP for witness to listen on
 
@@ -105,7 +105,7 @@ func run(ctx context.Context) error {
 	log.Println("database connected")
 
 	// Migrations
-	if err := runMigrations(dsn, migrationPath); err != nil {
+	if err := runMigrations(dsn); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
 	log.Println("migrations applied")
@@ -210,7 +210,7 @@ func run(ctx context.Context) error {
 	}
 }
 
-func runMigrations(dsn, migrationPath string) error {
+func runMigrations(dsn string) error {
 	migrateDSN := dsn
 	if len(dsn) >= 11 && dsn[:11] == "postgres://" {
 		migrateDSN = "pgx5://" + dsn[11:]
@@ -225,7 +225,11 @@ func runMigrations(dsn, migrationPath string) error {
 		migrateDSN = fmt.Sprintf("pgx5://%s:%s@%s:%d/%s?sslmode=disable",
 			cc.User, cc.Password, cc.Host, cc.Port, cc.Database)
 	}
-	m, err := migrate.New(migrationPath, migrateDSN)
+	src, err := iofs.New(dbmigrations.FS, ".")
+	if err != nil {
+		return fmt.Errorf("creating migration source: %w", err)
+	}
+	m, err := migrate.NewWithSourceInstance("iofs", src, migrateDSN)
 	if err != nil {
 		return fmt.Errorf("creating migrator: %w", err)
 	}

@@ -294,26 +294,46 @@ openssl rand -hex 32
 Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required values:
 
 ```bash
+# ── Required ──────────────────────────────────────────────────────────────────
+
 # PostgreSQL connection string — use the password generated in Step 4
 DATABASE_URL=postgres://netbox_conductor:<password>@localhost:5432/netbox_conductor?sslmode=disable
 
-# Paste the output of: openssl rand -hex 32
+# Secret used to sign JWT tokens — paste the output of: openssl rand -hex 32
 JWT_SECRET=<openssl output>
 
-# Public base URL — port is taken from LISTEN_ADDR automatically
+# ── Network ───────────────────────────────────────────────────────────────────
+
+# Address and port the server binds to.
+# Default is 8443 — port 443 (standard HTTPS) requires root or CAP_NET_BIND_SERVICE,
+# which the netbox-conductor service user does not have.
+LISTEN_ADDR=:8443
+
+# Public base URL advertised to operators in agent ENV snippets.
+# Port is taken from LISTEN_ADDR automatically if not specified here.
 SERVER_URL=https://your-conductor.example.com
 
-# Port 8443 is the default. Port 443 (standard HTTPS) requires root or CAP_NET_BIND_SERVICE;
-# the netbox-conductor service user has neither, so 8443 is used instead.
-LISTEN_ADDR=:8443
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+# Root directory for log files
 LOG_DIR=/var/log
+
+# Instance name — becomes the top-level log subdirectory (<LOG_DIR>/<LOG_NAME>/)
 LOG_NAME=netbox-conductor
+
+# Minimum log level: debug, info, warn, error
 LOG_LEVEL=info
 
-# Uncomment and set the master key path (generated in Step 5)
+# ── Encryption ────────────────────────────────────────────────────────────────
+
+# Path to the 32-byte AES-256-GCM master key file — generated in Step 5
 NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
 
-# TLS cert paths — auto-generated on first start if absent
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+# On first startup the conductor auto-generates a self-signed ECDSA P-256 cert
+# if these files do not exist. Download the CA from /api/v1/downloads/ca.crt
+# and distribute to agent nodes (or use UPDATE_CERT=true on agents).
 TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
 TLS_KEY_FILE=/etc/netbox-conductor/tls.key
 ```
