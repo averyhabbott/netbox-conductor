@@ -377,7 +377,7 @@ function RetentionCard({ clusterId }: { clusterId: string }) {
 
   const enforce = useMutation({
     mutationFn: () => patroniApi.enforceRetention(clusterId),
-    onSuccess: (d) => setMsg(d.message ?? 'Enforcement dispatched'),
+    onSuccess: (d) => setMsg(`Enforcement dispatched to ${d.hostname}`),
     onError: (e: any) => setMsg(e?.response?.data?.message ?? 'Failed to enforce'),
   })
 
@@ -515,8 +515,10 @@ function DatabaseTab({ clusterId }: { clusterId: string }) {
     onSuccess: () => refetchTopo(),
   })
 
+  const primaryNode = topology?.nodes.find((n) => n.patroni_role === 'primary')
+
   const failover = useMutation({
-    mutationFn: () => patroniApi.failover(clusterId),
+    mutationFn: () => patroniApi.failover(clusterId, primaryNode?.hostname ?? ''),
     onSuccess: () => { refetchTopo(); setFailoverMsg('Failover dispatched.') },
     onError: (e: any) => setFailoverMsg(e?.response?.data?.message ?? 'Failover failed'),
   })

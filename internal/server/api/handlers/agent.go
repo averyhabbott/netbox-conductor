@@ -278,6 +278,7 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 
 	sess := hub.NewSession(nodeID, clusterID, conn)
 	sess.AgentVersion = hello.AgentVersion
+	sess.Arch = hello.Arch
 	h.hub.Register(sess)
 	// Capture variables for the closure — don't close over the loop-local pointers.
 	logDir, logName, cn, hn := h.logDir, h.logName, clusterName, node.Hostname

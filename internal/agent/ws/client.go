@@ -11,7 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"strings"
+	"runtime"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -125,7 +125,7 @@ func (c *Client) connect(ctx context.Context) error {
 		AgentVersion: agentVersion,
 		Hostname:     hostname,
 		OS:           "linux",
-		Arch:         "amd64",
+		Arch:         runtime.GOARCH,
 	})
 	if err := wsjson.Write(ctx, conn, protocol.Envelope{
 		ID:      newID(),
@@ -276,9 +276,3 @@ func min(a, b time.Duration) time.Duration {
 	return b
 }
 
-// isWS returns true if the URL uses the ws:// scheme.
-func isWS(url string) bool {
-	return strings.HasPrefix(url, "ws://")
-}
-
-var _ = isWS // suppress unused warning

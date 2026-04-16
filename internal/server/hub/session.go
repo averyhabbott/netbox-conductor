@@ -27,6 +27,7 @@ type Session struct {
 	NodeID          uuid.UUID
 	ClusterID       uuid.UUID
 	AgentVersion    string // from agent.hello
+	Arch            string // from agent.hello ("amd64" | "arm64")
 	NetboxVersion   string // from heartbeat; updated on each heartbeat
 	// NetboxLogPathFn derives the on-disk path for a forwarded NetBox log file.
 	// logFilename is the base name as reported by the agent, e.g. "netbox.log".

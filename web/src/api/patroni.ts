@@ -71,9 +71,9 @@ export const patroniApi = {
       )
       .then((r) => r.data),
 
-  failover: (clusterId: string, candidate?: string) =>
+  failover: (clusterId: string, master: string, candidate?: string) =>
     client
-      .post(`/clusters/${clusterId}/patroni/failover`, { candidate: candidate ?? '' })
+      .post(`/clusters/${clusterId}/patroni/failover`, { master, candidate: candidate ?? '' })
       .then((r) => r.data),
 
   getRetentionPolicy: (clusterId: string) =>
@@ -93,7 +93,7 @@ export const patroniApi = {
 
   enforceRetention: (clusterId: string) =>
     client
-      .post<{ task_id: string; message: string }>(
+      .post<{ task_id: string; node_id: string; hostname: string; status: string }>(
         `/clusters/${clusterId}/retention-policy/enforce`,
         {}
       )

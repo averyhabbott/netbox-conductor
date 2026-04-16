@@ -258,7 +258,9 @@ func (h *PatroniHandler) Switchover(c echo.Context) error {
 	var req struct {
 		Candidate string `json:"candidate"` // hostname or node_id of desired new primary; empty = let Patroni choose
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
 
 	ctx := c.Request().Context()
 	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
@@ -611,7 +613,9 @@ func (h *PatroniHandler) PushSentinelConfig(c echo.Context) error {
 	var req struct {
 		RestartAfter bool `json:"restart_after"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
 
 	ctx := c.Request().Context()
 
@@ -800,7 +804,9 @@ func (h *PatroniHandler) InstallPatroni(c echo.Context) error {
 		PackageManager string `json:"package_manager"`
 		InstallCmd     string `json:"install_cmd"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
 
 	ctx := c.Request().Context()
 	node, err := h.nodes.GetByID(ctx, nid)

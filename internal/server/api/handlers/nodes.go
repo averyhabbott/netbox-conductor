@@ -706,9 +706,11 @@ func (h *NodeHandler) UpgradeAgent(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected")
 	}
 
-	// Derive architecture from the current session's hello (stored in AgentVersion prefix if needed).
-	// Default to amd64; agent can detect its own arch.
-	arch := "amd64"
+	// Use the arch reported in the agent's hello payload; fall back to amd64.
+	arch := sess.Arch
+	if arch == "" {
+		arch = "amd64"
+	}
 	conductorURL := h.serverURL
 	if conductorURL == "" {
 		conductorURL = "https://localhost:8443"
