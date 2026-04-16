@@ -59,8 +59,13 @@ fi
 
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${INSTALL_DIR}"
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${BIN_DIR}"
-install -d -m 750 -o root            -g "${SERVICE_NAME}" "${CONF_DIR}"
+install -d -m 750 -o root             -g "${SERVICE_NAME}" "${CONF_DIR}"
 install -d -m 750 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${LOG_DIR}"
+# /var/lib/netbox-conductor must be writable by the service user so the
+# witness manager can create per-cluster raft data subdirectories at runtime.
+install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" /var/lib/netbox-conductor
+install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" /var/lib/netbox-conductor/bin
+install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" /var/lib/netbox-conductor/raft
 
 # ── Conductor binary (optional) ───────────────────────────────────────────────
 
@@ -87,11 +92,13 @@ if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
 
-echo "==> Installing Patroni and psycopg2-binary..."
+echo "==> Installing Patroni, pysyncobj, and psycopg2-binary..."
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
 # patroni ships patroni_raft_controller, the built-in Raft witness binary used
-# by the Conductor for 2-node HA clusters. psycopg2-binary is a Patroni dep.
-"${VENV_DIR}/bin/pip" install --quiet patroni psycopg2-binary
+# by the Conductor for 2-node HA clusters. pysyncobj is Patroni's Raft
+# transport layer (required by patroni_raft_controller). psycopg2-binary is
+# a Patroni dependency.
+"${VENV_DIR}/bin/pip" install --quiet patroni pysyncobj psycopg2-binary
 
 chown -R "${SERVICE_NAME}:${SERVICE_NAME}" "${VENV_DIR}"
 

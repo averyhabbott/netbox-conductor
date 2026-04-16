@@ -141,9 +141,9 @@ sudo apt-get install -y python3-venv
 # If the above fails (e.g. Python 3.13), use the version-specific package:
 #   sudo apt-get install -y python3.13-venv
 
-# Create the venv and install Patroni + its PostgreSQL adapter
+# Create the venv and install Patroni, pysyncobj, and psycopg2-binary
 sudo python3 -m venv /opt/netbox-conductor/venv
-sudo /opt/netbox-conductor/venv/bin/pip install patroni psycopg2-binary
+sudo /opt/netbox-conductor/venv/bin/pip install patroni pysyncobj psycopg2-binary
 sudo chown -R netbox-conductor:netbox-conductor /opt/netbox-conductor/venv
 ```
 
@@ -327,7 +327,7 @@ The node appears as **Connected** in the Conductor UI once the agent authenticat
 The `install.sh` script handles all of these automatically. For reference:
 
 | Path | Setup required |
-|---|---|
+| --- | --- |
 | `/opt/netbox/netbox/netbox/` | `usermod -aG netbox netbox-agent` + `chown :netbox <dir>` + `chmod g+ws <dir>` — setgid ensures files written by the agent inherit the `netbox` group and are readable by gunicorn and netbox-rq |
 | `/etc/patroni` | `mkdir -p`, `chown netbox-agent:netbox-agent`, `chmod 750` |
 | Redis Sentinel config | `usermod -aG redis netbox-agent` |
