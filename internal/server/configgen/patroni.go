@@ -31,6 +31,7 @@ type PatroniInput struct {
 	             // for distros that keep configs in the data dir.
 	ConnectAddr string // Postgres connect address (usually same as NodeAddr)
 	Port        int    // Postgres port (default 5432)
+	UseUnixSocket bool // Use unix socket for Patroni's local postgres connections (set true when unix_socket_directories is configured)
 }
 
 // RenderPatroni renders a complete patroni.yml for one node.
@@ -51,6 +52,21 @@ func RenderPatroni(in PatroniInput) (string, error) {
 	partners := make([]string, 0, len(in.RaftPartners))
 	for _, p := range in.RaftPartners {
 		partners = append(partners, fmt.Sprintf("  - %s", p))
+	}
+
+	// Auto-detect Debian/Ubuntu config layout: if DataDir is under
+	// /var/lib/postgresql/<ver>/main, set ConfigDir and UseUnixSocket
+	// automatically so Patroni finds pg_hba.conf and uses the unix socket.
+	if in.ConfigDir == "" && strings.Contains(in.DataDir, "/var/lib/postgresql/") {
+		// Extract version from path like /var/lib/postgresql/17/main
+		parts := strings.Split(in.DataDir, "/")
+		// parts: ["", "var", "lib", "postgresql", "17", "main"]
+		if len(parts) >= 6 {
+			in.ConfigDir = "/etc/postgresql/" + parts[4] + "/" + parts[5]
+		}
+	}
+	if in.ConfigDir != "" && !in.UseUnixSocket {
+		in.UseUnixSocket = true
 	}
 
 	data := struct {
@@ -146,6 +162,9 @@ postgresql:
   bin_dir: {{.BinDir}}
 {{- if .HasConfigDir}}
   config_dir: {{.ConfigDir}}
+{{- end}}
+{{- if .UseUnixSocket}}
+  use_unix_socket: true
 {{- end}}
   pgpass: /tmp/.pgpass-{{.Scope}}
   authentication:

@@ -37,7 +37,20 @@ func InstallPatroni(params protocol.PatroniInstallParams) (string, error) {
 	if err != nil {
 		return string(out), fmt.Errorf("patroni install failed: %w", err)
 	}
-	return string(out), nil
+	result := string(out)
+
+	// pysyncobj is required for Patroni's built-in Raft DCS but is not pulled
+	// in automatically by the apt package. Install it system-wide so both
+	// 'patroni' (the main daemon) and 'patroni_raft_controller' can import it.
+	// --break-system-packages is required on Python 3.11+ (PEP 668 systems).
+	pipCmd := exec.Command("sudo", "pip3", "install", "--break-system-packages", "--quiet", "pysyncobj")
+	if pipOut, pipErr := pipCmd.CombinedOutput(); pipErr != nil {
+		result += "\nwarn: pysyncobj install failed: " + pipErr.Error() + "\n" + string(pipOut)
+	} else {
+		result += "\npysyncobj installed"
+	}
+
+	return result, nil
 }
 
 func detectPackageManager() string {
