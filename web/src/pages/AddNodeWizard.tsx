@@ -19,6 +19,8 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
   const [node, setNode] = useState<Node | null>(null)
   const [regToken, setRegToken] = useState<RegTokenResponse | null>(null)
   const [copied, setCopied] = useState(false)
+  const [copiedInstall, setCopiedInstall] = useState(false)
+  const [copiedStart, setCopiedStart] = useState(false)
   const [error, setError] = useState('')
   const [arch, setArch] = useState<Arch>('amd64')
 
@@ -77,6 +79,21 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
     await navigator.clipboard.writeText(regToken.env_snippet)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
+  }
+
+  const installScript = (a: Arch) =>
+    `# Download the agent package\ncurl -fsSLk ${window.location.origin}/api/v1/downloads/agent-linux-${a} \\\n  -o netbox-agent.tar.gz\ntar -xzf netbox-agent.tar.gz\n\n# Run the installer — creates user/group, installs binary,\n# copies env file, installs and enables the systemd service\nsudo bash install.sh`
+
+  const copyInstall = async () => {
+    await navigator.clipboard.writeText(installScript(arch))
+    setCopiedInstall(true)
+    setTimeout(() => setCopiedInstall(false), 2000)
+  }
+
+  const copyStart = async () => {
+    await navigator.clipboard.writeText('sudo systemctl start netbox-agent')
+    setCopiedStart(true)
+    setTimeout(() => setCopiedStart(false), 2000)
   }
 
   return (
@@ -258,16 +275,17 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
                 ))}
               </div>
 
-              <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre-wrap">
-{`# Download the agent package
-curl -fsSLk ${window.location.origin}/api/v1/downloads/agent-linux-${arch} \\
-  -o netbox-agent.tar.gz
-tar -xzf netbox-agent.tar.gz
-
-# Run the installer — creates user/group, installs binary,
-# copies env file, installs and enables the systemd service
-sudo bash install.sh`}
-              </pre>
+              <div className="relative">
+                <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre-wrap">
+{installScript(arch)}
+                </pre>
+                <button
+                  onClick={copyInstall}
+                  className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
+                >
+                  {copiedInstall ? '✓ Copied' : 'Copy'}
+                </button>
+              </div>
 
               <p className="text-xs text-gray-500">
                 Once installation is complete, click Continue to generate the registration token.
@@ -319,9 +337,17 @@ sudo bash install.sh`}
                 </button>
               </div>
 
-              <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300">
+              <div className="relative">
+                <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300">
 {`sudo systemctl start netbox-agent`}
-              </pre>
+                </pre>
+                <button
+                  onClick={copyStart}
+                  className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
+                >
+                  {copiedStart ? '✓ Copied' : 'Copy'}
+                </button>
+              </div>
 
               <p className="text-sm text-gray-400">
                 The node will appear as <strong className="text-emerald-400">Connected</strong>{' '}

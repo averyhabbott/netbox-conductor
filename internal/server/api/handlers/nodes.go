@@ -367,7 +367,14 @@ func (h *NodeHandler) GenerateRegToken(c echo.Context) error {
 	if wsURL == "" {
 		wsURL = "wss://your-conductor"
 	}
-	envSnippet := fmt.Sprintf("AGENT_NODE_ID=%s\nAGENT_TOKEN=%s\nAGENT_SERVER_URL=%s/api/v1/agent/connect",
+	envSnippet := fmt.Sprintf(
+		"# — Required ————————————————————————————————————————————————————————\n\n"+
+			"# Assigned by the conductor during node registration\n"+
+			"AGENT_NODE_ID=%s\n\n"+
+			"# Bearer token for WebSocket authentication\n"+
+			"AGENT_TOKEN=%s\n\n"+
+			"# Conductor WebSocket URL — must use wss:// and include the port if not on 443\n"+
+			"AGENT_SERVER_URL=%s/api/v1/agent/connect",
 		node.ID.String(), rawToken, wsURL)
 
 	return c.JSON(http.StatusOK, map[string]any{
