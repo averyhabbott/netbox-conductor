@@ -19,7 +19,7 @@ No inbound firewall rules are needed on agent hosts — all traffic is agent-ini
           ┌────────┴─────────┐
           │                  │
 ┌─────────▼──────┐  ┌────────▼────────┐
-│    nbfa-1      │  │    nbfa-2       │
+│    node-1      │  │    node-2       │
 │  netbox-agent  │  │  netbox-agent   │
 │  Patroni       │  │  Patroni        │
 │  PostgreSQL    │  │  PostgreSQL     │
@@ -568,12 +568,12 @@ backend netbox_backends
     option httpchk GET /status
     http-check expect status 200
 
-    # Both nodes checked via HTTPS; nb-2 is standby (backup)
-    server nb-1 nb-1.example.com:443 ssl verify none check inter 10s fall 2 rise 1
-    server nb-2 nb-2.example.com:443 ssl verify none check inter 10s fall 2 rise 1 backup
+    # Both nodes checked via HTTPS; node-2 is standby (backup)
+    server node-1 node-1.example.com:443 ssl verify none check inter 10s fall 2 rise 1
+    server node-2 node-2.example.com:443 ssl verify none check inter 10s fall 2 rise 1 backup
 ```
 
-HAProxy marks a server down after 2 consecutive failed checks (`fall 2`) and brings it back after 1 passing check (`rise 1`). In active/standby mode only `nb-1` receives traffic; `nb-2` takes over automatically when `nb-1` returns 503.
+HAProxy marks a server down after 2 consecutive failed checks (`fall 2`) and brings it back after 1 passing check (`rise 1`). In active/standby mode only `node-1` receives traffic; `node-2` takes over automatically when `node-1` returns 503.
 
 ---
 
@@ -640,10 +640,10 @@ make typecheck  # TypeScript type check
 For the OrbStack dev environment:
 
 ```bash
-# Build and push conductor to nb-conductor@orb
+# Build and push conductor to the conductor node
 bash testing/deploy.sh
 
-# Also push agent binary, service file, and sudoers to nb-1 and nb-2
+# Also push agent binary, service file, and sudoers to agent nodes
 bash testing/deploy.sh --agents
 ```
 
