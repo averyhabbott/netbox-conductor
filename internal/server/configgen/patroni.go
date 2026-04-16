@@ -82,7 +82,7 @@ name: {{.NodeName}}
 namespace: /service/
 
 restapi:
-  listen: {{.NodeAddr}}:8008
+  listen: 0.0.0.0:8008
   connect_address: {{.NodeAddr}}:8008
   authentication:
     username: {{.RESTUsername}}
