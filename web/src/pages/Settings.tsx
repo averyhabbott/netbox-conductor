@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Layout from '../components/Layout'
 import { useAuthStore } from '../store/auth'
@@ -305,9 +305,33 @@ function RoleSelect({
 // ── System Tab ───────────────────────────────────────────────────────────────
 
 function SystemTab() {
+  const qc = useQueryClient()
+  const user = useAuthStore((s) => s.user)
+  const isAdmin = user?.role === 'admin'
+
   const { data, isLoading } = useQuery({
     queryKey: ['settings', 'tls'],
     queryFn: () => usersApi.getTLSInfo().then((r) => r.data),
+  })
+
+  const [showRegenForm, setShowRegenForm] = useState(false)
+  const [regenServerURL, setRegenServerURL] = useState('')
+  const [regenResult, setRegenResult] = useState<'success' | 'error' | null>(null)
+  const [regenError, setRegenError] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const regenMutation = useMutation({
+    mutationFn: () => usersApi.regenerateCert(regenServerURL || undefined),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings', 'tls'] })
+      setRegenResult('success')
+      setRegenError('')
+      setShowRegenForm(false)
+    },
+    onError: (err: any) => {
+      setRegenResult('error')
+      setRegenError(err?.response?.data?.message ?? 'Failed to regenerate certificate')
+    },
   })
 
   const daysUntilExpiry = data?.cert_info?.not_after
@@ -398,6 +422,74 @@ function SystemTab() {
                 Install on each agent as <code className="font-mono">AGENT_TLS_CA_CERT</code>
               </p>
             </div>
+          </div>
+        )}
+
+        {!isLoading && data?.enabled && isAdmin && (
+          <div className="mt-5 pt-4 border-t border-gray-800">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-medium text-gray-300">Generate New Certificate</h3>
+              {!showRegenForm && (
+                <button
+                  onClick={() => {
+                    setShowRegenForm(true)
+                    setRegenResult(null)
+                    setRegenError('')
+                    setTimeout(() => inputRef.current?.focus(), 50)
+                  }}
+                  className="text-sm px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded transition-colors"
+                >
+                  Generate new cert…
+                </button>
+              )}
+            </div>
+
+            {regenResult === 'success' && (
+              <div className="mb-3 px-3 py-2 bg-green-900/30 border border-green-700 rounded text-sm text-green-300">
+                Certificate regenerated. Restart the conductor service to serve the new cert, then re-download the CA cert and update all agents.
+              </div>
+            )}
+            {regenResult === 'error' && (
+              <div className="mb-3 px-3 py-2 bg-red-900/30 border border-red-700 rounded text-sm text-red-300">
+                {regenError}
+              </div>
+            )}
+
+            {showRegenForm && (
+              <div className="space-y-3 bg-gray-800/50 border border-gray-700 rounded-lg p-4">
+                <p className="text-xs text-gray-400">
+                  The new cert will include <span className="font-mono">localhost</span> and <span className="font-mono">127.0.0.1</span> as SANs. Optionally specify a hostname or IP to add (e.g. the value of your <span className="font-mono">SERVER_URL</span>).
+                </p>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">
+                    Server URL <span className="text-gray-500">(optional — e.g. https://conductor.example.com)</span>
+                  </label>
+                  <input
+                    ref={inputRef}
+                    type="text"
+                    value={regenServerURL}
+                    onChange={(e) => setRegenServerURL(e.target.value)}
+                    placeholder="https://conductor.example.com"
+                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div className="flex items-center gap-3 pt-1">
+                  <button
+                    onClick={() => { setShowRegenForm(false); setRegenError('') }}
+                    className="text-sm text-gray-400 hover:text-white transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => regenMutation.mutate()}
+                    disabled={regenMutation.isPending}
+                    className="px-4 py-1.5 text-sm bg-amber-600 hover:bg-amber-500 disabled:opacity-50 rounded transition-colors"
+                  >
+                    {regenMutation.isPending ? 'Generating…' : 'Generate'}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

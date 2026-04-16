@@ -24,3 +24,13 @@ var InstallScript []byte
 //
 //go:embed netbox-agent-sudoers
 var SudoersFile []byte
+
+// NginxConf is the nginx site config for NetBox + conductor health checks.
+//
+//go:embed nginx-netbox-conductor.conf
+var NginxConf []byte
+
+// ApacheConf is the Apache site config for NetBox + conductor health checks.
+//
+//go:embed apache-netbox-conductor.conf
+var ApacheConf []byte

@@ -46,7 +46,7 @@ def main():
     )
 
     try:
-        obj = SyncObj(self_addr, partners, cfg=conf)
+        obj = SyncObj(self_addr, partners, conf=conf)
     except Exception as e:
         print(f"ERROR: failed to start SyncObj: {e}", file=sys.stderr)
         sys.exit(1)

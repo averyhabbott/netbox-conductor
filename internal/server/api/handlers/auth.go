@@ -20,7 +20,9 @@ type AuthHandler struct {
 	users         *queries.UserQuerier
 	refreshTokens *queries.RefreshTokenQuerier
 	jwtSecret     []byte
-	certFile      string           // path to TLS cert, empty if TLS disabled
+	certFile      string            // path to TLS cert, empty if TLS disabled
+	keyFile       string            // path to TLS private key
+	serverURL     string            // SERVER_URL env value (used for cert SAN generation)
 	enc           *crypto.Encryptor // for encrypting TOTP secrets at rest
 }
 
@@ -29,6 +31,8 @@ func NewAuthHandler(
 	refreshTokens *queries.RefreshTokenQuerier,
 	jwtSecret []byte,
 	certFile string,
+	keyFile string,
+	serverURL string,
 	enc *crypto.Encryptor,
 ) *AuthHandler {
 	return &AuthHandler{
@@ -36,6 +40,8 @@ func NewAuthHandler(
 		refreshTokens: refreshTokens,
 		jwtSecret:     jwtSecret,
 		certFile:      certFile,
+		keyFile:       keyFile,
+		serverURL:     serverURL,
 		enc:           enc,
 	}
 }
@@ -324,6 +330,35 @@ func (h *AuthHandler) TLSInfo(c echo.Context) error {
 		Enabled:  info != nil,
 		CertInfo: info,
 	})
+}
+
+// RegenerateCert godoc
+// POST /api/v1/settings/tls/regenerate
+func (h *AuthHandler) RegenerateCert(c echo.Context) error {
+	if h.certFile == "" || h.keyFile == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "TLS is not enabled on this server")
+	}
+
+	var req struct {
+		ServerURL string `json:"server_url"`
+	}
+	_ = c.Bind(&req)
+
+	serverURL := h.serverURL
+	if req.ServerURL != "" {
+		serverURL = req.ServerURL
+	}
+
+	dnsNames, ipAddrs := tlscert.SANsFromServerURL(serverURL)
+	if err := tlscert.Regenerate(h.certFile, h.keyFile, dnsNames, ipAddrs); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to regenerate cert: "+err.Error())
+	}
+
+	info, err := tlscert.ReadCertInfo(h.certFile)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to read new cert info")
+	}
+	return c.JSON(http.StatusOK, tlsInfoResponse{Enabled: true, CertInfo: info})
 }
 
 // ─── TOTP ──────────────────────────────────────────────────────────────────────

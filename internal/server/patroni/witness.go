@@ -1,4 +1,4 @@
-// Package patroni manages Patroni witness subprocesses, one per active_standby cluster.
+// Package patroni manages Patroni raft-controller subprocesses, one per active_standby cluster.
 package patroni
 
 import (
@@ -16,20 +16,20 @@ import (
 )
 
 const (
-	defaultWitnessScript = "/opt/netbox-conductor/patroni-witness.py"
-	defaultPythonBin     = "/opt/netbox-conductor/venv/bin/python3"
-	defaultBasePort      = 5500
+	defaultRaftControllerBin = "/opt/netbox-conductor/venv/bin/patroni_raft_controller"
+	defaultRaftDataDir       = "/var/lib/netbox-conductor/raft"
+	defaultBasePort          = 5500
 )
 
 // WitnessConfig holds global witness configuration.
 type WitnessConfig struct {
-	ScriptPath  string // path to patroni-witness.py
-	PythonBin   string // python interpreter (venv preferred)
-	ServerAddr  string // tool server's bind address (e.g. "192.168.139.240")
-	BasePort    int    // first port to allocate; each cluster gets BasePort+N
+	RaftControllerBin string // path to patroni_raft_controller binary
+	RaftDataDir       string // base dir for per-cluster raft data (journal files)
+	ServerAddr        string // tool server's bind address (e.g. "192.168.139.240")
+	BasePort          int    // first port to allocate; each cluster gets BasePort+N
 }
 
-// WitnessManager manages one pysyncobj witness process per cluster.
+// WitnessManager manages one patroni_raft_controller process per cluster.
 type WitnessManager struct {
 	cfg      WitnessConfig
 	mu       sync.Mutex
@@ -41,21 +41,16 @@ type witnessProc struct {
 	clusterID uuid.UUID
 	addr      string // "host:port" this witness listens on
 	partners  []string
-	cmd       *exec.Cmd
 	cancel    context.CancelFunc
 }
 
 // NewWitnessManager creates a manager with the given config.
 func NewWitnessManager(cfg WitnessConfig) *WitnessManager {
-	if cfg.ScriptPath == "" {
-		cfg.ScriptPath = defaultWitnessScript
+	if cfg.RaftControllerBin == "" {
+		cfg.RaftControllerBin = defaultRaftControllerBin
 	}
-	if cfg.PythonBin == "" {
-		cfg.PythonBin = defaultPythonBin
-		// Fall back to system python3 if venv doesn't exist
-		if _, err := os.Stat(cfg.PythonBin); err != nil {
-			cfg.PythonBin = "python3"
-		}
+	if cfg.RaftDataDir == "" {
+		cfg.RaftDataDir = defaultRaftDataDir
 	}
 	if cfg.BasePort == 0 {
 		cfg.BasePort = defaultBasePort
@@ -154,7 +149,33 @@ type ClusterWitnessInfo struct {
 	PartnerAddrs []string // Raft peer "host:port" addresses
 }
 
-// runProc supervises a single witness subprocess with auto-restart.
+// writeRaftConfig writes the patroni_raft_controller YAML config for this witness
+// and returns the path to the written file.
+func (m *WitnessManager) writeRaftConfig(proc *witnessProc) (string, error) {
+	dataDir := filepath.Join(m.cfg.RaftDataDir, proc.clusterID.String())
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return "", fmt.Errorf("creating raft data dir: %w", err)
+	}
+
+	var partners string
+	for _, p := range proc.partners {
+		partners += fmt.Sprintf("  - %s\n", p)
+	}
+
+	content := fmt.Sprintf(`raft:
+  self_addr: %s
+  partner_addrs:
+%s  data_dir: %s
+`, proc.addr, partners, dataDir)
+
+	cfgPath := filepath.Join(dataDir, "raft-controller.yml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("writing raft config: %w", err)
+	}
+	return cfgPath, nil
+}
+
+// runProc supervises a single patroni_raft_controller subprocess with auto-restart.
 func (m *WitnessManager) runProc(proc *witnessProc) {
 	backoff := 5 * time.Second
 
@@ -167,32 +188,31 @@ func (m *WitnessManager) runProc(proc *witnessProc) {
 		}
 		m.mu.Unlock()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		proc.cancel = cancel
-
-		scriptPath := m.cfg.ScriptPath
-		if _, err := os.Stat(scriptPath); err != nil {
-			// Script not installed yet — wait and retry
-			log.Printf("witness script not found at %s — retrying in %s", scriptPath, backoff)
-			cancel()
+		controllerBin := m.cfg.RaftControllerBin
+		if _, err := os.Stat(controllerBin); err != nil {
+			log.Printf("witness: patroni_raft_controller not found at %s — retrying in %s", controllerBin, backoff)
 			time.Sleep(backoff)
 			continue
 		}
 
-		args := append([]string{proc.addr}, proc.partners...)
-		cmd := exec.CommandContext(ctx, m.cfg.PythonBin,
-			append([]string{scriptPath}, args...)...)
+		cfgPath, err := m.writeRaftConfig(proc)
+		if err != nil {
+			log.Printf("witness: failed to write raft config for cluster=%s: %v — retrying in %s",
+				proc.clusterID, err, backoff)
+			time.Sleep(backoff)
+			continue
+		}
 
-		// Log witness stdout/stderr with a prefix
+		ctx, cancel := context.WithCancel(context.Background())
+		proc.cancel = cancel
+
+		cmd := exec.CommandContext(ctx, controllerBin, cfgPath)
 		cmd.Stdout = &prefixWriter{prefix: fmt.Sprintf("[witness %s] ", proc.clusterID)}
 		cmd.Stderr = &prefixWriter{prefix: fmt.Sprintf("[witness %s] ", proc.clusterID)}
 
-		// Ensure the script is in the right directory for relative imports
-		cmd.Dir = filepath.Dir(scriptPath)
-
-		proc.cmd = cmd
 		if err := cmd.Run(); err != nil {
 			if ctx.Err() != nil {
+				cancel()
 				return // stopped intentionally
 			}
 			log.Printf("witness crashed for cluster=%s: %v — restarting in %s",

@@ -91,6 +91,7 @@ func New(cfg RouterConfig) *echo.Echo {
 
 	// ── Settings ────────────────────────────────────────────────────────────────
 	protected.GET("/settings/tls", cfg.AuthHandler.TLSInfo)
+	protected.POST("/settings/tls/regenerate", cfg.AuthHandler.RegenerateCert, mw.RequireRole("admin"))
 
 	// SSE live event stream
 	protected.GET("/events", echo.WrapHandler(cfg.SSEBroker))

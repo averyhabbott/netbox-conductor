@@ -43,4 +43,7 @@ export const usersApi = {
 
   getTLSInfo: () =>
     client.get<TLSInfoResponse>('/settings/tls'),
+
+  regenerateCert: (serverURL?: string) =>
+    client.post<TLSInfoResponse>('/settings/tls/regenerate', { server_url: serverURL ?? '' }),
 }

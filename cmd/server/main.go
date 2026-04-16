@@ -149,6 +149,12 @@ func run(ctx context.Context) error {
 		ServerAddr: serverBindIP,
 	})
 
+	// Recover witnesses for any active_standby clusters that were already
+	// configured before this conductor process started. Without this, all
+	// witness subprocesses die when the conductor restarts and don't
+	// restart until configure_failover is manually triggered again.
+	go recoverWitnesses(ctx, witnessManager, clusterQ, nodeQ)
+
 	// Failover manager — orchestrates automatic NetBox failover/failback
 	failoverManager := failover.New(nodeQ, clusterQ, taskQ, failoverEventQ, h, dispatcher, broker)
 
@@ -157,7 +163,7 @@ func run(ctx context.Context) error {
 	alertHandler := handlers.NewAlertHandler(alertQ, nodeLogQ, logDir, logName)
 
 	// Handlers
-	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, enc)
+	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, tlsKeyFile, serverURL, enc)
 	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, failoverManager, logDir, logName)
 	agentHandler.SetNodeLogQuerier(nodeLogQ)
 	agentHandler.SetAlertSender(alertSender)
@@ -275,6 +281,47 @@ func seedAdminIfEmpty(ctx context.Context, userQ *queries.UserQuerier) error {
 	log.Printf("⚠  Created default admin user: username=admin password=%s  — CHANGE THIS IMMEDIATELY", password)
 	log.Printf("   User ID: %s", user.ID)
 	return nil
+}
+
+// recoverWitnesses restarts patroni_raft_controller witnesses for every
+// active_standby cluster that already has Patroni configured. Called once
+// at startup so witnesses survive conductor restarts without needing a
+// manual configure_failover trigger.
+func recoverWitnesses(ctx context.Context, wm *patroni.WitnessManager, clusterQ *queries.ClusterQuerier, nodeQ *queries.NodeQuerier) {
+	clusters, err := clusterQ.List(ctx)
+	if err != nil {
+		log.Printf("witness recovery: failed to list clusters: %v", err)
+		return
+	}
+
+	var infos []patroni.ClusterWitnessInfo
+	for _, c := range clusters {
+		if c.Mode != "active_standby" || !c.PatroniConfigured {
+			continue
+		}
+		nodes, err := nodeQ.ListByCluster(ctx, c.ID)
+		if err != nil {
+			log.Printf("witness recovery: failed to list nodes for cluster %s: %v", c.ID, err)
+			continue
+		}
+		var peers []string
+		for _, n := range nodes {
+			if n.Role == "hyperconverged" || n.Role == "db_only" {
+				peers = append(peers, fmt.Sprintf("%s:5433", n.IPAddress))
+			}
+		}
+		if len(peers) > 0 {
+			infos = append(infos, patroni.ClusterWitnessInfo{
+				ClusterID:    c.ID,
+				PartnerAddrs: peers,
+			})
+		}
+	}
+
+	if len(infos) > 0 {
+		log.Printf("witness recovery: recovering %d witness(es)", len(infos))
+		wm.RecoverAll(infos)
+	}
 }
 
 func requireEnv(key string) string {

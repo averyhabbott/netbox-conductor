@@ -24,6 +24,13 @@ import (
 	"time"
 )
 
+// Regenerate forcibly creates a new self-signed certificate, overwriting any
+// existing files at certFile and keyFile. Unlike EnsureExists it does not check
+// whether the existing cert is still valid.
+func Regenerate(certFile, keyFile string, dnsNames []string, ipAddrs []net.IP) error {
+	return generate(certFile, keyFile, dnsNames, ipAddrs)
+}
+
 // EnsureExists checks whether certFile and keyFile exist and are not expiring
 // within 30 days. If either condition fails, a new self-signed certificate is
 // generated with the provided SANs and written to both paths.

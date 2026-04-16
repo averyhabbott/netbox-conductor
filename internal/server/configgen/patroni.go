@@ -9,12 +9,12 @@ import (
 
 // PatroniInput holds variables for rendering a Patroni config (patroni.yml).
 type PatroniInput struct {
-	Scope       string // cluster name / Patroni scope
-	NodeName    string // this node's hostname
-	NodeAddr    string // this node's IP
-	RaftSelfAddr  string // "IP:5433" for this node's Raft port
-	RaftPartners  []string // "IP:5433" for peer data nodes
-	WitnessAddr   string // "IP:port" of tool-server witness (empty if HA 3+)
+	Scope        string   // cluster name / Patroni scope
+	NodeName     string   // this node's hostname
+	NodeAddr     string   // this node's IP
+	RaftSelfAddr string   // "IP:5433" for this node's Raft port
+	RaftPartners []string // "IP:5433" for peer data nodes
+	WitnessAddr  string   // "IP:port" of tool-server witness (empty if HA 3+)
 
 	RESTUsername string // Patroni REST API basic-auth username
 	RESTPassword string // Patroni REST API basic-auth password
@@ -24,8 +24,11 @@ type PatroniInput struct {
 	DBReplicaUser string
 	DBReplicaPass string
 
-	DataDir     string // Postgres data directory (e.g. /var/lib/postgresql/14/main)
-	BinDir      string // Postgres bin directory (e.g. /usr/lib/postgresql/14/bin)
+	DataDir     string // Postgres data directory (e.g. /var/lib/postgresql/17/main)
+	BinDir      string // Postgres bin directory (e.g. /usr/lib/postgresql/17/bin)
+	ConfigDir   string // Postgres config directory — set on Debian/Ubuntu where configs live
+	             // in /etc/postgresql/<ver>/main instead of the data dir. Leave empty
+	             // for distros that keep configs in the data dir.
 	ConnectAddr string // Postgres connect address (usually same as NodeAddr)
 	Port        int    // Postgres port (default 5432)
 }
@@ -36,10 +39,10 @@ func RenderPatroni(in PatroniInput) (string, error) {
 		in.Port = 5432
 	}
 	if in.DataDir == "" {
-		in.DataDir = "/var/lib/postgresql/14/main"
+		in.DataDir = "/var/lib/postgresql/17/main"
 	}
 	if in.BinDir == "" {
-		in.BinDir = "/usr/lib/postgresql/14/bin"
+		in.BinDir = "/usr/lib/postgresql/17/bin"
 	}
 	if in.ConnectAddr == "" {
 		in.ConnectAddr = in.NodeAddr
@@ -54,10 +57,12 @@ func RenderPatroni(in PatroniInput) (string, error) {
 		PatroniInput
 		RaftPartnerLines string
 		HasWitness       bool
+		HasConfigDir     bool
 	}{
-		PatroniInput:    in,
+		PatroniInput:     in,
 		RaftPartnerLines: strings.Join(partners, "\n"),
 		HasWitness:       in.WitnessAddr != "",
+		HasConfigDir:     in.ConfigDir != "",
 	}
 
 	tmpl, err := template.New("patroni").Parse(patroniTemplate)
@@ -90,17 +95,39 @@ raft:
 {{- if .HasWitness}}
   - {{.WitnessAddr}}
 {{- end}}
+  data_dir: /var/lib/patroni
+
+# dcs settings applied on every Patroni start. These govern the running
+# cluster and take effect immediately on restart — unlike bootstrap.dcs
+# which is written to the DCS only once during initial cluster formation
+# and ignored on subsequent starts.
+dcs:
+  ttl: 30
+  loop_wait: 10
+  retry_timeout: 10
+  maximum_lag_on_failover: 1048576
+  # failsafe_mode keeps the primary serving if it loses contact with the
+  # standby, preventing a network partition from taking down the entire
+  # app tier in a 2-node cluster. The conductor witness provides the
+  # third Raft vote needed to maintain quorum on either side of a split.
+  failsafe_mode: true
+  postgresql:
+    use_pg_rewind: true
+    use_slots: true
+    parameters:
+      wal_level: replica
+      hot_standby: "on"
+      max_wal_senders: 5
+      max_replication_slots: 5
+      wal_log_hints: "on"
 
 bootstrap:
+  # bootstrap.dcs seeds the DCS key on first cluster formation.
   dcs:
     ttl: 30
     loop_wait: 10
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
-    # failsafe_mode keeps the primary serving if it loses contact with the
-    # standby, preventing a network partition from taking down the entire
-    # app tier in a 2-node cluster. The conductor witness provides the
-    # third Raft vote needed to maintain quorum on either side of a split.
     failsafe_mode: true
     postgresql:
       use_pg_rewind: true
@@ -112,15 +139,14 @@ bootstrap:
         max_replication_slots: 5
         wal_log_hints: "on"
 
-  initdb:
-    - encoding: UTF8
-    - data-checksums
-
 postgresql:
   listen: {{.ConnectAddr}}:{{.Port}}
   connect_address: {{.ConnectAddr}}:{{.Port}}
   data_dir: {{.DataDir}}
   bin_dir: {{.BinDir}}
+{{- if .HasConfigDir}}
+  config_dir: {{.ConfigDir}}
+{{- end}}
   pgpass: /tmp/.pgpass-{{.Scope}}
   authentication:
     replication:
@@ -132,6 +158,13 @@ postgresql:
     rewind:
       username: {{.DBSuperUser}}
       password: {{.DBSuperPass}}
+  pg_hba:
+    - local   all             postgres                                peer
+    - local   all             all                                     scram-sha-256
+    - host    all             all             127.0.0.1/32            scram-sha-256
+    - host    all             all             ::1/128                 scram-sha-256
+    - host    replication     {{.DBReplicaUser}}  0.0.0.0/0          scram-sha-256
+    - host    all             {{.DBSuperUser}}    0.0.0.0/0          scram-sha-256
   parameters:
     unix_socket_directories: '/var/run/postgresql'
 

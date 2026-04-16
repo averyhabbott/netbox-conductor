@@ -40,34 +40,34 @@ Controlled by `AGENT_STATUS_ADDR` in the agent env file (default `127.0.0.1:8081
 
 ## nginx
 
-Copy the provided example config:
+`nginx-netbox-conductor.conf` is included in the agent tarball downloaded from the conductor. Copy it into place after running the agent install:
 
 ```bash
-sudo cp deployments/agent/nginx-netbox-conductor.conf /etc/nginx/sites-available/netbox
+sudo cp /opt/netbox-agent/nginx-netbox-conductor.conf /etc/nginx/sites-available/netbox
 sudo ln -s /etc/nginx/sites-available/netbox /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-This is a drop-in replacement for the standard NetBox nginx config. It adds a `location = /status` block that proxies requests to `127.0.0.1:8081`.
+Edit the file first to replace `netbox.example.com` with your actual hostname and update the SSL certificate paths. This is a drop-in replacement for the standard NetBox nginx config — it adds a `location = /status` block that proxies requests to `127.0.0.1:8081`.
 
-> **SELinux (RHEL/CentOS/Rocky):** if nginx cannot connect to 127.0.0.1:8081:
->
-> ```bash
-> sudo setsebool -P httpd_can_network_connect 1
-> ```
+> **RHEL/CentOS/Rocky:** place the file in `/etc/nginx/conf.d/netbox.conf` instead of `sites-available/`. If nginx cannot connect to 127.0.0.1:8081, run `sudo setsebool -P httpd_can_network_connect 1`.
 
 ---
 
 ## Apache
 
+`apache-netbox-conductor.conf` is included in the agent tarball downloaded from the conductor. Copy it into place after running the agent install:
+
 ```bash
-sudo cp deployments/agent/apache-netbox-conductor.conf /etc/apache2/sites-available/netbox.conf
 sudo a2enmod proxy proxy_http ssl rewrite headers
+sudo cp /opt/netbox-agent/apache-netbox-conductor.conf /etc/apache2/sites-available/netbox.conf
 sudo a2ensite netbox
 sudo apache2ctl configtest && sudo systemctl reload apache2
 ```
 
-This adds a `<Location /status>` block proxying to `127.0.0.1:8081`.
+Edit the file first to replace `netbox.example.com` with your actual hostname and update the SSL certificate paths. This adds a `<Location /status>` block proxying to `127.0.0.1:8081`.
+
+> **RHEL/CentOS/Rocky:** place the file in `/etc/httpd/conf.d/netbox.conf` instead.
 
 ---
 
