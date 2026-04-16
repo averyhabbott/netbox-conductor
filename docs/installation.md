@@ -133,7 +133,7 @@ sudo chmod +x /opt/netbox-conductor/bin/netbox-conductor
 
 **3. Set up the Patroni witness Python environment:**
 
-The Conductor includes a built-in Patroni Raft witness process that provides a third vote in 2-node clusters. It is a Python script that requires `pysyncobj`.
+The Conductor includes a built-in Raft witness process that provides a third vote in 2-node clusters using `patroni_raft_controller` — a binary that ships with Patroni itself.
 
 ```bash
 # Debian/Ubuntu: install the venv package first (version must match your system Python)
@@ -141,18 +141,13 @@ sudo apt-get install -y python3-venv
 # If the above fails (e.g. Python 3.13), use the version-specific package:
 #   sudo apt-get install -y python3.13-venv
 
-# Create the venv and install pysyncobj
+# Create the venv and install Patroni + its PostgreSQL adapter
 sudo python3 -m venv /opt/netbox-conductor/venv
-sudo /opt/netbox-conductor/venv/bin/pip install pysyncobj
-
-# Deploy the witness script
-sudo cp deployments/server/patroni-witness.py /opt/netbox-conductor/patroni-witness.py
-sudo chmod 755 /opt/netbox-conductor/patroni-witness.py
+sudo /opt/netbox-conductor/venv/bin/pip install patroni psycopg2-binary
 sudo chown -R netbox-conductor:netbox-conductor /opt/netbox-conductor/venv
-sudo chown netbox-conductor:netbox-conductor /opt/netbox-conductor/patroni-witness.py
 ```
 
-> Patroni's built-in Raft DCS is implemented on top of `pysyncobj`. The Conductor spawns a witness subprocess so that a 2-node cluster has a 3rd Raft voter on a separate host, preserving quorum in a network partition. Without `pysyncobj` installed, the witness exits immediately and the cluster may fail to elect a primary.
+> The Conductor spawns `patroni_raft_controller` (installed at `/opt/netbox-conductor/venv/bin/patroni_raft_controller`) as a subprocess, one per active/standby cluster. This gives 2-node clusters a 3rd Raft voter on the conductor host, preserving quorum across a network partition without needing a dedicated witness VM. The process auto-restarts every 5 seconds on crash and is also recovered automatically when the conductor restarts.
 
 **4. Copy agent binaries** (served to managed nodes via download endpoint):
 
@@ -248,7 +243,12 @@ sudo systemctl enable --now netbox-conductor
 sudo journalctl -u netbox-conductor -f
 ```
 
-The UI is available at `https://<conductor>:8443`. On first start, create your admin account via the login page — the first registration on a fresh database is automatically granted admin.
+The UI is available at `https://<conductor>:8443`. On first start against an empty database, a default admin account is automatically created:
+
+- **Username:** `admin`
+- **Password:** `changeme123!`
+
+Change this password immediately after first login.
 
 ---
 

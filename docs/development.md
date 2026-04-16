@@ -54,7 +54,7 @@ netbox-conductor/
 │   ├── agent/           # Agent binary entry point (task executor)
 │   └── rotate-key/      # Offline key-rotation tool (re-encrypts all secrets)
 ├── deployments/
-│   ├── server/          # Server systemd unit, env template, install.sh, Patroni witness script
+│   ├── server/          # Server systemd unit, env template, install.sh
 │   └── agent/           # Agent systemd unit, install.sh, env template, sudoers, bundle.go
 ├── docs/                # This documentation
 ├── internal/

@@ -8,9 +8,9 @@
 # What it does:
 #   1. Creates the netbox-conductor OS user and directory layout
 #   2. Installs/upgrades the conductor binary (optional; skip if no --binary flag)
-#   3. Deploys the Patroni witness Python script and sets up its venv
-#   4. Installs pysyncobj into the venv (required for the witness process)
-#   5. Installs/reloads the systemd unit
+#   3. Creates a Python venv and installs Patroni + psycopg2-binary
+#      (provides patroni_raft_controller, the built-in Raft witness binary)
+#   4. Installs/reloads the systemd unit
 
 set -euo pipefail
 
@@ -19,7 +19,6 @@ BIN_DIR=${INSTALL_DIR}/bin
 CONF_DIR=/etc/netbox-conductor
 LOG_DIR=/var/log/netbox-conductor
 VENV_DIR=${INSTALL_DIR}/venv
-WITNESS_SCRIPT=${INSTALL_DIR}/patroni-witness.py
 SERVICE_NAME=netbox-conductor
 SERVICE_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
@@ -70,7 +69,7 @@ if [[ -n "${BINARY_SRC}" ]]; then
   install -m 755 -o root -g "${SERVICE_NAME}" "${BINARY_SRC}" "${BIN_DIR}/netbox-conductor"
 fi
 
-# ── Python venv + pysyncobj (required for the Patroni witness) ───────────────
+# ── Python venv + Patroni (provides patroni_raft_controller witness) ─────────
 
 echo "==> Setting up Python venv at ${VENV_DIR}..."
 
@@ -88,17 +87,13 @@ if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
 
-echo "==> Installing pysyncobj..."
+echo "==> Installing Patroni and psycopg2-binary..."
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
-"${VENV_DIR}/bin/pip" install --quiet pysyncobj
+# patroni ships patroni_raft_controller, the built-in Raft witness binary used
+# by the Conductor for 2-node HA clusters. psycopg2-binary is a Patroni dep.
+"${VENV_DIR}/bin/pip" install --quiet patroni psycopg2-binary
 
 chown -R "${SERVICE_NAME}:${SERVICE_NAME}" "${VENV_DIR}"
-
-# ── Patroni witness script ────────────────────────────────────────────────────
-
-echo "==> Deploying patroni-witness.py..."
-install -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" \
-  "${SCRIPT_DIR}/patroni-witness.py" "${WITNESS_SCRIPT}"
 
 # ── Env file (only if it doesn't already exist) ───────────────────────────────
 
