@@ -29,6 +29,7 @@ type RouterConfig struct {
 	DownloadHandler   *handlers.DownloadHandler
 	StagingHandler    *handlers.StagingHandler
 	MetricsHandler    *handlers.MetricsHandler
+	AlertHandler      *handlers.AlertHandler
 	TaskResultQuerier *queries.TaskResultQuerier
 	SSEBroker         *sse.Broker
 	AuditQuerier      *queries.AuditQuerier
@@ -156,6 +157,18 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.GET("/clusters/:id/credentials", cfg.CredentialHandler.List)
 	protected.PUT("/clusters/:id/credentials/:kind", cfg.CredentialHandler.Upsert, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/credentials/generate", cfg.CredentialHandler.GenerateCredentials, mw.RequireRole("operator"))
+
+	// ── Alerts ──────────────────────────────────────────────────────────────────
+	if cfg.AlertHandler != nil {
+		protected.GET("/alerts", cfg.AlertHandler.ListActiveAlerts)
+		protected.POST("/alerts/:id/acknowledge", cfg.AlertHandler.AcknowledgeAlert, mw.RequireRole("operator"))
+		protected.GET("/alert-configs", cfg.AlertHandler.ListAlertConfigs)
+		protected.POST("/alert-configs", cfg.AlertHandler.CreateAlertConfig, mw.RequireRole("operator"))
+		protected.PUT("/alert-configs/:id", cfg.AlertHandler.UpdateAlertConfig, mw.RequireRole("operator"))
+		protected.DELETE("/alert-configs/:id", cfg.AlertHandler.DeleteAlertConfig, mw.RequireRole("operator"))
+		protected.GET("/clusters/:id/logs", cfg.AlertHandler.ClusterLogs)
+		protected.GET("/system/logs", cfg.AlertHandler.SystemLogs, mw.RequireRole("operator"))
+	}
 
 	// ── Cluster-scoped audit log ─────────────────────────────────────────────────
 	protected.GET("/clusters/:id/audit-logs", func(c echo.Context) error {

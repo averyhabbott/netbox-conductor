@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
@@ -952,6 +953,8 @@ func (h *PatroniHandler) EnforceRetention(c echo.Context) error {
 // and (when app_tier_always_available=true) pushes Sentinel config.
 // POST /api/v1/clusters/:id/configure-failover
 func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
+	startedAt := time.Now()
+
 	clusterID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
@@ -966,6 +969,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		VIP                    *string `json:"vip"`
 		RedisSentinelMaster    string  `json:"redis_sentinel_master"`
 		SaveBackup             bool    `json:"save_backup"`
+		PrimaryNodeID          string  `json:"primary_node_id"` // optional explicit override
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -1084,32 +1088,59 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
-	// Identify primary: prefer Patroni state, fall back to netbox_running=true.
-	// Reject ambiguous states (0 or 2+ primaries) to prevent split-brain setup.
+	// Identify primary using the following priority chain:
+	//  1. Explicit override — primary_node_id in the request body.
+	//  2. Patroni state — a node reporting role=primary.
+	//  3. Single netbox_running=true node — unambiguous.
+	//  4. Highest failover_priority among connected nodes running NetBox —
+	//     used when multiple nodes are running (e.g. before first failover config).
+	//     This mirrors the failover manager's tie-break logic.
 	var primaryNode *queries.Node
-	for i := range nodes {
-		n := &nodes[i]
-		if n.PatroniState != nil {
-			var ps map[string]any
-			if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
-				primaryNode = n
+
+	// (1) Explicit override
+	if req.PrimaryNodeID != "" {
+		overrideID, parseErr := uuid.Parse(req.PrimaryNodeID)
+		if parseErr != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid primary_node_id")
+		}
+		for i := range nodes {
+			if nodes[i].ID == overrideID {
+				primaryNode = &nodes[i]
 				break
 			}
 		}
+		if primaryNode == nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "primary_node_id does not belong to this cluster")
+		}
 	}
+
+	// (2) Patroni state
 	if primaryNode == nil {
 		for i := range nodes {
 			n := &nodes[i]
-			if n.NetboxRunning != nil && *n.NetboxRunning && n.AgentStatus == "connected" {
-				if primaryNode != nil {
-					return echo.NewHTTPError(http.StatusConflict,
-						"multiple nodes report netbox_running=true — cannot safely determine primary. "+
-							"Stop NetBox on all but one node before configuring failover.")
+			if n.PatroniState != nil {
+				var ps map[string]any
+				if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
+					primaryNode = n
+					break
 				}
+			}
+		}
+	}
+
+	// (3) + (4) netbox_running — pick best by failover_priority if ambiguous
+	if primaryNode == nil {
+		for i := range nodes {
+			n := &nodes[i]
+			if n.NetboxRunning == nil || !*n.NetboxRunning || n.AgentStatus != "connected" {
+				continue
+			}
+			if primaryNode == nil || n.FailoverPriority > primaryNode.FailoverPriority {
 				primaryNode = n
 			}
 		}
 	}
+
 	if primaryNode == nil {
 		return echo.NewHTTPError(http.StatusConflict,
 			"cannot identify primary node: no connected node reports netbox_running=true or patroni role=primary. "+
@@ -1178,6 +1209,27 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				TaskID:   tid,
 				Status:   "dispatched",
 			}
+		}
+	}
+
+	// Stop NetBox on all non-primary nodes before configuring Patroni.
+	// This prevents split-brain while Patroni is being reconfigured. The primary
+	// keeps running so operators don't see an outage during the config push.
+	// If AppTierAlwaysAvailable is enabled, NetBox will be restarted on non-primary
+	// nodes after db_host is updated (Patroni primary election handles routing).
+	stopTasks := make([]taskRef, 0, len(nodes))
+	for _, node := range nodes {
+		if node.ID == primaryNode.ID {
+			continue
+		}
+		stopParams, _ := json.Marshal(struct{}{})
+		if tid, err := dispatch(node.ID, protocol.TaskStopNetbox, stopParams, 30); err != nil {
+			warnings = append(warnings, fmt.Sprintf("stop-netbox dispatch failed for %s: %v", node.Hostname, err))
+		} else {
+			stopTasks = append(stopTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				TaskID: tid, Status: "dispatched",
+			})
 		}
 	}
 
@@ -1328,6 +1380,21 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// Restart NetBox on the primary after Patroni is configured so it picks up
+	// any updated configuration. For non-primary nodes on app_tier_always_available
+	// clusters, NetBox was stopped above; the db_host_update task already sets the
+	// correct primary, and the operator (or auto-failover) will bring them back up.
+	var netboxRestartTask *taskRef
+	restartNetboxParams, _ := json.Marshal(struct{}{})
+	if tid, err := dispatch(primaryNode.ID, protocol.TaskRestartNetbox, restartNetboxParams, 30); err != nil {
+		warnings = append(warnings, fmt.Sprintf("restart-netbox dispatch failed for primary %s: %v", primaryNode.Hostname, err))
+	} else {
+		netboxRestartTask = &taskRef{
+			NodeID: primaryNode.ID.String(), Hostname: primaryNode.Hostname,
+			TaskID: tid, Status: "dispatched",
+		}
+	}
+
 	if err := h.clusters.SetPatroniConfigured(ctx, clusterID); err != nil {
 		slog.Warn("configure-failover: failed to mark cluster as configured",
 			"cluster", clusterID, "error", err)
@@ -1343,13 +1410,16 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	)
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id":     clusterID.String(),
-		"witness_addr":   witnessAddr,
-		"primary_node":   primaryNode.Hostname,
-		"backup_task":    backupTask,
-		"patroni_tasks":  patroniTasks,
-		"sentinel_tasks": sentinelTasks,
-		"warnings":       warnings,
+		"cluster_id":           clusterID.String(),
+		"witness_addr":         witnessAddr,
+		"primary_node":         primaryNode.Hostname,
+		"started_at":           startedAt.UTC().Format(time.RFC3339),
+		"backup_task":          backupTask,
+		"stop_tasks":           stopTasks,
+		"patroni_tasks":        patroniTasks,
+		"sentinel_tasks":       sentinelTasks,
+		"netbox_restart_task":  netboxRestartTask,
+		"warnings":             warnings,
 	})
 }
 

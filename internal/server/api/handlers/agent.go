@@ -13,6 +13,7 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/alerting"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
@@ -40,6 +41,8 @@ type AgentHandler struct {
 	enc           *crypto.Encryptor
 	media         *media.Manager
 	failover      *failover.Manager
+	nodeLogQ      *queries.NodeLogQuerier
+	alertSender   *alerting.Sender
 	logDir        string
 	logName       string
 }
@@ -77,6 +80,12 @@ func NewAgentHandler(
 		logName:       logName,
 	}
 }
+
+// SetNodeLogQuerier wires up the node log querier (called from main after construction).
+func (h *AgentHandler) SetNodeLogQuerier(q *queries.NodeLogQuerier) { h.nodeLogQ = q }
+
+// SetAlertSender wires up the alert sender (called from main after construction).
+func (h *AgentHandler) SetAlertSender(s *alerting.Sender) { h.alertSender = s }
 
 // ─── Registration ──────────────────────────────────────────────────────────────
 
@@ -292,12 +301,46 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 			h.failover.OnNodeDisconnect(nodeID, clusterID)
 		}
 		slog.Info("agent disconnected", "node", nodeID, "hostname", node.Hostname)
+
+		// Persist a structured log entry so operators can see disconnect history.
+		if h.nodeLogQ != nil {
+			nid := nodeID
+			_ = h.nodeLogQ.Insert(context.Background(), queries.InsertNodeLogParams{
+				ClusterID: clusterID,
+				NodeID:    &nid,
+				Hostname:  node.Hostname,
+				Level:     "warn",
+				Source:    "conductor",
+				Message:   "Agent disconnected",
+			})
+		}
+
+		// Fire alert unless the node is in maintenance mode (suppress expected downtime).
+		if h.alertSender != nil && !node.MaintenanceMode {
+			go h.alertSender.FireAgentDisconnect(nodeID, clusterID, node.Hostname)
+		}
 	}()
 
 	_ = h.nodes.UpdateAgentStatus(ctx, nodeID, "connected")
 	_ = h.agentToks.Touch(ctx, crypto.HashToken(hello.Token))
 	if h.failover != nil {
 		h.failover.OnNodeConnect(nodeID, clusterID)
+	}
+
+	// Log the connect event and resolve any open disconnect alert.
+	if h.nodeLogQ != nil {
+		nid := nodeID
+		_ = h.nodeLogQ.Insert(ctx, queries.InsertNodeLogParams{
+			ClusterID: clusterID,
+			NodeID:    &nid,
+			Hostname:  node.Hostname,
+			Level:     "info",
+			Source:    "conductor",
+			Message:   "Agent connected (v" + hello.AgentVersion + ")",
+		})
+	}
+	if h.alertSender != nil {
+		go h.alertSender.ResolveAgentDisconnect(nodeID, clusterID)
 	}
 
 	helloPayload := protocol.ServerHelloPayload{

@@ -4,8 +4,10 @@ import Layout from '../components/Layout'
 import { useAuthStore } from '../store/auth'
 import { usersApi, type UserItem } from '../api/users'
 import { authApi } from '../api/auth'
+import { alertsApi, ALERT_CONDITIONS } from '../api/alerts'
+import type { AlertConfig, AlertConfigBody } from '../api/alerts'
 
-type Tab = 'users' | 'system' | 'password' | 'totp'
+type Tab = 'users' | 'system' | 'password' | 'totp' | 'alerting'
 
 export default function Settings() {
   const [tab, setTab] = useState<Tab>('users')
@@ -33,12 +35,16 @@ export default function Settings() {
         <TabBtn active={tab === 'totp'} onClick={() => setTab('totp')}>
           Two-Factor Auth
         </TabBtn>
+        <TabBtn active={tab === 'alerting'} onClick={() => setTab('alerting')}>
+          Alerting
+        </TabBtn>
       </div>
 
       {tab === 'users' && isAdmin && <UsersTab currentUserId={user?.id ?? ''} />}
       {tab === 'system' && <SystemTab />}
       {tab === 'password' && <ChangePasswordTab />}
       {tab === 'totp' && <TOTPTab />}
+      {tab === 'alerting' && <AlertingTab />}
     </Layout>
   )
 }
@@ -716,6 +722,262 @@ function TOTPTab() {
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+// ── Alerting Tab ─────────────────────────────────────────────────────────────
+
+const emptyConfig = (): AlertConfigBody => ({
+  name: '',
+  type: 'webhook',
+  enabled: true,
+  conditions: [],
+  webhook_url: '',
+  email_to: '',
+})
+
+function AlertConfigForm({
+  initial,
+  onSave,
+  onCancel,
+  isPending,
+  error,
+}: {
+  initial: AlertConfigBody
+  onSave: (body: AlertConfigBody) => void
+  onCancel: () => void
+  isPending: boolean
+  error?: string
+}) {
+  const [form, setForm] = useState<AlertConfigBody>(initial)
+
+  function toggleCondition(val: string) {
+    setForm((f) => ({
+      ...f,
+      conditions: f.conditions.includes(val)
+        ? f.conditions.filter((c) => c !== val)
+        : [...f.conditions, val],
+    }))
+  }
+
+  return (
+    <div className="space-y-4 bg-gray-800/50 border border-gray-700 rounded-xl p-5">
+      <div>
+        <label className="block text-xs text-gray-400 mb-1">Name</label>
+        <input
+          type="text"
+          value={form.name}
+          onChange={(e) => setForm({ ...form, name: e.target.value })}
+          placeholder="e.g. PagerDuty webhook"
+          className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+        />
+      </div>
+
+      <div className="flex gap-4">
+        {(['webhook', 'email'] as const).map((t) => (
+          <label key={t} className="flex items-center gap-2 text-sm cursor-pointer">
+            <input
+              type="radio"
+              checked={form.type === t}
+              onChange={() => setForm({ ...form, type: t })}
+              className="accent-blue-500"
+            />
+            {t === 'webhook' ? 'Webhook (HTTP POST)' : 'Email (SMTP)'}
+          </label>
+        ))}
+      </div>
+
+      {form.type === 'webhook' ? (
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Webhook URL</label>
+          <input
+            type="url"
+            value={form.webhook_url ?? ''}
+            onChange={(e) => setForm({ ...form, webhook_url: e.target.value })}
+            placeholder="https://hooks.example.com/…"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
+          />
+        </div>
+      ) : (
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Email recipients (comma-separated)</label>
+          <input
+            type="text"
+            value={form.email_to ?? ''}
+            onChange={(e) => setForm({ ...form, email_to: e.target.value })}
+            placeholder="ops@example.com, alerts@example.com"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            SMTP settings are configured via server environment variables (SMTP_HOST, SMTP_PORT, SMTP_FROM, SMTP_USER, SMTP_PASS).
+          </p>
+        </div>
+      )}
+
+      <div>
+        <label className="block text-xs text-gray-400 mb-2">Trigger conditions</label>
+        <div className="space-y-1.5">
+          {ALERT_CONDITIONS.map(({ value, label }) => (
+            <label key={value} className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.conditions.includes(value)}
+                onChange={() => toggleCondition(value)}
+                className="accent-blue-500"
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <label className="flex items-center gap-2 text-sm cursor-pointer">
+        <input
+          type="checkbox"
+          checked={form.enabled}
+          onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
+          className="accent-blue-500"
+        />
+        Enabled
+      </label>
+
+      {error && <p className="text-xs text-red-400">{error}</p>}
+
+      <div className="flex justify-end gap-3">
+        <button onClick={onCancel} className="text-sm text-gray-400 hover:text-white px-3 py-1.5 transition-colors">
+          Cancel
+        </button>
+        <button
+          onClick={() => onSave(form)}
+          disabled={isPending || !form.name || form.conditions.length === 0}
+          className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-4 py-1.5 rounded-lg transition-colors"
+        >
+          {isPending ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function AlertingTab() {
+  const qc = useQueryClient()
+  const [showCreate, setShowCreate] = useState(false)
+  const [editId, setEditId] = useState<string | null>(null)
+
+  const { data: configs = [], isLoading } = useQuery({
+    queryKey: ['alert-configs'],
+    queryFn: alertsApi.listConfigs,
+  })
+
+  const create = useMutation({
+    mutationFn: (body: AlertConfigBody) => alertsApi.createConfig(body),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['alert-configs'] }); setShowCreate(false) },
+  })
+
+  const update = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: AlertConfigBody }) =>
+      alertsApi.updateConfig(id, body),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['alert-configs'] }); setEditId(null) },
+  })
+
+  const del = useMutation({
+    mutationFn: (id: string) => alertsApi.deleteConfig(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['alert-configs'] }),
+  })
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold mb-1">Alert Destinations</h2>
+        <p className="text-sm text-gray-400">
+          Conductor fires alerts when agents disconnect or services go down (outside maintenance mode).
+          Add webhook or email destinations below.
+        </p>
+      </div>
+
+      {isLoading ? (
+        <p className="text-gray-500 text-sm">Loading…</p>
+      ) : configs.length === 0 && !showCreate ? (
+        <p className="text-gray-500 text-sm">No alert destinations configured.</p>
+      ) : (
+        <div className="space-y-3">
+          {configs.map((cfg: AlertConfig) =>
+            editId === cfg.id ? (
+              <AlertConfigForm
+                key={cfg.id}
+                initial={{
+                  name: cfg.name,
+                  type: cfg.type,
+                  enabled: cfg.enabled,
+                  conditions: cfg.conditions,
+                  webhook_url: cfg.webhook_url ?? '',
+                  email_to: cfg.email_to ?? '',
+                }}
+                onSave={(body) => update.mutate({ id: cfg.id, body })}
+                onCancel={() => setEditId(null)}
+                isPending={update.isPending}
+                error={(update.error as any)?.response?.data?.message}
+              />
+            ) : (
+              <div key={cfg.id} className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-xl px-5 py-4">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-sm">{cfg.name}</span>
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono">
+                      {cfg.type}
+                    </span>
+                    {!cfg.enabled && (
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">disabled</span>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    {cfg.conditions.join(', ') || 'no conditions'}
+                    {cfg.type === 'webhook' && cfg.webhook_url && (
+                      <> · <span className="font-mono">{cfg.webhook_url}</span></>
+                    )}
+                    {cfg.type === 'email' && cfg.email_to && (
+                      <> · {cfg.email_to}</>
+                    )}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setEditId(cfg.id)}
+                    className="text-xs text-gray-400 hover:text-white transition-colors"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => del.mutate(cfg.id)}
+                    disabled={del.isPending}
+                    className="text-xs text-red-500 hover:text-red-400 disabled:opacity-40 transition-colors"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      )}
+
+      {showCreate ? (
+        <AlertConfigForm
+          initial={emptyConfig()}
+          onSave={(body) => create.mutate(body)}
+          onCancel={() => setShowCreate(false)}
+          isPending={create.isPending}
+          error={(create.error as any)?.response?.data?.message}
+        />
+      ) : (
+        <button
+          onClick={() => setShowCreate(true)}
+          className="text-sm bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg transition-colors"
+        >
+          + Add destination
+        </button>
+      )}
     </div>
   )
 }

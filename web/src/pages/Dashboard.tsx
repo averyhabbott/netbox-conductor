@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
 import type { ClusterStatus } from '../api/clusters'
+import { alertsApi } from '../api/alerts'
 import Layout from '../components/Layout'
 import { useSSE } from '../hooks/useSSE'
 import type { SSEEvent } from '../hooks/useSSE'
@@ -187,6 +188,12 @@ export default function Dashboard() {
     refetchInterval: 30_000,
   })
 
+  const { data: activeAlerts = [] } = useQuery({
+    queryKey: ['active-alerts'],
+    queryFn: alertsApi.listActive,
+    refetchInterval: 30_000,
+  })
+
   const handleSSE = useCallback((ev: SSEEvent) => {
     if (ev.type !== 'node.heartbeat') {
       dispatch({
@@ -334,8 +341,28 @@ export default function Dashboard() {
 
       {/* Active Alerts */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
-        <p className="text-sm text-gray-400 mb-1">Active Alerts</p>
-        <p className="text-3xl font-semibold">0</p>
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-sm text-gray-400">Active Alerts</p>
+          <Link to="/settings?tab=alerting" className="text-xs text-blue-400 hover:text-blue-300 transition-colors">
+            Configure →
+          </Link>
+        </div>
+        <p className={`text-3xl font-semibold ${activeAlerts.length > 0 ? 'text-amber-400' : ''}`}>
+          {activeAlerts.length}
+        </p>
+        {activeAlerts.length > 0 && (
+          <ul className="mt-3 space-y-1">
+            {activeAlerts.slice(0, 5).map((a) => (
+              <li key={a.id} className="text-xs flex items-center gap-2">
+                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${a.severity === 'error' ? 'bg-red-400' : 'bg-amber-400'}`} />
+                <span className="text-gray-300">{a.message}</span>
+              </li>
+            ))}
+            {activeAlerts.length > 5 && (
+              <li className="text-xs text-gray-500">…and {activeAlerts.length - 5} more</li>
+            )}
+          </ul>
+        )}
       </div>
 
       {/* Live event feed — full width */}

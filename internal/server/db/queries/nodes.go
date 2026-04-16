@@ -182,6 +182,20 @@ func (q *NodeQuerier) CountNodes(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// NextPriority returns the next auto-assigned failover_priority for a new node
+// in the given cluster. The first node gets 100; each subsequent node gets one
+// less than the current minimum, so earlier-added nodes have higher (more
+// preferred) priority.  Floor is 1.
+func (q *NodeQuerier) NextPriority(ctx context.Context, clusterID uuid.UUID) (int, error) {
+	var next int
+	err := q.pool.QueryRow(ctx, `
+		SELECT GREATEST(1, COALESCE(MIN(failover_priority), 101) - 1)
+		FROM nodes WHERE cluster_id = $1`,
+		clusterID,
+	).Scan(&next)
+	return next, err
+}
+
 // ── Agent tokens ──────────────────────────────────────────────────────────────
 
 // AgentTokenQuerier handles agent token operations.

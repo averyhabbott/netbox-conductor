@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/alerting"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/handlers"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
@@ -126,6 +127,8 @@ func run(ctx context.Context) error {
 	configQ := queries.NewConfigQuerier(store.Pool())
 	taskQ := queries.NewTaskResultQuerier(store.Pool())
 	failoverEventQ := queries.NewFailoverEventQuerier(store.Pool())
+	nodeLogQ := queries.NewNodeLogQuerier(store.Pool())
+	alertQ := queries.NewAlertQuerier(store.Pool())
 
 	// Seed default admin
 	if err := seedAdminIfEmpty(ctx, userQ); err != nil {
@@ -149,9 +152,15 @@ func run(ctx context.Context) error {
 	// Failover manager — orchestrates automatic NetBox failover/failback
 	failoverManager := failover.New(nodeQ, clusterQ, taskQ, failoverEventQ, h, dispatcher, broker)
 
+	// Alerting
+	alertSender := alerting.New(alertQ)
+	alertHandler := handlers.NewAlertHandler(alertQ, nodeLogQ, logDir, logName)
+
 	// Handlers
 	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, enc)
 	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, failoverManager, logDir, logName)
+	agentHandler.SetNodeLogQuerier(nodeLogQ)
+	agentHandler.SetAlertSender(alertSender)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
 	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, enc, witnessManager)
 	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, dispatcher, broker, serverURL, logDir, logName)
@@ -174,6 +183,7 @@ func run(ctx context.Context) error {
 		PatroniHandler:    patroniHandler,
 		StagingHandler:    stagingHandler,
 		MetricsHandler:    metricsHandler,
+		AlertHandler:      alertHandler,
 		TaskResultQuerier: taskQ,
 		SSEBroker:         broker,
 		AuditQuerier:      auditQ,

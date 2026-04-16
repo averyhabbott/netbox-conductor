@@ -78,6 +78,11 @@ export const nodesApi = {
       )
       .then((r) => r.data),
 
+  fetchAgentEnvText: (clusterId: string, nodeId: string) =>
+    client
+      .post<string>(`/clusters/${clusterId}/nodes/${nodeId}/agent-env`, {}, { responseType: 'text' })
+      .then((r) => r.data as unknown as string),
+
   downloadAgentEnv: async (clusterId: string, nodeId: string, hostname: string) => {
     const response = await client.post(
       `/clusters/${clusterId}/nodes/${nodeId}/agent-env`,

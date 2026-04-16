@@ -30,6 +30,7 @@ export interface ConfigureFailoverBody {
   vip?: string | null
   redis_sentinel_master: string
   save_backup: boolean
+  primary_node_id?: string
 }
 
 export interface ConfigureFailoverTaskRef {
@@ -44,9 +45,12 @@ export interface ConfigureFailoverResult {
   cluster_id: string
   witness_addr: string
   primary_node: string
+  started_at: string
   backup_task?: ConfigureFailoverTaskRef
+  stop_tasks: ConfigureFailoverTaskRef[]
   patroni_tasks: ConfigureFailoverTaskRef[]
   sentinel_tasks: ConfigureFailoverTaskRef[]
+  netbox_restart_task?: ConfigureFailoverTaskRef
   warnings: string[]
 }
 

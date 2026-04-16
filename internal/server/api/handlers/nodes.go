@@ -200,7 +200,11 @@ func (h *NodeHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "role must be hyperconverged, app, or db_only")
 	}
 	if req.FailoverPriority == 0 {
-		req.FailoverPriority = 100
+		next, err := h.nodes.NextPriority(c.Request().Context(), clusterID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to assign failover priority")
+		}
+		req.FailoverPriority = next
 	}
 	if req.SSHPort == 0 {
 		req.SSHPort = 22

@@ -609,6 +609,36 @@ export default function NodeDetail() {
     }
   }
 
+  const [showEnvMenu, setShowEnvMenu] = useState(false)
+  const envMenuRef = useRef<HTMLDivElement>(null)
+  const [envContent, setEnvContent] = useState<string | null>(null)
+  const [envViewing, setEnvViewing] = useState(false)
+  const [envCopied, setEnvCopied] = useState(false)
+
+  useEffect(() => {
+    if (!showEnvMenu) return
+    const handler = (e: MouseEvent) => {
+      if (envMenuRef.current && !envMenuRef.current.contains(e.target as HTMLElement)) {
+        setShowEnvMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showEnvMenu])
+
+  const viewEnv = async () => {
+    setShowEnvMenu(false)
+    setEnvViewing(true)
+    try {
+      const text = await nodesApi.fetchAgentEnvText(id!, nid!)
+      setEnvContent(text)
+    } catch {
+      setEnvContent('Failed to fetch agent .env file.')
+    } finally {
+      setEnvViewing(false)
+    }
+  }
+
   const { data: tasksData } = useQuery({
     queryKey: ['node-tasks', nid],
     queryFn: () =>
@@ -675,13 +705,31 @@ export default function NodeDetail() {
 
         {/* Service controls */}
         <div className="flex gap-2 flex-wrap items-center">
-          <button
-            onClick={downloadEnv}
-            disabled={envDownloading}
-            className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
-          >
-            {envDownloading ? 'Generating…' : 'Download agent .env'}
-          </button>
+          <div className="relative" ref={envMenuRef}>
+            <button
+              onClick={() => setShowEnvMenu((v) => !v)}
+              disabled={envDownloading || envViewing}
+              className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
+            >
+              {envViewing ? 'Loading…' : envDownloading ? 'Generating…' : 'Agent .env ▾'}
+            </button>
+            {showEnvMenu && (
+              <div className="absolute right-0 top-full mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-10 min-w-max">
+                <button
+                  onClick={viewEnv}
+                  className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-700 rounded-t-lg transition-colors"
+                >
+                  View
+                </button>
+                <button
+                  onClick={() => { setShowEnvMenu(false); downloadEnv() }}
+                  className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-700 rounded-b-lg transition-colors"
+                >
+                  Download
+                </button>
+              </div>
+            )}
+          </div>
           {userRole === 'admin' && (
             <button
               onClick={() => setShowDBRestore(true)}
@@ -927,6 +975,37 @@ export default function NodeDetail() {
           hostname={node.hostname}
           onClose={() => setShowDBRestore(false)}
         />
+      )}
+
+      {envContent !== null && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[80vh]">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800 flex-shrink-0">
+              <h3 className="font-medium">Agent .env — {node.hostname}</h3>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(envContent)
+                    setEnvCopied(true)
+                    setTimeout(() => setEnvCopied(false), 2000)
+                  }}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg transition-colors"
+                >
+                  {envCopied ? '✓ Copied' : 'Copy'}
+                </button>
+                <button
+                  onClick={() => setEnvContent(null)}
+                  className="text-gray-400 hover:text-white transition-colors text-lg leading-none"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <pre className="text-xs font-mono text-gray-300 p-6 overflow-auto flex-1 leading-5 whitespace-pre">
+              {envContent}
+            </pre>
+          </div>
+        </div>
       )}
     </Layout>
   )

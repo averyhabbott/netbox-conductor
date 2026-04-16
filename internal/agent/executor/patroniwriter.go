@@ -30,7 +30,9 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 	}
 
 	tmpPath := filepath.Join(dir, fmt.Sprintf(".patroni-config.tmp.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpPath, []byte(params.Content), 0640); err != nil {
+	// 0644 so the postgres OS user (which runs patronictl) can read the file
+	// without needing to be in the netbox-agent group.
+	if err := os.WriteFile(tmpPath, []byte(params.Content), 0644); err != nil {
 		return "", fmt.Errorf("writing temp config: %w", err)
 	}
 	if err := os.Rename(tmpPath, configPath); err != nil {
@@ -38,7 +40,19 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 		return "", fmt.Errorf("atomic rename failed: %w", err)
 	}
 
-	output := fmt.Sprintf("wrote %d bytes to %s", len(params.Content), configPath)
+	// The Debian/Ubuntu Patroni systemd unit ships with
+	//   ConditionPathExists=/etc/patroni/config.yml
+	// but the conductor writes to patroni.yml. Create a symlink so systemd
+	// will actually start the service. This is idempotent — Remove ignores
+	// "no such file" errors.
+	symlinkPath := filepath.Join(dir, "config.yml")
+	_ = os.Remove(symlinkPath) // remove stale file or old symlink if present
+	symlinkNote := ", symlinked config.yml"
+	if err := os.Symlink("patroni.yml", symlinkPath); err != nil {
+		symlinkNote = fmt.Sprintf(", warn: config.yml symlink failed: %v", err)
+	}
+
+	output := fmt.Sprintf("wrote %d bytes to %s%s", len(params.Content), configPath, symlinkNote)
 
 	if params.RestartAfter {
 		cmd := exec.Command("systemctl", "restart", "patroni")

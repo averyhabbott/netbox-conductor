@@ -9,6 +9,8 @@ import { credentialsApi, credentialLabels } from '../api/credentials'
 import type { Credential, CredentialKind, GeneratedCredential } from '../api/credentials'
 import { patroniApi } from '../api/patroni'
 import type { PushResult } from '../api/patroni'
+import { alertsApi } from '../api/alerts'
+import type { ClusterLogEntry } from '../api/alerts'
 import client from '../api/client'
 import Layout from '../components/Layout'
 import AddNodeWizard from './AddNodeWizard'
@@ -861,7 +863,7 @@ function FailoverToggle({
   )
 }
 
-function FailoverCard({ cluster }: { cluster: Cluster }) {
+function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) {
   const qc = useQueryClient()
 
   const [autoFailover, setAutoFailover] = useState(cluster.auto_failover)
@@ -871,6 +873,7 @@ function FailoverCard({ cluster }: { cluster: Cluster }) {
   const [delaySecs, setDelaySecs] = useState(String(cluster.failover_delay_secs || 30))
   const [sentinelMaster, setSentinelMaster] = useState(cluster.redis_sentinel_master || 'netbox')
   const [saveBackup, setSaveBackup] = useState(true)
+  const [primaryNodeId, setPrimaryNodeId] = useState('')
 
   // Warning modal state (shown when Patroni is already configured)
   const [showWarning, setShowWarning] = useState(false)
@@ -906,6 +909,7 @@ function FailoverCard({ cluster }: { cluster: Cluster }) {
         vip: cluster.vip ?? null,
         redis_sentinel_master: sentinelMaster,
         save_backup: saveBackup,
+        primary_node_id: primaryNodeId || undefined,
       }),
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['cluster', cluster.id] })
@@ -1039,6 +1043,33 @@ function FailoverCard({ cluster }: { cluster: Cluster }) {
         </label>
       )}
 
+      {/* Primary node selector — shown when multiple nodes exist so the operator can
+          pin the primary explicitly. When left on "Auto", the backend picks the
+          highest-priority connected node that's running NetBox. */}
+      {nodes && nodes.length > 1 && isActiveStandby && (
+        <div className="flex items-center justify-between py-3 border-b border-gray-800">
+          <div>
+            <p className="text-sm font-medium text-gray-200">Primary node</p>
+            <p className="text-xs text-gray-500 mt-0.5">
+              The node that will become the Patroni primary. Auto selects the highest-priority running node.
+            </p>
+          </div>
+          <select
+            value={primaryNodeId}
+            onChange={(e) => setPrimaryNodeId(e.target.value)}
+            disabled={isPending}
+            className="w-44 text-sm bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
+          >
+            <option value="">Auto</option>
+            {nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.hostname}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
       {/* Result panel */}
       {result && (
         <div className="mt-4 p-4 bg-gray-800/60 border border-gray-700 rounded-lg text-xs space-y-2">
@@ -1064,12 +1095,20 @@ function FailoverCard({ cluster }: { cluster: Cluster }) {
               {result.warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
             </ul>
           )}
-          <button
-            onClick={() => setResult(null)}
-            className="text-gray-500 hover:text-gray-300 text-xs mt-1"
-          >
-            Dismiss
-          </button>
+          <div className="flex items-center gap-4 mt-1">
+            <button
+              onClick={() => setResult(null)}
+              className="text-gray-500 hover:text-gray-300 text-xs"
+            >
+              Dismiss
+            </button>
+            <Link
+              to={`/clusters/${cluster.id}?tab=logs`}
+              className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
+            >
+              Follow →
+            </Link>
+          </div>
         </div>
       )}
 
@@ -1369,13 +1408,90 @@ function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
   )
 }
 
-type Tab = 'nodes' | 'database' | 'settings' | 'deployment' | 'history' | 'audit'
+// ── Logs tab ──────────────────────────────────────────────────────────────────
+
+const LOG_LEVEL_COLOR: Record<string, string> = {
+  debug: 'text-gray-500',
+  info: 'text-gray-300',
+  warn: 'text-amber-400',
+  error: 'text-red-400',
+}
+
+const LOG_SOURCE_BADGE: Record<string, string> = {
+  conductor: 'bg-blue-900/40 text-blue-300',
+  agent: 'bg-purple-900/40 text-purple-300',
+  netbox: 'bg-emerald-900/40 text-emerald-300',
+}
+
+function LogsTab({ clusterId }: { clusterId: string }) {
+  const [minLevel, setMinLevel] = useState('')
+  const { data: entries = [], isLoading, refetch } = useQuery({
+    queryKey: ['cluster-logs', clusterId, minLevel],
+    queryFn: () => alertsApi.clusterLogs(clusterId, { level: minLevel || undefined, limit: 300 }),
+    refetchInterval: 15_000,
+  })
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-medium">Cluster Logs</h3>
+        <div className="flex items-center gap-3">
+          <select
+            value={minLevel}
+            onChange={(e) => setMinLevel(e.target.value)}
+            className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 focus:outline-none"
+          >
+            <option value="">All levels</option>
+            <option value="debug">Debug+</option>
+            <option value="info">Info+</option>
+            <option value="warn">Warn+</option>
+            <option value="error">Error only</option>
+          </select>
+          <button onClick={() => refetch()} className="text-xs text-gray-500 hover:text-gray-300">
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <p className="text-gray-500 text-sm">Loading…</p>
+      ) : entries.length === 0 ? (
+        <p className="text-gray-500 text-sm">No log entries yet.</p>
+      ) : (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+          <div className="max-h-[32rem] overflow-y-auto divide-y divide-gray-800/60">
+            {entries.map((e: ClusterLogEntry) => (
+              <div key={e.id} className="px-4 py-2 flex items-start gap-3 text-xs">
+                <span className="text-gray-600 flex-shrink-0 w-36 font-mono">
+                  {new Date(e.occurred_at).toLocaleTimeString()}
+                </span>
+                <span className={`font-bold w-10 flex-shrink-0 ${LOG_LEVEL_COLOR[e.level] ?? 'text-gray-400'}`}>
+                  {e.level.toUpperCase()}
+                </span>
+                <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${LOG_SOURCE_BADGE[e.source] ?? 'bg-gray-800 text-gray-400'}`}>
+                  {e.source}
+                </span>
+                {e.hostname && (
+                  <span className="text-gray-500 flex-shrink-0">{e.hostname}</span>
+                )}
+                <span className="text-gray-200 break-all">{e.message}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+type Tab = 'nodes' | 'database' | 'settings' | 'deployment' | 'history' | 'audit' | 'logs'
 
 export default function ClusterDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const qc = useQueryClient()
-  const [tab, setTab] = useState<Tab>('nodes')
+  const initialTab = (new URLSearchParams(window.location.search).get('tab') as Tab | null) ?? 'nodes'
+  const [tab, setTab] = useState<Tab>(initialTab)
   const [showWizard, setShowWizard] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showAgentMenu, setShowAgentMenu] = useState(false)
@@ -1511,7 +1627,7 @@ export default function ClusterDetail() {
 
       {/* Tabs */}
       <div className="border-b border-gray-800 mb-6">
-        {(['nodes', 'database', 'settings', 'deployment', 'history', 'audit'] as Tab[]).map((t) => (
+        {(['nodes', 'database', 'settings', 'deployment', 'history', 'audit', 'logs'] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -1663,7 +1779,7 @@ export default function ClusterDetail() {
           </div>
 
           {/* Failover */}
-          <FailoverCard cluster={cluster} />
+          <FailoverCard cluster={cluster} nodes={nodes} />
 
           {/* Media Sync */}
           <MediaSyncCard cluster={cluster} />
@@ -1675,6 +1791,8 @@ export default function ClusterDetail() {
       )}
 
       {tab === 'audit' && id && <AuditTab clusterId={id} />}
+
+      {tab === 'logs' && id && <LogsTab clusterId={id} />}
 
       {showWizard && (
         <AddNodeWizard
