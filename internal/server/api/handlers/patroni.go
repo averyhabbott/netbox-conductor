@@ -1261,6 +1261,19 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// Stage the replicator PostgreSQL role on the primary before Patroni takes over.
+	// Patroni's bootstrap.users only fires during initdb — it is skipped when taking
+	// over an existing cluster. Creating the role here ensures the replica can connect
+	// for streaming replication as soon as Patroni starts.
+	rp, _ := json.Marshal(protocol.CreatePgRoleParams{
+		RoleName: replicaUser,
+		Password: replicaPass,
+		Options:  []string{"LOGIN", "REPLICATION"},
+	})
+	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 30); err != nil {
+		warnings = append(warnings, "create replicator role dispatch failed: "+err.Error())
+	}
+
 	// Push patroni.yml to every node, then restart Patroni.
 	// Tasks are dispatched in order: install → write_config → restart.
 	// The agent serializes tasks in a queue, so each step completes before the

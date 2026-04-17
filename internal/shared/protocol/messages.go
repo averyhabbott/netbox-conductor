@@ -33,6 +33,7 @@ const (
 	TaskRestartNetbox     TaskType = "service.restart.netbox"
 	TaskRestartRQ         TaskType = "service.restart.rq"
 	TaskInstallPatroni    TaskType = "patroni.install"
+	TaskCreatePgRole      TaskType = "postgres.create_role"
 	TaskWritePatroniConf  TaskType = "patroni.write_config"
 	TaskRestartPatroni    TaskType = "service.restart.patroni"
 	TaskRestartRedis      TaskType = "service.restart.redis"
@@ -248,6 +249,16 @@ type MediaSyncParams struct {
 type PatroniInstallParams struct {
 	PackageManager string `json:"package_manager"` // "apt-get" | "yum" | "dnf" — auto-detected if empty
 	InstallCmd     string `json:"install_cmd"`     // optional full override command
+}
+
+// CreatePgRoleParams are the params for TaskCreatePgRole.
+// The conductor constructs the role details; the agent executes the SQL as the
+// postgres OS user via peer authentication — no pg_hba.conf remote-access rules
+// or database passwords required.
+type CreatePgRoleParams struct {
+	RoleName string   `json:"role_name"`
+	Password string   `json:"password"`
+	Options  []string `json:"options"` // e.g. ["LOGIN", "REPLICATION"]
 }
 
 // EnforceRetentionParams are the params for TaskEnforceRetention.

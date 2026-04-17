@@ -163,7 +163,11 @@ func main() {
 
 	// Wire heartbeat function
 	client.HeartbeatFn = func() (protocol.HeartbeatPayload, error) {
-		return metrics.Collect()
+		hb, err := metrics.Collect()
+		if err == nil && cfg.PatroniRESTURL != "" && hb.PatroniRunning && hb.PatroniRole == "" {
+			slog.Warn("patroni service is running but not connected to cluster")
+		}
+		return hb, err
 	}
 
 	// Update status server state whenever the server delivers cluster config.
@@ -414,6 +418,20 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			errMsg = "bad params: " + err.Error()
 		} else {
 			out, err := executor.UpdateDBHost(params, cfg.NetboxConfigPath)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskCreatePgRole:
+		var params protocol.CreatePgRoleParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.CreatePgRole(params)
 			output = out
 			if err != nil {
 				errMsg = err.Error()

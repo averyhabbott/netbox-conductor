@@ -65,23 +65,14 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 		symlinkNote += confNote
 	}
 
-	// Ensure /var/lib/patroni exists (writable by postgres) for the Raft journal.
-	raftDir := "/var/lib/patroni"
-	if err := os.MkdirAll(raftDir, 0755); err == nil {
-		_ = os.Chmod(raftDir, 0755)
-		// chown to postgres if possible (best-effort)
-		_ = exec.Command("chown", "postgres:postgres", raftDir).Run()
-	}
-
 	output := fmt.Sprintf("wrote %d bytes to %s%s", len(params.Content), configPath, symlinkNote)
 
 	if params.RestartAfter {
 		cmd := exec.Command("systemctl", "restart", "patroni")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			output += "\nwarn: patroni restart failed: " + err.Error() + "\n" + string(out)
-		} else {
-			output += "\nrestarted patroni"
+			return output, fmt.Errorf("patroni restart failed: %w\n%s", err, out)
 		}
+		output += "\nrestarted patroni"
 	}
 
 	return output, nil

@@ -18,4 +18,5 @@ netbox-agent ALL=(ALL) NOPASSWD: \
 # so that peer authentication works without a password.
 netbox-agent ALL=(postgres) NOPASSWD: \
   /usr/bin/pg_dump, \
+  /usr/bin/psql, \
   /bin/mkdir
