@@ -63,7 +63,9 @@ function HealthDot({ status }: { status?: string }) {
   )
 }
 
-function ServiceBadge({ running, label }: { running: boolean | null | undefined; label: string }) {
+function ServiceBadge({ running, label, unknown }: { running: boolean | null | undefined; label: string; unknown?: boolean }) {
+  if (unknown)
+    return <span className="text-gray-500 text-xs">{label}: ?</span>
   if (running === null || running === undefined)
     return <span className="text-gray-600 text-xs">{label}: —</span>
   return (
@@ -79,11 +81,15 @@ function ServiceBadgeWithRole({
   running,
   label,
   role,
+  unknown,
 }: {
   running: boolean | null | undefined
   label: string
   role?: string
+  unknown?: boolean
 }) {
+  if (unknown)
+    return <span className="text-gray-500 text-xs">{label}: ?</span>
   if (running === null || running === undefined)
     return <span className="text-gray-600 text-xs">{label}: —</span>
   const roleStr = role ? ` (${role})` : ''
@@ -245,6 +251,7 @@ function NodeRow({
     node.agent_status === 'connected' &&
     node.agent_version != null &&
     node.agent_version !== CURRENT_AGENT_VERSION
+  const disconnected = node.agent_status !== 'connected'
 
   return (
     <tr
@@ -263,15 +270,15 @@ function NodeRow({
         </div>
         <div className="text-xs text-gray-500 font-mono">{node.ip_address}</div>
       </td>
-      {/* Active App — green checkmark when NetBox is running */}
+      {/* Active App — green checkmark when connected and NetBox is running */}
       <td className="px-6 py-4 text-center">
-        {node.netbox_running === true && (
+        {!disconnected && node.netbox_running === true && (
           <span className="text-emerald-400 text-base" title="Active app node">✓</span>
         )}
       </td>
-      {/* Active DB — green checkmark when this node is the Patroni primary */}
+      {/* Active DB — green checkmark when connected and this node is the Patroni primary */}
       <td className="px-6 py-4 text-center">
-        {(node.patroni_state?.role === 'primary' || node.patroni_state?.role === 'master') && (
+        {!disconnected && (node.patroni_state?.role === 'primary' || node.patroni_state?.role === 'master') && (
           <span className="text-emerald-400 text-base" title="Active DB (Patroni primary)">✓</span>
         )}
       </td>
@@ -298,22 +305,24 @@ function NodeRow({
       </td>
       <td className="px-6 py-4">
         <div className="flex gap-3">
-          <ServiceBadge running={node.netbox_running} label="NetBox" />
-          <ServiceBadge running={node.rq_running} label="RQ" />
+          <ServiceBadge running={node.netbox_running} label="NetBox" unknown={disconnected} />
+          <ServiceBadge running={node.rq_running} label="RQ" unknown={disconnected} />
         </div>
         <div className="flex gap-3 mt-1">
           <ServiceBadgeWithRole
             running={node.patroni_running}
             label="Patroni"
             role={node.patroni_state?.role as string | undefined}
+            unknown={disconnected}
           />
           <ServiceBadgeWithRole
             running={node.redis_running}
             label="Redis"
             role={node.redis_role}
+            unknown={disconnected}
           />
-          <ServiceBadge running={node.sentinel_running} label="Sentinel" />
-          <ServiceBadge running={node.postgres_running} label="DB" />
+          <ServiceBadge running={node.sentinel_running} label="Sentinel" unknown={disconnected} />
+          <ServiceBadge running={node.postgres_running} label="DB" unknown={disconnected} />
         </div>
         {node.netbox_version && (
           <div className="text-xs text-gray-500 mt-0.5">nb {node.netbox_version}</div>
