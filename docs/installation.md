@@ -169,10 +169,10 @@ Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required value
 DATABASE_URL=postgres://netbox_conductor@localhost:5432/netbox_conductor?sslmode=disable
 
 # Database password — injected into DATABASE_URL at startup (use the password generated in Step 5)
-DB_PASSWORD=<generated password>
+DB_PASSWORD=
 
 # Secret used to sign JWT tokens — paste the output of: openssl rand -hex 32
-JWT_SECRET=<openssl output>
+JWT_SECRET=
 
 # Address and port the server binds to (port 443 requires root or CAP_NET_BIND_SERVICE)
 LISTEN_ADDR=:8443
@@ -180,7 +180,7 @@ LISTEN_ADDR=:8443
 # The conductor's reachable IP address — must be a valid IPv4 or IPv6 address, not a hostname.
 # Used as the Patroni Raft witness listen address and, when SERVER_URL is not set, as the
 # base URL included in agent ENV snippets. Required for active_standby (Patroni) clusters.
-SERVER_BIND_IP=192.168.1.10
+SERVER_BIND_IP=
 
 # Public base URL included in agent ENV snippets (optional).
 # If omitted, derived automatically from SERVER_BIND_IP and LISTEN_ADDR.
