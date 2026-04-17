@@ -1274,6 +1274,18 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		warnings = append(warnings, "create replicator role dispatch failed: "+err.Error())
 	}
 
+	// Set the postgres superuser password to match what Patroni expects.
+	// bootstrap.users only fires during initdb — on an existing cluster this must be
+	// done explicitly. CreatePgRole is idempotent and uses peer auth.
+	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
+		RoleName: superUser,
+		Password: superPass,
+		Options:  []string{},
+	})
+	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 30); err != nil {
+		warnings = append(warnings, "set postgres superuser password dispatch failed: "+err.Error())
+	}
+
 	// Push patroni.yml to every node, then restart Patroni.
 	// Tasks are dispatched in order: install → write_config → restart.
 	// The agent serializes tasks in a queue, so each step completes before the
