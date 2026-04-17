@@ -165,8 +165,11 @@ openssl rand -hex 32
 Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required values:
 
 ```bash
-# PostgreSQL connection string — use the password generated in Step 5
-DATABASE_URL=postgres://netbox_conductor:<password>@localhost:5432/netbox_conductor?sslmode=disable
+# PostgreSQL connection string — no password here; set it in DB_PASSWORD below
+DATABASE_URL=postgres://netbox_conductor@localhost:5432/netbox_conductor?sslmode=disable
+
+# Database password — injected into DATABASE_URL at startup (use the password generated in Step 5)
+DB_PASSWORD=<generated password>
 
 # Secret used to sign JWT tokens — paste the output of: openssl rand -hex 32
 JWT_SECRET=<openssl output>
