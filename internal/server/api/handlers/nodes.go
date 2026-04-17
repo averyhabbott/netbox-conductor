@@ -93,6 +93,12 @@ type nodeResponse struct {
 	LastSeenAt        *string `json:"last_seen_at,omitempty"`
 	CreatedAt         string  `json:"created_at"`
 	UpdatedAt         string  `json:"updated_at"`
+	// Service-level health indicators from heartbeat.
+	RedisRunning    *bool  `json:"redis_running"`
+	RedisRole       string `json:"redis_role,omitempty"`
+	SentinelRunning *bool  `json:"sentinel_running"`
+	PatroniRunning  *bool  `json:"patroni_running"`
+	PostgresRunning *bool  `json:"postgres_running"`
 }
 
 func toNodeResponse(n *queries.Node) nodeResponse {
@@ -117,6 +123,11 @@ func toNodeResponse(n *queries.Node) nodeResponse {
 		SSHPort:           n.SSHPort,
 		CreatedAt:         n.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:         n.UpdatedAt.Format(time.RFC3339),
+		RedisRunning:      n.RedisRunning,
+		RedisRole:         n.RedisRole,
+		SentinelRunning:   n.SentinelRunning,
+		PatroniRunning:    n.PatroniRunning,
+		PostgresRunning:   n.PostgresRunning,
 	}
 	if n.LastSeenAt != nil {
 		s := n.LastSeenAt.Format(time.RFC3339)

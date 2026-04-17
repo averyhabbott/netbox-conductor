@@ -27,6 +27,13 @@ type Node struct {
 	SSHPort           int
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+
+	// Service-level health (populated from agent heartbeats).
+	RedisRunning    *bool
+	RedisRole       string
+	SentinelRunning *bool
+	PatroniRunning  *bool
+	PostgresRunning *bool
 }
 
 // AgentToken represents a row in the agent_tokens table.
@@ -61,7 +68,8 @@ func NewNodeQuerier(pool *pgxpool.Pool) *NodeQuerier {
 const nodeColumns = `
 	id, cluster_id, hostname, ip_address::text, role, failover_priority,
 	agent_status, last_seen_at, patroni_state, netbox_running, rq_running,
-	suppress_auto_start, maintenance_mode, ssh_port, created_at, updated_at`
+	suppress_auto_start, maintenance_mode, ssh_port, created_at, updated_at,
+	redis_running, COALESCE(redis_role, ''), sentinel_running, patroni_running, postgres_running`
 
 func scanNode(row interface {
 	Scan(...any) error
@@ -73,6 +81,7 @@ func scanNode(row interface {
 		&n.PatroniState, &n.NetboxRunning, &n.RQRunning,
 		&n.SuppressAutoStart, &n.MaintenanceMode, &n.SSHPort,
 		&n.CreatedAt, &n.UpdatedAt,
+		&n.RedisRunning, &n.RedisRole, &n.SentinelRunning, &n.PatroniRunning, &n.PostgresRunning,
 	); err != nil {
 		return nil, err
 	}
@@ -132,17 +141,31 @@ func (q *NodeQuerier) UpdateAgentStatus(ctx context.Context, id uuid.UUID, statu
 	return err
 }
 
-func (q *NodeQuerier) UpdateHeartbeat(ctx context.Context, id uuid.UUID, netboxRunning, rqRunning bool, patroniState json.RawMessage) error {
+func (q *NodeQuerier) UpdateHeartbeat(
+	ctx context.Context,
+	id uuid.UUID,
+	netboxRunning, rqRunning bool,
+	patroniState json.RawMessage,
+	redisRunning bool,
+	redisRole string,
+	sentinelRunning, patroniRunning, postgresRunning bool,
+) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE nodes
-		SET last_seen_at = now(),
-		    agent_status = 'connected',
-		    netbox_running = $2,
-		    rq_running = $3,
-		    patroni_state = $4,
-		    updated_at = now()
+		SET last_seen_at      = now(),
+		    agent_status      = 'connected',
+		    netbox_running    = $2,
+		    rq_running        = $3,
+		    patroni_state     = $4,
+		    redis_running     = $5,
+		    redis_role        = NULLIF($6, ''),
+		    sentinel_running  = $7,
+		    patroni_running   = $8,
+		    postgres_running  = $9,
+		    updated_at        = now()
 		WHERE id = $1
-	`, id, netboxRunning, rqRunning, patroniState)
+	`, id, netboxRunning, rqRunning, patroniState,
+		redisRunning, redisRole, sentinelRunning, patroniRunning, postgresRunning)
 	return err
 }
 

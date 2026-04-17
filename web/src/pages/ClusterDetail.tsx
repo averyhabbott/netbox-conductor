@@ -63,14 +63,33 @@ function HealthDot({ status }: { status?: string }) {
   )
 }
 
-function ServiceBadge({ running, label }: { running: boolean | null; label: string }) {
-  if (running === null)
+function ServiceBadge({ running, label }: { running: boolean | null | undefined; label: string }) {
+  if (running === null || running === undefined)
     return <span className="text-gray-600 text-xs">{label}: —</span>
   return (
     <span
       className={`text-xs ${running ? 'text-emerald-400' : 'text-red-400'}`}
     >
       {label}: {running ? '✓' : '✗'}
+    </span>
+  )
+}
+
+function ServiceBadgeWithRole({
+  running,
+  label,
+  role,
+}: {
+  running: boolean | null | undefined
+  label: string
+  role?: string
+}) {
+  if (running === null || running === undefined)
+    return <span className="text-gray-600 text-xs">{label}: —</span>
+  const roleStr = role ? ` (${role})` : ''
+  return (
+    <span className={`text-xs ${running ? 'text-emerald-400' : 'text-red-400'}`}>
+      {label}: {running ? '✓' : '✗'}{roleStr}
     </span>
   )
 }
@@ -104,6 +123,18 @@ function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
         </div>
         <div className="text-xs text-gray-500 font-mono">{node.ip_address}</div>
       </td>
+      {/* Active App — green checkmark when NetBox is running */}
+      <td className="px-6 py-4 text-center">
+        {node.netbox_running === true && (
+          <span className="text-emerald-400 text-base" title="Active app node">✓</span>
+        )}
+      </td>
+      {/* Active DB — green checkmark when this node is the Patroni primary */}
+      <td className="px-6 py-4 text-center">
+        {(node.patroni_state?.role === 'primary' || node.patroni_state?.role === 'master') && (
+          <span className="text-emerald-400 text-base" title="Active DB (Patroni primary)">✓</span>
+        )}
+      </td>
       <td className="px-6 py-4 text-gray-300 text-sm capitalize">
         {node.role.replace('_', ' ')}
       </td>
@@ -129,6 +160,20 @@ function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
         <div className="flex gap-3">
           <ServiceBadge running={node.netbox_running} label="NetBox" />
           <ServiceBadge running={node.rq_running} label="RQ" />
+        </div>
+        <div className="flex gap-3 mt-1">
+          <ServiceBadgeWithRole
+            running={node.patroni_running}
+            label="Patroni"
+            role={node.patroni_state?.role as string | undefined}
+          />
+          <ServiceBadgeWithRole
+            running={node.redis_running}
+            label="Redis"
+            role={node.redis_role}
+          />
+          <ServiceBadge running={node.sentinel_running} label="Sentinel" />
+          <ServiceBadge running={node.postgres_running} label="DB" />
         </div>
         {node.netbox_version && (
           <div className="text-xs text-gray-500 mt-0.5">nb {node.netbox_version}</div>
@@ -1696,6 +1741,8 @@ export default function ClusterDetail() {
                 <thead>
                   <tr className="border-b border-gray-800 text-gray-400">
                     <th className="text-left px-6 py-3 font-medium">Hostname</th>
+                    <th className="px-6 py-3 font-medium text-center">Active App</th>
+                    <th className="px-6 py-3 font-medium text-center">Active DB</th>
                     <th className="text-left px-6 py-3 font-medium">Role</th>
                     <th className="text-left px-6 py-3 font-medium">Agent</th>
                     <th className="text-left px-6 py-3 font-medium">Services</th>

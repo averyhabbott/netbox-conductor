@@ -82,6 +82,13 @@ type HeartbeatPayload struct {
 	PatroniRole   string   `json:"patroni_role"`   // "primary", "replica", "standby_leader", ""
 	PatroniLagB   *int64   `json:"patroni_lag_bytes,omitempty"`
 	PatroniState  *json.RawMessage `json:"patroni_state,omitempty"` // full Patroni /patroni response
+
+	// Service-level health indicators added in v0.1.1+.
+	RedisRunning    bool   `json:"redis_running"`
+	RedisRole       string `json:"redis_role,omitempty"`    // "master" | "slave" | ""
+	SentinelRunning bool   `json:"sentinel_running"`
+	PatroniRunning  bool   `json:"patroni_running"`
+	PostgresRunning bool   `json:"postgres_running"`
 }
 
 // PatroniStatePayload is sent proactively when the agent detects a role change.

@@ -67,6 +67,11 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 	// Service state
 	hb.NetboxRunning = isServiceActive("netbox")
 	hb.RQRunning = isServiceActive("netbox-rq")
+	hb.RedisRunning = isServiceActive("redis")
+	hb.RedisRole = queryRedisRole()
+	hb.SentinelRunning = isServiceActive("redis-sentinel")
+	hb.PatroniRunning = isServiceActive("patroni")
+	hb.PostgresRunning = isPostgresReady()
 
 	// NetBox version (cached; re-detected if empty)
 	if m.cachedNBVersion == "" {
@@ -86,6 +91,29 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 	}
 
 	return hb, nil
+}
+
+// queryRedisRole calls the local redis-cli and returns "master", "slave", or "".
+func queryRedisRole() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "redis-cli", "-p", "6379", "ROLE").Output()
+	if err != nil {
+		return ""
+	}
+	parts := strings.Fields(string(out))
+	if len(parts) > 0 {
+		return strings.ToLower(parts[0])
+	}
+	return ""
+}
+
+// isPostgresReady uses pg_isready to check whether Postgres is accepting connections.
+// More reliable than checking the systemd unit name, which varies across distro versions.
+func isPostgresReady() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "pg_isready", "-q").Run() == nil
 }
 
 // isServiceActive checks if a systemd service is active.

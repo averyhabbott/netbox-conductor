@@ -561,7 +561,11 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 		patroniStateJSON = *hb.PatroniState
 	}
 
-	if err := h.nodes.UpdateHeartbeat(ctx, sess.NodeID, hb.NetboxRunning, hb.RQRunning, patroniStateJSON); err != nil {
+	if err := h.nodes.UpdateHeartbeat(ctx, sess.NodeID,
+		hb.NetboxRunning, hb.RQRunning, patroniStateJSON,
+		hb.RedisRunning, hb.RedisRole,
+		hb.SentinelRunning, hb.PatroniRunning, hb.PostgresRunning,
+	); err != nil {
 		logger.Warn("heartbeat DB update failed", "error", err)
 	}
 
@@ -601,14 +605,19 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 		Type:   sse.EventNodeHeartbeat,
 		NodeID: sess.NodeID,
 		Payload: map[string]any{
-			"node_id":        sess.NodeID,
-			"load_avg_1":     hb.LoadAvg1,
-			"load_avg_5":     hb.LoadAvg5,
-			"mem_used_pct":   hb.MemUsedPct,
-			"disk_used_pct":  hb.DiskUsedPct,
-			"netbox_running": hb.NetboxRunning,
-			"rq_running":     hb.RQRunning,
-			"patroni_role":   hb.PatroniRole,
+			"node_id":         sess.NodeID,
+			"load_avg_1":      hb.LoadAvg1,
+			"load_avg_5":      hb.LoadAvg5,
+			"mem_used_pct":    hb.MemUsedPct,
+			"disk_used_pct":   hb.DiskUsedPct,
+			"netbox_running":  hb.NetboxRunning,
+			"rq_running":      hb.RQRunning,
+			"patroni_role":    hb.PatroniRole,
+			"redis_running":   hb.RedisRunning,
+			"redis_role":      hb.RedisRole,
+			"sentinel_running": hb.SentinelRunning,
+			"patroni_running": hb.PatroniRunning,
+			"postgres_running": hb.PostgresRunning,
 		},
 	})
 }

@@ -20,6 +20,12 @@ export interface Node {
   patroni_state?: Record<string, unknown>
   created_at: string
   updated_at: string
+  // Service-level health indicators from heartbeat
+  redis_running?: boolean | null
+  redis_role?: string
+  sentinel_running?: boolean | null
+  patroni_running?: boolean | null
+  postgres_running?: boolean | null
 }
 
 export interface CreateNodeBody {
