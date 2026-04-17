@@ -4,6 +4,8 @@
 set -euo pipefail
 
 BIN_DEST=/usr/local/bin/netbox-agent
+OPT_DIR=/opt/netbox-agent
+VENV_DIR=/opt/netbox-agent/venv
 ENV_DIR=/etc/netbox-agent
 SERVICE_FILE=/etc/systemd/system/netbox-agent.service
 
@@ -15,6 +17,11 @@ fi
 echo "→ Creating netbox-agent user/group"
 groupadd --system netbox-agent 2>/dev/null || true
 useradd --system --gid netbox-agent --no-create-home --shell /usr/sbin/nologin netbox-agent 2>/dev/null || true
+
+echo "→ Creating $OPT_DIR"
+mkdir -p "$OPT_DIR"
+chown netbox-agent:netbox-agent "$OPT_DIR"
+chmod 755 "$OPT_DIR"
 
 echo "→ Installing binary to $BIN_DEST"
 install -m 755 netbox-agent "$BIN_DEST"
@@ -35,6 +42,14 @@ else
   chmod 600 "$ENV_DIR/netbox-agent.env"
   echo "  $ENV_DIR/netbox-agent.env already exists — permissions updated"
 fi
+
+echo "→ Installing example configs to $ENV_DIR/examples"
+mkdir -p "$ENV_DIR/examples"
+install -m 644 nginx-netbox-conductor.conf "$ENV_DIR/examples/"
+install -m 644 apache-netbox-conductor.conf "$ENV_DIR/examples/"
+install -m 644 netbox-agent.env.example "$ENV_DIR/examples/"
+chown -R root:netbox-agent "$ENV_DIR/examples"
+chmod 750 "$ENV_DIR/examples"
 
 echo "→ Setting up managed directories"
 
@@ -78,33 +93,63 @@ chown netbox-agent:netbox-agent /etc/patroni
 chmod 750 /etc/patroni
 
 # ── HA packages: Patroni and Redis Sentinel ──────────────────────────────────
-# Install at agent-setup time (running as root) so the patroni.install task
-# never needs sudo. Enable patroni once here — no need to enable it before
-# every restart in the task handler.
-echo "→ Installing HA packages (patroni, redis-sentinel)"
+# Install at agent-setup time (running as root). redis-sentinel comes from the
+# system package manager. Patroni is installed via the apt package for its
+# systemd unit, then also installed into the venv below so the venv binary is
+# what actually runs (giving us a self-contained patronictl as well).
+echo "→ Installing HA packages (patroni, redis-sentinel, python3-venv)"
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get install -y patroni redis-sentinel
+  apt-get install -y patroni redis-sentinel python3-venv
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y patroni redis-sentinel
+  dnf install -y patroni redis-sentinel python3-virtualenv
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y patroni redis-sentinel
+  yum install -y patroni redis-sentinel python3-virtualenv
 else
   echo "  WARNING: no supported package manager found — install patroni and redis-sentinel manually"
 fi
-systemctl enable patroni 2>/dev/null || true
 
-# ── pysyncobj deps directory for Patroni Raft DCS ────────────────────────────
-# Pre-create a directory owned by netbox-agent so patroni.install can pip-install
-# pysyncobj without sudo. A systemd drop-in makes Patroni find it via PYTHONPATH.
-PATRONI_DEPS=/var/lib/netbox-agent/patroni-deps
-mkdir -p "$PATRONI_DEPS"
-chown netbox-agent:netbox-agent "$PATRONI_DEPS"
-chmod 755 "$PATRONI_DEPS"
+# Stop and disable the stock postgresql service — Patroni manages PostgreSQL exclusively.
+# On Debian/Ubuntu, both services try to own the same data directory; the stock service
+# must be stopped before Patroni can start postgres cleanly.
+systemctl stop postgresql 2>/dev/null || true
+systemctl disable postgresql 2>/dev/null || true
+
+# Patroni raft data directory — patroni runs as postgres, which cannot create dirs
+# under /var/lib itself. Create and own it here (running as root).
+mkdir -p /var/lib/patroni
+chown postgres:postgres /var/lib/patroni
+chmod 750 /var/lib/patroni
+
+# ── Patroni venv ──────────────────────────────────────────────────────────────
+# Create a Python venv at $VENV_DIR containing patroni + pysyncobj (Raft DCS).
+# Owned by netbox-agent (world-readable/executable) so:
+#   - the patroni.install task can pip-install pysyncobj without sudo
+#   - postgres (who runs patroni) can execute the venv binaries
+# The systemd drop-in overrides ExecStart to use the venv's patroni binary.
+# patronictl is symlinked onto PATH so it works without a venv prefix.
+echo "→ Creating Patroni venv at $VENV_DIR"
+python3 -m venv "$VENV_DIR"
+"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+"$VENV_DIR/bin/pip" install --quiet patroni pysyncobj
+chown -R netbox-agent:netbox-agent "$VENV_DIR"
+chmod -R 755 "$VENV_DIR"
+
+# Remove the old PYTHONPATH drop-in if present from a previous install.
+rm -f /etc/systemd/system/patroni.service.d/pythonpath.conf
+
+# Override Patroni's systemd ExecStart to use the venv binary.
+# The blank ExecStart= clears the apt-provided value before setting the new one.
 mkdir -p /etc/systemd/system/patroni.service.d
-cat > /etc/systemd/system/patroni.service.d/pythonpath.conf <<'EOF'
+cat > /etc/systemd/system/patroni.service.d/venv.conf <<EOF
 [Service]
-Environment=PYTHONPATH=/var/lib/netbox-agent/patroni-deps
+ExecStart=
+ExecStart=$VENV_DIR/bin/patroni /etc/patroni/config.yml
 EOF
+
+# Symlink patronictl onto PATH so operators can use it without a venv prefix.
+ln -sf "$VENV_DIR/bin/patronictl" /usr/local/bin/patronictl
+
+systemctl enable patroni 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 
 # ── Redis/Sentinel configuration directory ───────────────────────────────────

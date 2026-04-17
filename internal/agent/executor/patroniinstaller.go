@@ -2,40 +2,42 @@ package executor
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
-// patroniDepsDir is pre-created by the agent installer (owned by netbox-agent).
-// A patroni.service drop-in sets PYTHONPATH to this directory so Patroni finds
-// pysyncobj without it being installed into the global Python distribution.
-const patroniDepsDir = "/var/lib/netbox-agent/patroni-deps"
+// patroniVenv is the Python venv created by the agent installer (install.sh).
+// Owned by netbox-agent (world-readable/executable) so:
+//   - this task can pip-install pysyncobj without sudo
+//   - the postgres user (who runs patroni) can execute the venv binaries
+const patroniVenv = "/opt/netbox-agent/venv"
 
-// InstallPatroni verifies Patroni is present and installs the pysyncobj package
-// required for Patroni's built-in Raft DCS. Patroni and redis-sentinel are
-// pre-installed by the agent installer (install.sh) running as root, so this
-// task no longer needs sudo for package management.
+// InstallPatroni verifies the Patroni venv is present and installs the
+// pysyncobj package required for Patroni's built-in Raft DCS.
+// Both patroni and pysyncobj are pre-installed into the venv by install.sh;
+// this task re-runs pip install to ensure pysyncobj is current.
 func InstallPatroni(params protocol.PatroniInstallParams) (string, error) {
 	if params.InstallCmd != "" {
 		return runInstallCmd(params.InstallCmd)
 	}
 
-	// Verify patroni is installed (pre-installed by the agent installer).
-	if _, err := exec.LookPath("patroni"); err != nil {
-		return "", fmt.Errorf("patroni binary not found — re-run the agent installer to install it")
+	// Verify the venv patroni binary is present (created by the agent installer).
+	patroniBin := patroniVenv + "/bin/patroni"
+	if _, err := os.Stat(patroniBin); err != nil {
+		return "", fmt.Errorf("patroni not found at %s — re-run the agent installer", patroniBin)
 	}
 
-	// pysyncobj is required for Patroni's built-in Raft DCS but is not pulled
-	// in automatically by the apt package. Install into the pre-created deps dir
-	// (owned by netbox-agent) — no sudo needed.
-	pipCmd := exec.Command("pip3", "install", "--target", patroniDepsDir, "--quiet", "pysyncobj")
+	// Install (or upgrade) pysyncobj into the venv. The venv is owned by
+	// netbox-agent so no sudo is required.
+	pipCmd := exec.Command(patroniVenv+"/bin/pip", "install", "--quiet", "pysyncobj")
 	if pipOut, pipErr := pipCmd.CombinedOutput(); pipErr != nil {
 		return string(pipOut), fmt.Errorf("pysyncobj install failed: %w", pipErr)
 	}
 
-	return "pysyncobj installed", nil
+	return "pysyncobj installed to venv", nil
 }
 
 func runInstallCmd(cmd string) (string, error) {
