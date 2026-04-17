@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,17 +62,6 @@ func NewWitnessManager(cfg WitnessConfig) *WitnessManager {
 	}
 }
 
-// outboundIP returns the local IP used for outbound connections by dialing a
-// UDP "connection" (no packets are sent). Falls back to "" on error.
-func outboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
-}
-
 // Start launches a witness for the given cluster if not already running.
 // partnerAddrs are the Raft peer addresses of the data nodes ("host:5433").
 func (m *WitnessManager) Start(clusterID uuid.UUID, partnerAddrs []string) error {
@@ -84,17 +72,14 @@ func (m *WitnessManager) Start(clusterID uuid.UUID, partnerAddrs []string) error
 		return nil // already running
 	}
 
+	if m.cfg.ServerAddr == "" {
+		return fmt.Errorf("witness: SERVER_BIND_IP must be set to the conductor's reachable IP address")
+	}
+
 	port := m.nextPort
 	m.nextPort++
 
-	serverAddr := m.cfg.ServerAddr
-	if serverAddr == "" {
-		serverAddr = outboundIP()
-		if serverAddr != "" {
-			log.Printf("witness: SERVER_BIND_IP not set, auto-detected %s", serverAddr)
-		}
-	}
-	addr := fmt.Sprintf("%s:%d", serverAddr, port)
+	addr := fmt.Sprintf("%s:%d", m.cfg.ServerAddr, port)
 
 	proc := &witnessProc{
 		clusterID: clusterID,

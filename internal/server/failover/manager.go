@@ -11,16 +11,23 @@
 package failover
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -44,6 +51,8 @@ type Manager struct {
 	h          *hub.Hub
 	dispatcher *hub.Dispatcher
 	broker     *sse.Broker
+	creds      *queries.CredentialQuerier
+	enc        *crypto.Encryptor
 	grace      time.Duration
 	startedAt  time.Time // used for startup suppression window
 
@@ -61,6 +70,8 @@ func New(
 	h *hub.Hub,
 	dispatcher *hub.Dispatcher,
 	broker *sse.Broker,
+	creds *queries.CredentialQuerier,
+	enc *crypto.Encryptor,
 ) *Manager {
 	return &Manager{
 		nodes:          nodes,
@@ -70,6 +81,8 @@ func New(
 		h:              h,
 		dispatcher:     dispatcher,
 		broker:         broker,
+		creds:          creds,
+		enc:            enc,
 		grace:          DefaultGracePeriod,
 		startedAt:      time.Now(),
 		failTimers:     make(map[uuid.UUID]*time.Timer),
@@ -218,6 +231,21 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 		"priority", candidate.FailoverPriority,
 	)
 
+	// Trigger a Patroni switchover so the DB primary follows the new active node.
+	// Fetch all nodes for the switchover decision (bestCandidate already fetched them
+	// internally; this second call is acceptable on this rare, critical path).
+	allNodes, _ := m.nodes.ListByCluster(ctx, clusterID)
+	switchoverTriggered, switchoverErr := m.triggerPatroniSwitchover(ctx, cluster, candidate, allNodes, failedNodeID)
+	if switchoverErr != nil {
+		slog.Warn("failover: patroni switchover failed — NetBox start may fail if DB is read-only",
+			"cluster", clusterID, "error", switchoverErr)
+		// Do not abort — NetBox failover proceeds regardless.
+	}
+	if switchoverTriggered && cluster.AppTierAlwaysAvailable {
+		candidateIP, _, _ := strings.Cut(candidate.IPAddress, "/")
+		m.dispatchDBHostUpdate(ctx, allNodes, candidateIP)
+	}
+
 	if err := m.dispatchServiceTask(ctx, candidate, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failover: dispatch failed", "candidate", candidate.ID, "error", err)
 		m.recordEvent(ctx, queries.CreateFailoverEventParams{
@@ -322,6 +350,16 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 		"from", currentActive.Hostname, "priority", currentActive.FailoverPriority,
 		"to", reconnected.Hostname, "priority", reconnected.FailoverPriority,
 	)
+
+	// Trigger a Patroni switchover so the DB primary follows the reconnected node.
+	switchoverTriggered, switchoverErr := m.triggerPatroniSwitchover(ctx, cluster, reconnected, nodes, currentActive.ID)
+	if switchoverErr != nil {
+		slog.Warn("failback: patroni switchover failed", "cluster", clusterID, "error", switchoverErr)
+	}
+	if switchoverTriggered && cluster.AppTierAlwaysAvailable {
+		reconnectedIP, _, _ := strings.Cut(reconnected.IPAddress, "/")
+		m.dispatchDBHostUpdate(ctx, nodes, reconnectedIP)
+	}
 
 	if err := m.dispatchServiceTask(ctx, currentActive, protocol.TaskStopNetbox); err != nil {
 		slog.Error("failback: stop dispatch failed", "node", currentActive.ID, "error", err)
@@ -457,6 +495,17 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 		"to", candidate.Hostname,
 	)
 
+	// Trigger a Patroni switchover so the DB primary follows the candidate.
+	maintenanceNodes, _ := m.nodes.ListByCluster(ctx, clusterID)
+	switchoverTriggered, switchoverErr := m.triggerPatroniSwitchover(ctx, cluster, candidate, maintenanceNodes, nodeID)
+	if switchoverErr != nil {
+		slog.Warn("failover (maintenance): patroni switchover failed", "error", switchoverErr)
+	}
+	if switchoverTriggered && cluster.AppTierAlwaysAvailable {
+		candidateIP, _, _ := strings.Cut(candidate.IPAddress, "/")
+		m.dispatchDBHostUpdate(ctx, maintenanceNodes, candidateIP)
+	}
+
 	if err := m.dispatchServiceTask(ctx, node, protocol.TaskStopNetbox); err != nil {
 		slog.Error("failover (maintenance): stop dispatch failed", "node", node.ID, "error", err)
 		m.recordEvent(ctx, queries.CreateFailoverEventParams{
@@ -508,13 +557,16 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// bestCandidate returns the first connected, eligible node ordered by
+// bestCandidate returns the best connected, eligible node ordered by
 // failover_priority DESC (ListByCluster already sorts this way).
+// Healthy candidates are preferred over unhealthy ones within each priority tier.
 func (m *Manager) bestCandidate(ctx context.Context, clusterID, excludeNodeID uuid.UUID) (*queries.Node, error) {
 	nodes, err := m.nodes.ListByCluster(ctx, clusterID)
 	if err != nil {
 		return nil, err
 	}
+	// Collect eligible candidates (connected, not excluded, not maintenance/suppressed, not db_only).
+	var eligible []*queries.Node
 	for i := range nodes {
 		n := &nodes[i]
 		if n.ID == excludeNodeID {
@@ -526,9 +578,161 @@ func (m *Manager) bestCandidate(ctx context.Context, clusterID, excludeNodeID uu
 		if !m.h.IsConnected(n.ID) {
 			continue
 		}
-		return n, nil
+		eligible = append(eligible, n)
 	}
-	return nil, nil
+	if len(eligible) == 0 {
+		return nil, nil
+	}
+	// Prefer healthy candidates. Nodes are already sorted by failover_priority DESC,
+	// so the first healthy one is both the highest priority and healthy.
+	for _, n := range eligible {
+		patroniRole := nodestate.ExtractPatroniRole(n.PatroniState)
+		if nodestate.ComputeNodeHealth(n.Role, "connected", n.NetboxRunning, n.RQRunning, patroniRole, false) == "healthy" {
+			return n, nil
+		}
+	}
+	return eligible[0], nil // fallback: best priority regardless of health
+}
+
+// patroniRestCreds fetches and decrypts the Patroni REST API credentials for a cluster.
+// Returns empty strings if no credentials are found (e.g. Patroni not yet configured).
+func (m *Manager) patroniRestCreds(ctx context.Context, clusterID uuid.UUID) (user, pass string) {
+	if m.creds == nil || m.enc == nil {
+		return
+	}
+	cred, err := m.creds.GetByKind(ctx, clusterID, "patroni_rest_password")
+	if err != nil {
+		return
+	}
+	user = cred.Username
+	if pw, err := m.enc.Decrypt(cred.PasswordEnc); err == nil {
+		pass = string(pw)
+	}
+	return
+}
+
+// triggerPatroniSwitchover calls the Patroni REST API to move the primary to the candidate node.
+//
+// It is a no-op when:
+//   - the cluster does not use Patroni (PatroniConfigured=false)
+//   - the cluster mode is not active_standby
+//   - the candidate is already the Patroni primary (no switchover needed)
+//   - the candidate has no Patroni role (app+db_only topology — Patroni is on db_only nodes)
+//
+// When the current primary is still reachable, POST /switchover is called on it (graceful).
+// When the primary is unreachable, POST /failover is called on the candidate (forced).
+func (m *Manager) triggerPatroniSwitchover(
+	ctx context.Context,
+	cluster *queries.Cluster,
+	candidate *queries.Node,
+	nodes []queries.Node,
+	failingNodeID uuid.UUID,
+) (triggered bool, err error) {
+	if !cluster.PatroniConfigured || cluster.Mode != "active_standby" {
+		return false, nil
+	}
+	candidateRole := nodestate.ExtractPatroniRole(candidate.PatroniState)
+	// Candidate is already primary, or has no Patroni role (app-only node) — nothing to do.
+	if candidateRole == "primary" || candidateRole == "master" || candidateRole == "" {
+		return false, nil
+	}
+
+	// Find the connected Patroni primary. We do NOT exclude failingNodeID here:
+	// in the heartbeat path (NetBox stopped but agent still connected) the failing
+	// node may still be the Patroni primary and capable of a graceful switchover.
+	// Truly disconnected nodes are already excluded by IsConnected.
+	var primary *queries.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if !m.h.IsConnected(n.ID) {
+			continue
+		}
+		if r := nodestate.ExtractPatroniRole(n.PatroniState); r == "primary" || r == "master" {
+			primary = n
+			break
+		}
+	}
+
+	restUser, restPass := m.patroniRestCreds(ctx, cluster.ID)
+
+	if primary != nil {
+		// Graceful switchover: POST /switchover to the current primary's REST API.
+		primaryIP, _, _ := strings.Cut(primary.IPAddress, "/")
+		body, _ := json.Marshal(map[string]string{
+			"leader":    primary.Hostname,
+			"candidate": candidate.Hostname,
+		})
+		url := fmt.Sprintf("http://%s:8008/switchover", primaryIP)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.SetBasicAuth(restUser, restPass)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("patroni switchover request: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			out, _ := io.ReadAll(resp.Body)
+			return false, fmt.Errorf("patroni switchover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
+		}
+		slog.Info("failover: patroni switchover triggered via REST API",
+			"from", primary.Hostname, "to", candidate.Hostname)
+	} else {
+		// No connected primary — forced failover via candidate's REST API.
+		failingHostname := failingNodeID.String()
+		for i := range nodes {
+			if nodes[i].ID == failingNodeID {
+				failingHostname = nodes[i].Hostname
+				break
+			}
+		}
+		candidateIP, _, _ := strings.Cut(candidate.IPAddress, "/")
+		body, _ := json.Marshal(map[string]string{
+			"master":    failingHostname,
+			"candidate": candidate.Hostname,
+		})
+		url := fmt.Sprintf("http://%s:8008/failover", candidateIP)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.SetBasicAuth(restUser, restPass)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("patroni failover request: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			out, _ := io.ReadAll(resp.Body)
+			return false, fmt.Errorf("patroni failover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
+		}
+		slog.Info("failover: patroni forced failover triggered via REST API",
+			"dead_primary", failingHostname, "candidate", candidate.Hostname)
+	}
+	return true, nil
+}
+
+// dispatchDBHostUpdate sends a TaskUpdateDBHost task to all currently connected
+// cluster nodes. This is called after a Patroni switchover when
+// AppTierAlwaysAvailable=true so every node updates its DATABASE_HOST to point
+// at the new Patroni primary.
+func (m *Manager) dispatchDBHostUpdate(ctx context.Context, nodes []queries.Node, newHost string) {
+	params, _ := json.Marshal(protocol.DBHostUpdateParams{Host: newHost, RestartAfter: false})
+	for _, n := range nodes {
+		if !m.h.IsConnected(n.ID) {
+			continue
+		}
+		taskID := uuid.New()
+		_ = m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateDBHost), params)
+		if err := m.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
+			TaskID:      taskID.String(),
+			TaskType:    protocol.TaskUpdateDBHost,
+			Params:      json.RawMessage(params),
+			TimeoutSecs: 30,
+		}); err != nil {
+			slog.Warn("failover: db-host-update dispatch failed", "node", n.Hostname, "error", err)
+			continue
+		}
+		_ = m.tasks.SetSent(ctx, taskID)
+	}
 }
 
 func (m *Manager) dispatchServiceTask(ctx context.Context, node *queries.Node, taskType protocol.TaskType) error {

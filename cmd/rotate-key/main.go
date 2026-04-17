@@ -27,14 +27,11 @@ import (
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/jackc/pgx/v5"
-	"github.com/joho/godotenv"
 )
 
 func main() {
 	inPlace := flag.Bool("in-place", false, "overwrite the current key file instead of writing to NEW_MASTER_KEY_FILE")
 	flag.Parse()
-
-	_ = godotenv.Load()
 
 	dsn := requireEnv("DATABASE_URL")
 

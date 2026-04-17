@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,13 +32,10 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
 
 func main() {
-	_ = godotenv.Load()
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -50,12 +48,26 @@ func run(ctx context.Context) error {
 	dsn := requireEnv("DATABASE_URL")
 	jwtSecret := []byte(requireEnv("JWT_SECRET"))
 	addr := envOr("LISTEN_ADDR", ":8443")
-	serverURL := envOr("SERVER_URL", "")         // base URL shown in agent ENV snippets
-	serverBindIP := envOr("SERVER_BIND_IP", "")  // IP for witness to listen on
+	serverBindIP := envOr("SERVER_BIND_IP", "")
+	serverURL := envOr("SERVER_URL", "")
 
-	// If SERVER_URL has no explicit port, append the port from LISTEN_ADDR so
-	// that generated agent env snippets connect on the right port without
-	// requiring the operator to duplicate it in both env vars.
+	// Validate SERVER_BIND_IP — must be a parseable IP address, never a hostname,
+	// because it is written directly into Patroni configs as the witness Raft
+	// address that data nodes connect to.
+	if serverBindIP != "" {
+		if net.ParseIP(serverBindIP) == nil {
+			return fmt.Errorf("SERVER_BIND_IP %q is not a valid IP address — hostnames are not allowed", serverBindIP)
+		}
+	}
+
+	// Derive SERVER_URL from SERVER_BIND_IP when not explicitly set, so agents
+	// get a working WebSocket URL without requiring duplicate configuration.
+	if serverURL == "" && serverBindIP != "" {
+		serverURL = "https://" + serverBindIP
+	}
+
+	// Append the port from LISTEN_ADDR to SERVER_URL when the URL has no
+	// explicit port and the port is non-standard.
 	if serverURL != "" {
 		if u, err := url.Parse(serverURL); err == nil && u.Port() == "" {
 			if _, port, err := net.SplitHostPort(addr); err == nil && port != "" {
@@ -156,7 +168,7 @@ func run(ctx context.Context) error {
 	go recoverWitnesses(ctx, witnessManager, clusterQ, nodeQ)
 
 	// Failover manager — orchestrates automatic NetBox failover/failback
-	failoverManager := failover.New(nodeQ, clusterQ, taskQ, failoverEventQ, h, dispatcher, broker)
+	failoverManager := failover.New(nodeQ, clusterQ, taskQ, failoverEventQ, h, dispatcher, broker, credQ, enc)
 
 	// Alerting
 	alertSender := alerting.New(alertQ)
@@ -307,7 +319,8 @@ func recoverWitnesses(ctx context.Context, wm *patroni.WitnessManager, clusterQ 
 		var peers []string
 		for _, n := range nodes {
 			if n.Role == "hyperconverged" || n.Role == "db_only" {
-				peers = append(peers, fmt.Sprintf("%s:5433", n.IPAddress))
+				ip, _, _ := strings.Cut(n.IPAddress, "/")
+				peers = append(peers, ip+":5433")
 			}
 		}
 		if len(peers) > 0 {

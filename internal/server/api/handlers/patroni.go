@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -286,35 +287,44 @@ func (h *PatroniHandler) Switchover(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "no primary node found in cluster")
 	}
 
-	// Dispatch exec.run task to primary to run patronictl switchover
-	args := []string{"--master", primaryNode.Hostname}
+	// Fetch Patroni REST credentials.
+	var restUser, restPass string
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+		restUser = cred.Username
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			restPass = string(pw)
+		}
+	}
+
+	// Call the Patroni REST API directly — no agent exec.run required.
+	primaryIP := stripCIDR(primaryNode.IPAddress)
+	switchBody := map[string]string{"leader": primaryNode.Hostname}
 	if req.Candidate != "" {
-		args = append(args, "--candidate", req.Candidate)
+		switchBody["candidate"] = req.Candidate
 	}
-	args = append(args, "--force")
-
-	taskID := uuid.New()
-	params, _ := json.Marshal(protocol.RunCommandParams{
-		Command: "patronictl",
-		Args:    append([]string{"-c", "/etc/patroni/patroni.yml", "switchover"}, args...),
-	})
-
-	_ = h.taskResults.Create(ctx, primaryNode.ID, taskID, string(protocol.TaskRunCommand), params)
-
-	if err := h.dispatcher.Dispatch(primaryNode.ID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskRunCommand,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 30,
-	}); err != nil {
-		return echo.NewHTTPError(http.StatusConflict, "primary node is not connected: "+err.Error())
+	bodyBytes, _ := json.Marshal(switchBody)
+	patroniURL := fmt.Sprintf("http://%s:8008/switchover", primaryIP)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, patroniURL, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build switchover request")
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.SetBasicAuth(restUser, restPass)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadGateway, "patroni switchover request failed: "+err.Error())
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return echo.NewHTTPError(http.StatusBadGateway,
+			fmt.Sprintf("patroni switchover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
 	}
 
-	_ = h.taskResults.SetSent(ctx, taskID)
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"task_id":       taskID.String(),
-		"primary_node":  primaryNode.Hostname,
-		"candidate":     req.Candidate,
+	return c.JSON(http.StatusOK, map[string]any{
+		"primary_node": primaryNode.Hostname,
+		"candidate":    req.Candidate,
+		"message":      strings.TrimSpace(string(respBody)),
 	})
 }
 
@@ -758,33 +768,45 @@ func (h *PatroniHandler) Failover(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "no connected replica found to run patronictl failover")
 	}
 
-	cluster, err := h.clusters.GetByID(ctx, clusterID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	// Fetch Patroni REST credentials.
+	var restUser, restPass string
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+		restUser = cred.Username
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			restPass = string(pw)
+		}
 	}
 
-	args := []string{"-c", "/etc/patroni/patroni.yml", "failover", cluster.PatroniScope, "--master", req.Master, "--force"}
+	// Call POST /failover on the target node's Patroni REST API.
+	targetIP := stripCIDR(targetNode.IPAddress)
+	failBody := map[string]string{"master": req.Master}
 	if req.Candidate != "" {
-		args = append(args, "--candidate", req.Candidate)
+		failBody["candidate"] = req.Candidate
+	}
+	bodyBytes, _ := json.Marshal(failBody)
+	patroniURL := fmt.Sprintf("http://%s:8008/failover", targetIP)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, patroniURL, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build failover request")
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.SetBasicAuth(restUser, restPass)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadGateway, "patroni failover request failed: "+err.Error())
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return echo.NewHTTPError(http.StatusBadGateway,
+			fmt.Sprintf("patroni failover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
 	}
 
-	taskID := uuid.New()
-	params, _ := json.Marshal(protocol.RunCommandParams{Command: "patronictl", Args: args})
-	_ = h.taskResults.Create(ctx, targetNode.ID, taskID, string(protocol.TaskRunCommand), params)
-
-	if err := h.dispatcher.Dispatch(targetNode.ID, protocol.TaskDispatchPayload{
-		TaskID: taskID.String(), TaskType: protocol.TaskRunCommand,
-		Params: json.RawMessage(params), TimeoutSecs: 30,
-	}); err != nil {
-		return echo.NewHTTPError(http.StatusConflict, "target node is not connected: "+err.Error())
-	}
-
-	_ = h.taskResults.SetSent(ctx, taskID)
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"task_id":     taskID.String(),
+	return c.JSON(http.StatusOK, map[string]any{
 		"target_node": targetNode.Hostname,
 		"master":      req.Master,
 		"candidate":   req.Candidate,
+		"message":     strings.TrimSpace(string(respBody)),
 	})
 }
 

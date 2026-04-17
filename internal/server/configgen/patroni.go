@@ -156,7 +156,7 @@ bootstrap:
         wal_log_hints: "on"
 
 postgresql:
-  listen: {{.ConnectAddr}}:{{.Port}}
+  listen: 0.0.0.0:{{.Port}}
   connect_address: {{.ConnectAddr}}:{{.Port}}
   data_dir: {{.DataDir}}
   bin_dir: {{.BinDir}}

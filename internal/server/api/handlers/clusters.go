@@ -7,6 +7,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -319,9 +320,14 @@ func (h *ClusterHandler) Status(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
 	}
 
-	nodes, err := h.nodes.ListByCluster(c.Request().Context(), id)
+	cluster, err := h.clusters.GetByID(c.Request().Context(), id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
+	}
+
+	nodes, err := h.nodes.ListByCluster(c.Request().Context(), id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
 
 	connected := h.hub.ConnectedNodeIDs()
@@ -333,43 +339,55 @@ func (h *ClusterHandler) Status(c echo.Context) error {
 	type nodeStatus struct {
 		NodeID        string `json:"node_id"`
 		Hostname      string `json:"hostname"`
+		Role          string `json:"role"`
 		AgentStatus   string `json:"agent_status"`
 		NetboxRunning *bool  `json:"netbox_running"`
 		RQRunning     *bool  `json:"rq_running"`
 		PatroniRole   string `json:"patroni_role,omitempty"`
+		Health        string `json:"health"`
+		State         string `json:"state,omitempty"`
 		LastSeenAt    string `json:"last_seen_at,omitempty"`
 	}
 
 	statuses := make([]nodeStatus, 0, len(nodes))
+	healthSlice := make([]string, 0, len(nodes))
+	stateSlice := make([]string, 0, len(nodes))
+	roleSlice := make([]string, 0, len(nodes))
+
 	for _, n := range nodes {
-		// Live status overrides DB status
-		status := n.AgentStatus
+		// Live hub connection overrides the DB-stored agent_status.
+		agentStatus := n.AgentStatus
 		if connSet[n.ID.String()] {
-			status = "connected"
+			agentStatus = "connected"
 		}
 
-		var patroniRole string
-		if n.PatroniState != nil {
-			// Extract role from JSONB — simplified; Phase 4 will parse fully
-			patroniRole = ""
-		}
+		patroniRole := nodestate.ExtractPatroniRole(n.PatroniState)
+		health := nodestate.ComputeNodeHealth(n.Role, agentStatus, n.NetboxRunning, n.RQRunning, patroniRole, cluster.PatroniConfigured)
+		state := nodestate.ComputeNodeState(n.Role, n.NetboxRunning, patroniRole, cluster.PatroniConfigured)
 
 		ns := nodeStatus{
 			NodeID:        n.ID.String(),
 			Hostname:      n.Hostname,
-			AgentStatus:   status,
+			Role:          n.Role,
+			AgentStatus:   agentStatus,
 			NetboxRunning: n.NetboxRunning,
 			RQRunning:     n.RQRunning,
 			PatroniRole:   patroniRole,
+			Health:        health,
+			State:         state,
 		}
 		if n.LastSeenAt != nil {
 			ns.LastSeenAt = n.LastSeenAt.Format(time.RFC3339)
 		}
 		statuses = append(statuses, ns)
+		healthSlice = append(healthSlice, health)
+		stateSlice = append(stateSlice, state)
+		roleSlice = append(roleSlice, n.Role)
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id": id.String(),
-		"nodes":      statuses,
+		"cluster_id":     id.String(),
+		"cluster_health": nodestate.AggregateClusterHealth(healthSlice, stateSlice, roleSlice),
+		"nodes":          statuses,
 	})
 }

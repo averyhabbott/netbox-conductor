@@ -109,6 +109,7 @@ type statusResponse struct {
 	RQ             bool   `json:"rq"`
 	NodeID         string `json:"node_id"`
 	PatroniPrimary *bool  `json:"patroni_primary,omitempty"`
+	PatroniRole    string `json:"patroni_role,omitempty"`
 }
 
 func makeStatusHandler(nodeID string, state *State) http.HandlerFunc {
@@ -122,13 +123,19 @@ func makeStatusHandler(nodeID string, state *State) http.HandlerFunc {
 		netboxUp := isActive("netbox")
 		rqUp := isActive("netbox-rq")
 
-		// In app_tier_always_available=false mode with Patroni configured,
-		// only return 200 if this node is the Patroni primary. This ensures the
-		// LB only routes to the node whose local Postgres is writable.
 		var patroniPrimary *bool
-		if patroniConfigured && !appTierAlwaysAvail {
-			primary := isPatroniPrimary(patroniRESTURL)
-			patroniPrimary = &primary
+		var patroniRole string
+		if patroniConfigured {
+			// Always query Patroni role so operators can see it regardless of
+			// whether app_tier_always_available is set.
+			patroniRole = queryPatroniRole(patroniRESTURL)
+
+			// In app_tier_always_available=false mode, also gate traffic on
+			// primary status — only the primary node should serve writes.
+			if !appTierAlwaysAvail {
+				primary := patroniRole == "master" || patroniRole == "primary"
+				patroniPrimary = &primary
+			}
 		}
 
 		resp := statusResponse{
@@ -136,6 +143,7 @@ func makeStatusHandler(nodeID string, state *State) http.HandlerFunc {
 			RQ:             rqUp,
 			NodeID:         nodeID,
 			PatroniPrimary: patroniPrimary,
+			PatroniRole:    patroniRole,
 		}
 
 		// A node is healthy for traffic if:
@@ -168,21 +176,29 @@ func isActive(unit string) bool {
 	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
 }
 
-// isPatroniPrimary calls the local Patroni REST API's /primary endpoint.
-// Patroni returns 200 if this node is the current primary, 503 if it is a replica.
-// Returns false on any error (including Patroni not running), so nodes that
-// haven't completed Patroni setup don't accidentally answer 200 to health checks.
-func isPatroniPrimary(restURL string) bool {
+// queryPatroniRole calls the local Patroni REST API's /patroni endpoint and
+// returns the role string ("master", "replica", "standby_leader", etc.).
+// Returns "" on any error (Patroni not running, not configured, etc.).
+func queryPatroniRole(restURL string) string {
+	if restURL == "" {
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, restURL+"/primary", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, restURL+"/patroni", nil)
 	if err != nil {
-		return false
+		return ""
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false
+		return ""
 	}
-	_ = resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	defer resp.Body.Close()
+	var state struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		return ""
+	}
+	return state.Role
 }
