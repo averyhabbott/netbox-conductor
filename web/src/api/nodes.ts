@@ -36,6 +36,14 @@ export interface CreateNodeBody {
   ssh_port?: number
 }
 
+export interface EditNodeBody {
+  hostname?: string
+  ip_address?: string
+  role?: 'hyperconverged' | 'app' | 'db_only'
+  failover_priority?: number
+  suppress_auto_start?: boolean
+}
+
 export interface RegTokenResponse {
   token: string
   env_snippet: string
@@ -53,11 +61,7 @@ export const nodesApi = {
   create: (clusterId: string, body: CreateNodeBody) =>
     client.post<Node>(`/clusters/${clusterId}/nodes`, body).then((r) => r.data),
 
-  update: (
-    clusterId: string,
-    nodeId: string,
-    body: { failover_priority?: number; suppress_auto_start?: boolean }
-  ) =>
+  update: (clusterId: string, nodeId: string, body: EditNodeBody) =>
     client.put<Node>(`/clusters/${clusterId}/nodes/${nodeId}`, body).then((r) => r.data),
 
   delete: (clusterId: string, nodeId: string) =>

@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
 import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
-import type { Node } from '../api/nodes'
+import type { Node, EditNodeBody } from '../api/nodes'
 import { credentialsApi, credentialLabels } from '../api/credentials'
 import type { Credential, CredentialKind, GeneratedCredential } from '../api/credentials'
 import { patroniApi } from '../api/patroni'
@@ -94,7 +94,147 @@ function ServiceBadgeWithRole({
   )
 }
 
-function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
+function EditNodeModal({
+  node,
+  clusterId,
+  onClose,
+}: {
+  node: Node
+  clusterId: string
+  onClose: () => void
+}) {
+  const qc = useQueryClient()
+  const [form, setForm] = useState<EditNodeBody>({
+    hostname: node.hostname,
+    ip_address: node.ip_address,
+    role: node.role,
+    failover_priority: node.failover_priority,
+  })
+  const [error, setError] = useState('')
+
+  const save = useMutation({
+    mutationFn: (body: EditNodeBody) => nodesApi.update(clusterId, node.id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['nodes', clusterId] })
+      onClose()
+    },
+    onError: (e: any) => {
+      setError(e.response?.data?.message ?? 'Failed to save changes')
+    },
+  })
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    save.mutate(form)
+  }
+
+  const labelCls = 'block text-xs text-gray-400 mb-1'
+  const inputCls =
+    'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500'
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-md">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+          <div>
+            <h3 className="font-semibold">Edit Node</h3>
+            <p className="text-xs text-gray-500 mt-0.5 font-mono">{node.hostname}</p>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-xl leading-none">×</button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
+          {/* Warning */}
+          <div className="flex gap-2.5 bg-amber-950/60 border border-amber-800/60 rounded-lg px-4 py-3">
+            <span className="text-amber-400 text-base flex-shrink-0">⚠</span>
+            <p className="text-xs text-amber-300 leading-relaxed">
+              Changing the hostname, IP address, role, or failover priority requires
+              re-running <strong>Configure Failover</strong> to take effect.
+            </p>
+          </div>
+
+          <div>
+            <label className={labelCls}>Hostname</label>
+            <input
+              className={inputCls}
+              value={form.hostname ?? ''}
+              onChange={(e) => setForm((f) => ({ ...f, hostname: e.target.value }))}
+              required
+            />
+          </div>
+
+          <div>
+            <label className={labelCls}>IP Address</label>
+            <input
+              className={inputCls}
+              value={form.ip_address ?? ''}
+              onChange={(e) => setForm((f) => ({ ...f, ip_address: e.target.value }))}
+              required
+            />
+          </div>
+
+          <div>
+            <label className={labelCls}>Role</label>
+            <select
+              className={inputCls}
+              value={form.role}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, role: e.target.value as EditNodeBody['role'] }))
+              }
+            >
+              <option value="hyperconverged">Hyperconverged</option>
+              <option value="app">App</option>
+              <option value="db_only">DB Only</option>
+            </select>
+          </div>
+
+          <div>
+            <label className={labelCls}>Failover Priority</label>
+            <input
+              type="number"
+              className={inputCls}
+              value={form.failover_priority ?? ''}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, failover_priority: parseInt(e.target.value, 10) || 0 }))
+              }
+              min={1}
+            />
+          </div>
+
+          {error && <p className="text-xs text-red-400">{error}</p>}
+
+          <div className="flex justify-end gap-3 pt-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-sm px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={save.isPending}
+              className="text-sm px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg transition-colors"
+            >
+              {save.isPending ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+function NodeRow({
+  node,
+  clusterId,
+  onEdit,
+}: {
+  node: Node
+  clusterId: string
+  onEdit: (node: Node) => void
+}) {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const upgrade = useMutation({
@@ -180,6 +320,15 @@ function NodeRow({ node, clusterId }: { node: Node; clusterId: string }) {
         )}
       </td>
       <td className="px-6 py-4 text-gray-400 text-sm">{node.failover_priority}</td>
+      <td className="px-4 py-4 text-right">
+        <button
+          onClick={(e) => { e.stopPropagation(); onEdit(node) }}
+          className="text-xs text-gray-500 hover:text-gray-300 px-2 py-1 rounded hover:bg-gray-800 transition-colors"
+          title="Edit node"
+        >
+          Edit
+        </button>
+      </td>
     </tr>
   )
 }
@@ -1540,6 +1689,7 @@ export default function ClusterDetail() {
   const initialTab = (new URLSearchParams(window.location.search).get('tab') as Tab | null) ?? 'nodes'
   const [tab, setTab] = useState<Tab>(initialTab)
   const [showWizard, setShowWizard] = useState(false)
+  const [editingNode, setEditingNode] = useState<Node | null>(null)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showAgentMenu, setShowAgentMenu] = useState(false)
   const agentMenuRef = useRef<HTMLDivElement>(null)
@@ -1747,11 +1897,12 @@ export default function ClusterDetail() {
                     <th className="text-left px-6 py-3 font-medium">Agent</th>
                     <th className="text-left px-6 py-3 font-medium">Services</th>
                     <th className="text-left px-6 py-3 font-medium">Priority</th>
+                    <th className="px-4 py-3"></th>
                   </tr>
                 </thead>
                 <tbody>
                   {nodes.map((node) => (
-                    <NodeRow key={node.id} node={node} clusterId={id!} />
+                    <NodeRow key={node.id} node={node} clusterId={id!} onEdit={setEditingNode} />
                   ))}
                 </tbody>
               </table>
@@ -1851,6 +2002,14 @@ export default function ClusterDetail() {
             setShowWizard(false)
             refetchNodes()
           }}
+        />
+      )}
+
+      {editingNode && (
+        <EditNodeModal
+          node={editingNode}
+          clusterId={id!}
+          onClose={() => setEditingNode(null)}
         />
       )}
 

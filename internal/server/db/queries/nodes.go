@@ -169,6 +169,29 @@ func (q *NodeQuerier) UpdateHeartbeat(
 	return err
 }
 
+type UpdateNodeParams struct {
+	ID               uuid.UUID
+	Hostname         *string
+	IPAddress        *string
+	Role             *string
+	FailoverPriority *int
+}
+
+func (q *NodeQuerier) UpdateNode(ctx context.Context, p UpdateNodeParams) (*Node, error) {
+	row := q.pool.QueryRow(ctx, `
+		UPDATE nodes SET
+			hostname          = COALESCE($2, hostname),
+			ip_address        = COALESCE($3::inet, ip_address),
+			role              = COALESCE($4, role),
+			failover_priority = COALESCE($5, failover_priority),
+			updated_at        = now()
+		WHERE id = $1
+		RETURNING`+nodeColumns,
+		p.ID, p.Hostname, p.IPAddress, p.Role, p.FailoverPriority,
+	)
+	return scanNode(row)
+}
+
 func (q *NodeQuerier) UpdatePriority(ctx context.Context, id uuid.UUID, priority int) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE nodes SET failover_priority = $2, updated_at = now() WHERE id = $1

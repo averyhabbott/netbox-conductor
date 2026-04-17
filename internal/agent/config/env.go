@@ -75,8 +75,7 @@ func Load(envFile string) (*Config, error) {
 	cfg.TLSSkipVerify = skipVerify == "true" || skipVerify == "1" || skipVerify == "yes"
 
 	updateCert := strings.ToLower(os.Getenv("UPDATE_CERT"))
-	// Default true if the variable is unset (empty string treated as true)
-	cfg.UpdateCert = updateCert == "" || updateCert == "true" || updateCert == "1" || updateCert == "yes"
+	cfg.UpdateCert = updateCert == "true" || updateCert == "1" || updateCert == "yes"
 
 	return cfg, cfg.validate()
 }

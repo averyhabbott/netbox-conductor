@@ -82,7 +82,7 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
   }
 
   const installScript = (a: Arch) =>
-    `# Download the agent package\ncurl -fsSLk ${window.location.origin}/api/v1/downloads/agent-linux-${a} \\\n  -o netbox-agent.tar.gz\ntar -xzf netbox-agent.tar.gz\n\n# Run the installer — creates user/group, installs binary,\n# copies env file, installs and enables the systemd service\nsudo bash install.sh`
+    `# Download the agent package\ncurl -fsSLk ${window.location.origin}/api/v1/downloads/agent-linux-${a} \\\n  -o netbox-agent.tar.gz\ntar -xzf netbox-agent.tar.gz\ncd netbox-agent-installer\n\n# Run the installer — creates user/group, installs binary,\n# copies env file, installs and enables the systemd service\nsudo bash install.sh`
 
   const copyInstall = async () => {
     await navigator.clipboard.writeText(installScript(arch))

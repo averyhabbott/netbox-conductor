@@ -137,15 +137,19 @@ func toNodeResponse(n *queries.Node) nodeResponse {
 }
 
 // computeHealth derives a health status from live session data.
-// "healthy" = connected + NetBox running + RQ running
-// "degraded" = connected but at least one service down
+// "healthy" = connected + NetBox running + RQ running + Patroni connected (if running)
+// "degraded" = connected but at least one service down or Patroni not yet connected
 // "offline"  = not connected
-func computeHealth(status string, netboxRunning, rqRunning *bool) string {
+func computeHealth(status string, netboxRunning, rqRunning *bool, patroniRunning *bool, patroniConnected bool) string {
 	if status != "connected" {
 		return "offline"
 	}
 	nb := netboxRunning != nil && *netboxRunning
 	rq := rqRunning != nil && *rqRunning
+	// Patroni service running but cluster connection not established → degraded.
+	if patroniRunning != nil && *patroniRunning && !patroniConnected {
+		return "degraded"
+	}
 	if nb && rq {
 		return "healthy"
 	}
@@ -175,7 +179,7 @@ func (h *NodeHandler) List(c echo.Context) error {
 			r.AgentVersion = sess.AgentVersion
 			r.NetboxVersion = sess.NetboxVersion
 		}
-		r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning)
+		r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning, r.PatroniRunning, nodes[i].PatroniState != nil)
 		resp = append(resp, r)
 	}
 	return c.JSON(http.StatusOK, resp)
@@ -255,12 +259,17 @@ func (h *NodeHandler) Get(c echo.Context) error {
 		r.AgentVersion = sess.AgentVersion
 		r.NetboxVersion = sess.NetboxVersion
 	}
-	r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning)
+	r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning, r.PatroniRunning, node.PatroniState != nil)
 	return c.JSON(http.StatusOK, r)
 }
 
 type updateNodeRequest struct {
-	FailoverPriority  *int  `json:"failover_priority"`
+	// Identity fields — updating any of these requires re-running Configure Failover.
+	Hostname         *string `json:"hostname"`
+	IPAddress        *string `json:"ip_address"`
+	Role             *string `json:"role"`
+	FailoverPriority *int    `json:"failover_priority"`
+	// Operational flags — do not require Configure Failover.
 	SuppressAutoStart *bool `json:"suppress_auto_start"`
 }
 
@@ -279,11 +288,28 @@ func (h *NodeHandler) Update(c echo.Context) error {
 
 	ctx := c.Request().Context()
 
-	if req.FailoverPriority != nil {
-		if err := h.nodes.UpdatePriority(ctx, nid, *req.FailoverPriority); err != nil {
-			return echo.NewHTTPError(http.StatusNotFound, "node not found")
+	// If any identity field is being updated, validate and apply in one shot.
+	if req.Hostname != nil || req.IPAddress != nil || req.Role != nil || req.FailoverPriority != nil {
+		if req.Hostname != nil && *req.Hostname == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "hostname cannot be empty")
+		}
+		if req.IPAddress != nil && *req.IPAddress == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "ip_address cannot be empty")
+		}
+		if req.Role != nil && *req.Role != "hyperconverged" && *req.Role != "app" && *req.Role != "db_only" {
+			return echo.NewHTTPError(http.StatusBadRequest, "role must be hyperconverged, app, or db_only")
+		}
+		if _, err := h.nodes.UpdateNode(ctx, queries.UpdateNodeParams{
+			ID:               nid,
+			Hostname:         req.Hostname,
+			IPAddress:        req.IPAddress,
+			Role:             req.Role,
+			FailoverPriority: req.FailoverPriority,
+		}); err != nil {
+			return echo.NewHTTPError(http.StatusConflict, "update failed: hostname may already exist in this cluster")
 		}
 	}
+
 	if req.SuppressAutoStart != nil {
 		if err := h.nodes.SetSuppressAutoStart(ctx, nid, *req.SuppressAutoStart); err != nil {
 			return echo.NewHTTPError(http.StatusNotFound, "node not found")
@@ -345,7 +371,7 @@ func (h *NodeHandler) Status(c echo.Context) error {
 		r.AgentVersion = sess.AgentVersion
 		r.NetboxVersion = sess.NetboxVersion
 	}
-	r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning)
+	r.HealthStatus = computeHealth(r.AgentStatus, r.NetboxRunning, r.RQRunning, r.PatroniRunning, node.PatroniState != nil)
 	return c.JSON(http.StatusOK, r)
 }
 
@@ -385,7 +411,11 @@ func (h *NodeHandler) GenerateRegToken(c echo.Context) error {
 			"# Bearer token for WebSocket authentication\n"+
 			"AGENT_TOKEN=%s\n\n"+
 			"# Conductor WebSocket URL — must use wss:// and include the port if not on 443\n"+
-			"AGENT_SERVER_URL=%s/api/v1/agent/connect",
+			"AGENT_SERVER_URL=%s/api/v1/agent/connect\n\n"+
+			"# — TLS ─────────────────────────────────────────────────────────────\n\n"+
+			"# On first start the agent downloads the conductor's CA cert automatically.\n"+
+			"# Set to false once the cert has been saved (/etc/netbox-agent/ca.crt).\n"+
+			"UPDATE_CERT=true",
 		node.ID.String(), rawToken, wsURL)
 
 	return c.JSON(http.StatusOK, map[string]any{
@@ -629,10 +659,17 @@ AGENT_TOKEN=%s
 
 AGENT_SERVER_URL=%s/api/v1/agent/connect
 
-# To verify the conductor's TLS certificate, download the CA cert and set:
-#   AGENT_TLS_CA_CERT=/etc/netbox-agent/ca.crt
-# Or to skip verification (development only):
-#   AGENT_TLS_SKIP_VERIFY=true
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+# On first start the agent downloads the conductor's CA cert, saves it to
+# /etc/netbox-agent/ca.crt, and sets UPDATE_CERT=false automatically.
+UPDATE_CERT=true
+
+# Set to true ONLY for development — emits a warning at runtime
+AGENT_TLS_SKIP_VERIFY=false
+
+# Path to CA certificate — populated automatically by cert-learning:
+# AGENT_TLS_CA_CERT=/etc/netbox-agent/ca.crt
 
 AGENT_RECONNECT_INTERVAL_SECS=10
 

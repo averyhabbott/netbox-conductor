@@ -43,7 +43,7 @@ Controlled by `AGENT_STATUS_ADDR` in the agent env file (default `127.0.0.1:8081
 `nginx-netbox-conductor.conf` is included in the agent tarball downloaded from the conductor. Copy it into place after running the agent install:
 
 ```bash
-sudo cp /opt/netbox-agent/nginx-netbox-conductor.conf /etc/nginx/sites-available/netbox
+sudo cp /etc/netbox-agent/examples/nginx-netbox-conductor.conf /etc/nginx/sites-available/netbox
 sudo ln -s /etc/nginx/sites-available/netbox /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
@@ -60,7 +60,7 @@ Edit the file first to replace `netbox.example.com` with your actual hostname an
 
 ```bash
 sudo a2enmod proxy proxy_http ssl rewrite headers
-sudo cp /opt/netbox-agent/apache-netbox-conductor.conf /etc/apache2/sites-available/netbox.conf
+sudo cp /etc/netbox-agent/examples/apache-netbox-conductor.conf /etc/apache2/sites-available/netbox.conf
 sudo a2ensite netbox
 sudo apache2ctl configtest && sudo systemctl reload apache2
 ```

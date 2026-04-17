@@ -47,19 +47,30 @@ func (h *DownloadHandler) AgentBinary(arch string) echo.HandlerFunc {
 		gz := gzip.NewWriter(c.Response().Writer)
 		tw := tar.NewWriter(gz)
 
+		const dir = "netbox-agent-installer/"
+
+		// Top-level directory entry so the tarball extracts into a named folder.
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     dir,
+			Typeflag: tar.TypeDir,
+			Mode:     0755,
+		}); err != nil {
+			return err
+		}
+
 		type entry struct {
 			name string
 			mode int64
 			data []byte
 		}
 		files := []entry{
-			{"netbox-agent", 0755, binData},
-			{"netbox-agent.env.example", 0644, agentbundle.EnvExample},
-			{"netbox-agent.service", 0644, agentbundle.ServiceFile},
-			{"netbox-agent-sudoers", 0440, agentbundle.SudoersFile},
-			{"install.sh", 0755, agentbundle.InstallScript},
-			{"nginx-netbox-conductor.conf", 0644, agentbundle.NginxConf},
-			{"apache-netbox-conductor.conf", 0644, agentbundle.ApacheConf},
+			{dir + "netbox-agent", 0755, binData},
+			{dir + "netbox-agent.env.example", 0644, agentbundle.EnvExample},
+			{dir + "netbox-agent.service", 0644, agentbundle.ServiceFile},
+			{dir + "netbox-agent-sudoers", 0440, agentbundle.SudoersFile},
+			{dir + "install.sh", 0755, agentbundle.InstallScript},
+			{dir + "nginx-netbox-conductor.conf", 0644, agentbundle.NginxConf},
+			{dir + "apache-netbox-conductor.conf", 0644, agentbundle.ApacheConf},
 		}
 
 		for _, f := range files {
