@@ -177,8 +177,16 @@ JWT_SECRET=<openssl output>
 # Address and port the server binds to (port 443 requires root or CAP_NET_BIND_SERVICE)
 LISTEN_ADDR=:8443
 
-# Public base URL advertised to operators in agent ENV snippets
-SERVER_URL=https://conductor.example.com
+# The conductor's reachable IP address — must be a valid IPv4 or IPv6 address, not a hostname.
+# Used as the Patroni Raft witness listen address and, when SERVER_URL is not set, as the
+# base URL included in agent ENV snippets. Required for active_standby (Patroni) clusters.
+SERVER_BIND_IP=192.168.1.10
+
+# Public base URL included in agent ENV snippets (optional).
+# If omitted, derived automatically from SERVER_BIND_IP and LISTEN_ADDR.
+# Set this only if agents reach the conductor via a different address than SERVER_BIND_IP
+# (e.g. a load balancer VIP or public DNS name).
+# SERVER_URL=https://conductor.example.com
 
 # Log directory and instance name — logs go to <LOG_DIR>/<LOG_NAME>/conductor.log
 LOG_DIR=/var/log
