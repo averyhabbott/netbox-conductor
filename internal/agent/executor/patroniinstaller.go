@@ -32,7 +32,7 @@ func InstallPatroni(params protocol.PatroniInstallParams) (string, error) {
 
 	// Install (or upgrade) pysyncobj into the venv. The venv is owned by
 	// netbox-agent so no sudo is required.
-	pipCmd := exec.Command(patroniVenv+"/bin/pip", "install", "--quiet", "pysyncobj")
+	pipCmd := exec.Command(patroniVenv+"/bin/pip", "install", "--quiet", "pysyncobj", "psycopg[binary]")
 	if pipOut, pipErr := pipCmd.CombinedOutput(); pipErr != nil {
 		return string(pipOut), fmt.Errorf("pysyncobj install failed: %w", pipErr)
 	}

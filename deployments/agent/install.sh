@@ -130,7 +130,7 @@ chmod 750 /var/lib/patroni
 echo "→ Creating Patroni venv at $VENV_DIR"
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet patroni pysyncobj
+"$VENV_DIR/bin/pip" install --quiet patroni pysyncobj "psycopg[binary]"
 chown -R netbox-agent:netbox-agent "$VENV_DIR"
 chmod -R 755 "$VENV_DIR"
 
