@@ -9,17 +9,10 @@ netbox-agent ALL=(ALL) NOPASSWD: \
   /usr/bin/systemctl stop netbox netbox-rq, \
   /usr/bin/systemctl restart netbox netbox-rq, \
   /usr/bin/systemctl restart netbox-rq, \
-  /usr/bin/systemctl enable patroni, \
   /usr/bin/systemctl restart patroni, \
   /usr/bin/systemctl restart redis, \
   /usr/bin/systemctl restart redis-sentinel, \
   /usr/bin/systemctl restart netbox-agent
-
-# Package installation for Patroni setup (as root)
-netbox-agent ALL=(ALL) NOPASSWD: \
-  /usr/bin/apt-get install -y patroni, \
-  /usr/bin/dnf install -y patroni, \
-  /usr/bin/yum install -y patroni
 
 # Database backup: run pg_dump and create backup directory as the postgres OS user
 # so that peer authentication works without a password.

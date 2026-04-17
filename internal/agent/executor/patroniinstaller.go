@@ -8,58 +8,34 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
-// InstallPatroni installs Patroni using the package manager detected on the system,
-// or runs the operator-supplied install command if provided.
+// patroniDepsDir is pre-created by the agent installer (owned by netbox-agent).
+// A patroni.service drop-in sets PYTHONPATH to this directory so Patroni finds
+// pysyncobj without it being installed into the global Python distribution.
+const patroniDepsDir = "/var/lib/netbox-agent/patroni-deps"
+
+// InstallPatroni verifies Patroni is present and installs the pysyncobj package
+// required for Patroni's built-in Raft DCS. Patroni and redis-sentinel are
+// pre-installed by the agent installer (install.sh) running as root, so this
+// task no longer needs sudo for package management.
 func InstallPatroni(params protocol.PatroniInstallParams) (string, error) {
 	if params.InstallCmd != "" {
 		return runInstallCmd(params.InstallCmd)
 	}
 
-	pm := params.PackageManager
-	if pm == "" {
-		pm = detectPackageManager()
+	// Verify patroni is installed (pre-installed by the agent installer).
+	if _, err := exec.LookPath("patroni"); err != nil {
+		return "", fmt.Errorf("patroni binary not found — re-run the agent installer to install it")
 	}
-
-	// Install commands require root; the agent runs as netbox-agent so we use sudo.
-	var cmd *exec.Cmd
-	switch pm {
-	case "apt", "apt-get":
-		cmd = exec.Command("sudo", "apt-get", "install", "-y", "patroni")
-	case "yum":
-		cmd = exec.Command("sudo", "yum", "install", "-y", "patroni")
-	case "dnf":
-		cmd = exec.Command("sudo", "dnf", "install", "-y", "patroni")
-	default:
-		return "", fmt.Errorf("unsupported package manager %q — set install_cmd to override", pm)
-	}
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("patroni install failed: %w", err)
-	}
-	result := string(out)
 
 	// pysyncobj is required for Patroni's built-in Raft DCS but is not pulled
-	// in automatically by the apt package. Install it system-wide so both
-	// 'patroni' (the main daemon) and 'patroni_raft_controller' can import it.
-	// --break-system-packages is required on Python 3.11+ (PEP 668 systems).
-	pipCmd := exec.Command("sudo", "pip3", "install", "--break-system-packages", "--quiet", "pysyncobj")
+	// in automatically by the apt package. Install into the pre-created deps dir
+	// (owned by netbox-agent) — no sudo needed.
+	pipCmd := exec.Command("pip3", "install", "--target", patroniDepsDir, "--quiet", "pysyncobj")
 	if pipOut, pipErr := pipCmd.CombinedOutput(); pipErr != nil {
-		result += "\nwarn: pysyncobj install failed: " + pipErr.Error() + "\n" + string(pipOut)
-	} else {
-		result += "\npysyncobj installed"
+		return string(pipOut), fmt.Errorf("pysyncobj install failed: %w", pipErr)
 	}
 
-	return result, nil
-}
-
-func detectPackageManager() string {
-	for _, pm := range []string{"apt-get", "dnf", "yum"} {
-		if _, err := exec.LookPath(pm); err == nil {
-			return pm
-		}
-	}
-	return ""
+	return "pysyncobj installed", nil
 }
 
 func runInstallCmd(cmd string) (string, error) {

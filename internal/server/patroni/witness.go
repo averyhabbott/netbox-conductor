@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -175,15 +176,14 @@ func (m *WitnessManager) runProc(proc *witnessProc) {
 
 		controllerBin := m.cfg.RaftControllerBin
 		if _, err := os.Stat(controllerBin); err != nil {
-			log.Printf("witness: patroni_raft_controller not found at %s — retrying in %s", controllerBin, backoff)
+			slog.Error("witness: patroni_raft_controller not found", "path", controllerBin, "retry_in", backoff)
 			time.Sleep(backoff)
 			continue
 		}
 
 		cfgPath, err := m.writeRaftConfig(proc)
 		if err != nil {
-			log.Printf("witness: failed to write raft config for cluster=%s: %v — retrying in %s",
-				proc.clusterID, err, backoff)
+			slog.Error("witness: failed to write raft config", "cluster", proc.clusterID, "error", err, "retry_in", backoff)
 			time.Sleep(backoff)
 			continue
 		}

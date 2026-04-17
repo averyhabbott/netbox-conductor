@@ -43,10 +43,9 @@ func WriteSentinelConfig(params protocol.SentinelConfigWriteParams) (string, err
 	if params.RestartAfter {
 		cmd := exec.Command("systemctl", "restart", "redis-sentinel")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			output += "\nwarn: redis-sentinel restart failed: " + err.Error() + "\n" + string(out)
-		} else {
-			output += "\nrestarted redis-sentinel"
+			return output, fmt.Errorf("redis-sentinel restart failed: %w\n%s", err, out)
 		}
+		output += "\nrestarted redis-sentinel"
 	}
 
 	return output, nil

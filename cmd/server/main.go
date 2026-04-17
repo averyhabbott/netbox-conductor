@@ -46,6 +46,13 @@ func main() {
 
 func run(ctx context.Context) error {
 	dsn := requireEnv("DATABASE_URL")
+	dbPassword := requireEnv("DB_PASSWORD")
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("invalid DATABASE_URL: %w", err)
+	}
+	u.User = url.UserPassword(u.User.Username(), dbPassword)
+	dsn = u.String()
 	jwtSecret := []byte(requireEnv("JWT_SECRET"))
 	addr := envOr("LISTEN_ADDR", ":8443")
 	serverBindIP := envOr("SERVER_BIND_IP", "")

@@ -77,6 +77,36 @@ mkdir -p /etc/patroni
 chown netbox-agent:netbox-agent /etc/patroni
 chmod 750 /etc/patroni
 
+# ── HA packages: Patroni and Redis Sentinel ──────────────────────────────────
+# Install at agent-setup time (running as root) so the patroni.install task
+# never needs sudo. Enable patroni once here — no need to enable it before
+# every restart in the task handler.
+echo "→ Installing HA packages (patroni, redis-sentinel)"
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get install -y patroni redis-sentinel
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y patroni redis-sentinel
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y patroni redis-sentinel
+else
+  echo "  WARNING: no supported package manager found — install patroni and redis-sentinel manually"
+fi
+systemctl enable patroni 2>/dev/null || true
+
+# ── pysyncobj deps directory for Patroni Raft DCS ────────────────────────────
+# Pre-create a directory owned by netbox-agent so patroni.install can pip-install
+# pysyncobj without sudo. A systemd drop-in makes Patroni find it via PYTHONPATH.
+PATRONI_DEPS=/var/lib/netbox-agent/patroni-deps
+mkdir -p "$PATRONI_DEPS"
+chown netbox-agent:netbox-agent "$PATRONI_DEPS"
+chmod 755 "$PATRONI_DEPS"
+mkdir -p /etc/systemd/system/patroni.service.d
+cat > /etc/systemd/system/patroni.service.d/pythonpath.conf <<'EOF'
+[Service]
+Environment=PYTHONPATH=/var/lib/netbox-agent/patroni-deps
+EOF
+systemctl daemon-reload 2>/dev/null || true
+
 # ── Redis/Sentinel configuration directory ───────────────────────────────────
 # Add agent to the redis group for sentinel.conf write access
 if getent group redis >/dev/null 2>&1; then

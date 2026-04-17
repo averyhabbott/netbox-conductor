@@ -716,8 +716,15 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 	}
 	if result.Success {
 		logger.Info("task result", "task_id", result.TaskID, "success", true, "duration_ms", result.DurationMs)
+		if strings.Contains(result.Output, "warn:") {
+			logger.Warn("task result: output contains warnings", "task_id", result.TaskID, "output", result.Output)
+		}
 	} else {
-		logger.Warn("task result: failed", "task_id", result.TaskID, "error", result.ErrorMsg, "duration_ms", result.DurationMs)
+		logger.Warn("task result: failed",
+			"task_id", result.TaskID,
+			"error", result.ErrorMsg,
+			"output", result.Output,
+			"duration_ms", result.DurationMs)
 	}
 
 	if taskID, err := uuid.Parse(result.TaskID); err == nil {

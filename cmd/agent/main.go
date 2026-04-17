@@ -336,11 +336,7 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		}
 
 	case protocol.TaskRestartPatroni:
-		// Enable the unit first (idempotent — no-op if already enabled).
-		// Required on first run: apt installs patroni but does not enable the service.
-		if out, err := exec.Command("sudo", "systemctl", "enable", "patroni").CombinedOutput(); err != nil {
-			slog.Warn("patroni enable failed (non-fatal)", "error", err, "output", string(out))
-		}
+		// patroni is enabled at agent install time (install.sh), not here.
 		cmd := exec.Command("sudo", "systemctl", "restart", "patroni")
 		out, err := cmd.CombinedOutput()
 		output = string(out)
