@@ -13,31 +13,15 @@
 
 ## Build Prerequisites
 
-The conductor server and build toolchain are tested on **Linux (arm64/amd64)** and **macOS**. The agent binary targets Linux only.
+The conductor server and build toolchain target **Linux (arm64/amd64)**. The agent binary also targets Linux only.
 
-### Git and Make
-
-**macOS:**
+### Git, Make, and wget
 
 ```bash
-brew install git make
-```
-
-**Linux (Ubuntu/Debian):**
-
-```bash
-sudo apt-get install -y git make
+sudo apt-get install -y git make wget
 ```
 
 ### Go 1.25+
-
-**macOS:**
-
-```bash
-brew install go
-```
-
-**Linux (Ubuntu/Debian):**
 
 ```bash
 # Check https://go.dev/dl/ for the latest 1.25.x release
@@ -51,14 +35,6 @@ go version
 
 ### Node.js 20+
 
-**macOS:**
-
-```bash
-brew install node
-```
-
-**Linux (Ubuntu/Debian):**
-
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
@@ -66,15 +42,6 @@ node --version
 ```
 
 ### PostgreSQL 15+ (conductor host only)
-
-**macOS:**
-
-```bash
-brew install postgresql@15
-brew services start postgresql@15
-```
-
-**Linux (Ubuntu/Debian):**
 
 ```bash
 sudo apt-get install -y postgresql postgresql-contrib
@@ -165,15 +132,6 @@ Generate a strong password and save it — you will need it in the next step:
 ```bash
 openssl rand -hex 16
 ```
-
-**macOS:**
-
-```bash
-createuser --pwprompt netbox_conductor   # enter the generated password when prompted
-createdb -O netbox_conductor netbox_conductor
-```
-
-**Linux:**
 
 ```bash
 sudo -u postgres psql -c "CREATE USER netbox_conductor WITH PASSWORD '<generated password>';"
