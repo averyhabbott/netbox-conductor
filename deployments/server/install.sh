@@ -92,13 +92,13 @@ if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
 
-echo "==> Installing Patroni, pysyncobj, and psycopg2-binary..."
+echo "==> Installing Patroni, pysyncobj, and psycopg..."
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
 # patroni ships patroni_raft_controller, the built-in Raft witness binary used
 # by the Conductor for 2-node HA clusters. pysyncobj is Patroni's Raft
-# transport layer (required by patroni_raft_controller). psycopg2-binary is
-# a Patroni dependency.
-"${VENV_DIR}/bin/pip" install --quiet patroni pysyncobj psycopg2-binary
+# transport layer (required by patroni_raft_controller). psycopg[binary]
+# (psycopg3) is Patroni's PostgreSQL adapter dependency.
+"${VENV_DIR}/bin/pip" install --quiet patroni pysyncobj "psycopg[binary]"
 
 chown -R "${SERVICE_NAME}:${SERVICE_NAME}" "${VENV_DIR}"
 
