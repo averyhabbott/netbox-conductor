@@ -17,7 +17,7 @@ export interface Node {
   maintenance_mode: boolean
   ssh_port: number
   last_seen_at?: string
-  patroni_state?: Record<string, unknown>
+  patroni_role?: string
   created_at: string
   updated_at: string
   // Service-level health indicators from heartbeat

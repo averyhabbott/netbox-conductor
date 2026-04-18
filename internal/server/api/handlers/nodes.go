@@ -12,6 +12,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
+	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
@@ -98,6 +99,7 @@ type nodeResponse struct {
 	RedisRole       string `json:"redis_role,omitempty"`
 	SentinelRunning *bool  `json:"sentinel_running"`
 	PatroniRunning  *bool  `json:"patroni_running"`
+	PatroniRole     string `json:"patroni_role,omitempty"`
 	PostgresRunning *bool  `json:"postgres_running"`
 }
 
@@ -127,6 +129,7 @@ func toNodeResponse(n *queries.Node) nodeResponse {
 		RedisRole:         n.RedisRole,
 		SentinelRunning:   n.SentinelRunning,
 		PatroniRunning:    n.PatroniRunning,
+		PatroniRole:       nodestate.ExtractPatroniRole(n.PatroniState),
 		PostgresRunning:   n.PostgresRunning,
 	}
 	if n.LastSeenAt != nil {

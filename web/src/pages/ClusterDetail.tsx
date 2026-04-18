@@ -276,9 +276,9 @@ function NodeRow({
           <span className="text-emerald-400 text-base" title="Active app node">✓</span>
         )}
       </td>
-      {/* Active DB — green checkmark when connected and this node is the Patroni primary */}
+      {/* Active DB — green checkmark when healthy and Patroni primary */}
       <td className="px-6 py-4 text-center">
-        {!disconnected && (node.patroni_state?.role === 'primary' || node.patroni_state?.role === 'master') && (
+        {node.health_status === 'healthy' && (node.patroni_role === 'primary' || node.patroni_role === 'master') && (
           <span className="text-emerald-400 text-base" title="Active DB (Patroni primary)">✓</span>
         )}
       </td>
