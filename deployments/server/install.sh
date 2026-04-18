@@ -56,6 +56,13 @@ if ! id "${SERVICE_NAME}" &>/dev/null; then
   useradd --system --no-create-home --shell /usr/sbin/nologin \
     --comment "NetBox Conductor server" "${SERVICE_NAME}"
 fi
+# Lock the password so su/PAM password auth cannot be used even if the shell is later changed.
+passwd -l "${SERVICE_NAME}" >/dev/null 2>&1 || true
+# Explicit SSH denial — belt-and-suspenders on top of the nologin shell.
+mkdir -p /etc/ssh/sshd_config.d
+echo "DenyUsers ${SERVICE_NAME}" > /etc/ssh/sshd_config.d/99-netbox-conductor-deny.conf
+chmod 600 /etc/ssh/sshd_config.d/99-netbox-conductor-deny.conf
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${INSTALL_DIR}"
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${BIN_DIR}"

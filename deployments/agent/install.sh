@@ -17,6 +17,13 @@ fi
 echo "→ Creating netbox-agent user/group"
 groupadd --system netbox-agent 2>/dev/null || true
 useradd --system --gid netbox-agent --no-create-home --shell /usr/sbin/nologin netbox-agent 2>/dev/null || true
+# Lock the password so su/PAM password auth cannot be used even if the shell is later changed.
+passwd -l netbox-agent >/dev/null 2>&1 || true
+# Explicit SSH denial — belt-and-suspenders on top of the nologin shell.
+mkdir -p /etc/ssh/sshd_config.d
+echo "DenyUsers netbox-agent" > /etc/ssh/sshd_config.d/99-netbox-agent-deny.conf
+chmod 600 /etc/ssh/sshd_config.d/99-netbox-agent-deny.conf
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 echo "→ Creating $OPT_DIR"
 mkdir -p "$OPT_DIR"
