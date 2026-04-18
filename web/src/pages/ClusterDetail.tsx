@@ -312,7 +312,7 @@ function NodeRow({
           <ServiceBadgeWithRole
             running={node.patroni_running}
             label="Patroni"
-            role={node.patroni_state?.role as string | undefined}
+            role={node.patroni_role}
             unknown={disconnected}
           />
           <ServiceBadgeWithRole
