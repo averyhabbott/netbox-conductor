@@ -317,6 +317,14 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 		"candidate_node":     candidate.Hostname,
 		"candidate_priority": candidate.FailoverPriority,
 	})
+
+	// For heartbeat-triggered failovers, the failed node's agent stays connected
+	// throughout (only NetBox stopped, not the WebSocket). OnNodeConnect is never
+	// called again, so the failback timer never gets re-armed via the normal path.
+	// Re-arm it here so the node can reclaim active status once it's stable.
+	if m.h.IsConnected(failedNodeID) {
+		m.OnNodeConnect(failedNodeID, clusterID)
+	}
 }
 
 // ── Failback ──────────────────────────────────────────────────────────────────
