@@ -26,6 +26,7 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
   const qc = useQueryClient()
   const [form, setForm] = useState<CreateClusterBody>({
     name: '',
+    description: '',
     mode: 'active_standby',
     patroni_scope: '',
     netbox_version: '',
@@ -65,6 +66,18 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               required
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">
+              Description <span className="text-gray-600">(optional)</span>
+            </label>
+            <input
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+              placeholder="e.g. Production cluster for network operations"
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
+              maxLength={255}
             />
           </div>
           <div>
@@ -155,6 +168,7 @@ export default function ClusterList() {
             <thead>
               <tr className="border-b border-gray-800 text-gray-400">
                 <th className="text-left px-6 py-3 font-medium">Name</th>
+                <th className="text-left px-6 py-3 font-medium">Description</th>
                 <th className="text-left px-6 py-3 font-medium">Mode</th>
                 <th className="text-left px-6 py-3 font-medium">Patroni Scope</th>
                 <th className="text-left px-6 py-3 font-medium">Auto Failover</th>
@@ -169,6 +183,9 @@ export default function ClusterList() {
                   className="border-b border-gray-800 last:border-0 hover:bg-gray-800/40 cursor-pointer"
                 >
                   <td className="px-6 py-4 font-medium">{cluster.name}</td>
+                  <td className="px-6 py-4 text-gray-400 text-sm">
+                    {cluster.description || <span className="text-gray-600">—</span>}
+                  </td>
                   <td className="px-6 py-4 text-gray-300">
                     {cluster.mode === 'active_standby' ? 'Active / Standby' : 'HA'}
                   </td>
