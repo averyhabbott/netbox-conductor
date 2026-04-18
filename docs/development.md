@@ -69,7 +69,7 @@ netbox-conductor/
 │   │   │   ├── handlers/ # HTTP endpoint implementations
 │   │   │   ├── middleware/ # Auth, audit, rate limiting
 │   │   │   └── router.go # All route registrations
-│   │   ├── configgen/    # NetBox configuration.py and Patroni/Sentinel config renderers
+│   │   ├── configgen/    # NetBox configuration.py and Patroni/Sentinel config renderers; parser.go extracts credentials from a live configuration.py
 │   │   ├── crypto/       # AES-256-GCM encryption helpers
 │   │   ├── db/
 │   │   │   ├── migrations/ # SQL migration files (golang-migrate)

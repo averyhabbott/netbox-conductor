@@ -15,7 +15,7 @@
 The **Configure Failover** button on a cluster's Settings tab is the single-step HA setup. It:
 
 1. Saves failover settings to the database
-2. Auto-generates any missing credentials (postgres superuser, replication user, Patroni REST password, Redis password)
+2. Auto-generates any missing credentials (Postgres superuser, replication user, Patroni REST password, Redis Tasks password, Redis Caching password)
 3. Starts the Conductor's built-in Patroni Raft witness subprocess — the third voter that gives 2-node clusters quorum without a dedicated witness VM
 4. Optionally runs `pg_dump` on the primary database before making any changes
 5. Stops NetBox on all non-primary nodes to prevent split-brain during reconfiguration

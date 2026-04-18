@@ -32,12 +32,13 @@ No inbound firewall rules are needed on agent hosts — all traffic is agent-ini
 ## Features
 
 - **Cluster & node management** — hyperconverged, app-only, and db-only node roles; maintenance mode; decommission workflow
-- **Configuration management** — browser-based `configuration.py` editor with version history, diffs, and per-node overrides
+- **Configuration management** — browser-based `configuration.py` editor with version history, diffs, and per-node overrides; **Sync Config** pulls the live config from a source node, lets you edit it, and pushes it to destination nodes
+- **Credential management** — stores eight credential kinds (Postgres superuser, replication user, NetBox DB user, Redis Tasks/Caching passwords, NetBox Secret Key, API Token Pepper, Patroni REST password) encrypted with AES-256-GCM; one-click **Auto-Generate** or **Import From Existing** wizard reads live values from `configuration.py` on any connected node
 - **Service control** — start/stop/restart NetBox, NetBox-RQ, Patroni, Redis, and Redis Sentinel on any node
 - **PostgreSQL HA** — one-button Configure Failover: installs Patroni, generates credentials, pushes config, starts the built-in Raft witness; see [HA & Failover](docs/ha-failover.md)
 - **Automatic failover & failback** — grace-period failover on disconnect or service failure; maintenance-triggered moves; auto-failback to higher-priority nodes
 - **App Tier Always Available** — all nodes run NetBox simultaneously; `DATABASE.HOST` follows the Patroni primary automatically
-- **Redis Sentinel** — push Sentinel config across the cluster; auth password managed as an encrypted credential
+- **Redis Sentinel** — push Sentinel config across the cluster; auth passwords managed as encrypted credentials
 - **Health checks** — `GET /status` endpoint on each agent node for VIP health-checkers and reverse proxies; Patroni-aware in active/standby mode; see [Reverse Proxy](docs/reverse-proxy.md)
 - **Alerting** — webhook and SMTP email alerts on agent disconnect or service degradation; configurable per condition
 - **Cluster & conductor logs** — live log viewer per node; filterable cluster-wide log aggregation; conductor system logs

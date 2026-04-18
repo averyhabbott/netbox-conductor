@@ -6,6 +6,7 @@
 - [Get the Code and Build](#get-the-code-and-build)
 - [Conductor Server Setup](#conductor-server-setup)
 - [Agent Setup](#agent-setup-per-managed-node)
+- [Cluster Credentials](#cluster-credentials)
 - [Directory Permissions Reference](#directory-permissions-reference)
 - [Master Key Rotation](#master-key-rotation)
 
@@ -288,6 +289,33 @@ sudo systemctl enable --now netbox-agent
 ```
 
 The node appears as **Connected** in the Conductor UI once the agent authenticates.
+
+---
+
+## Cluster Credentials
+
+Each cluster stores eight encrypted credential kinds. They are set per-cluster under the **Credentials** tab in the UI.
+
+| Kind | Description |
+| --- | --- |
+| `postgres_superuser` | PostgreSQL superuser (`postgres`) password |
+| `postgres_replication` | Replication user (`replicator`) password used by Patroni |
+| `netbox_db_user` | NetBox application database user password |
+| `redis_tasks_password` | Redis password for the NetBox task queue |
+| `redis_caching_password` | Redis password for the NetBox caching backend |
+| `netbox_secret_key` | NetBox `SECRET_KEY` — changing this invalidates all sessions |
+| `netbox_api_token_pepper` | NetBox `API_TOKEN_PEPPERS[0]` — changing this invalidates all API tokens |
+| `patroni_rest_password` | HTTP basic-auth password for the Patroni REST API |
+
+Credentials are never stored or transmitted in plaintext — they are encrypted at rest with the AES-256-GCM master key generated during conductor setup.
+
+### Setting credentials for a new cluster
+
+**Auto-Generate** (fresh installs): Click **Auto-Generate Credentials** on the Credentials tab. The Conductor generates cryptographically random passwords for all credential kinds that have a default username and stores them encrypted. The plaintext values are shown once — copy them before closing the dialog.
+
+**Import From Existing** (migrating an existing NetBox instance): Click **Import From Existing** on the Credentials tab. Select a connected node; the Conductor reads `configuration.py` from that node and extracts the current `SECRET_KEY`, `API_TOKEN_PEPPERS`, database password, and Redis passwords. Review the detected values, select which to import, and click **Import**. The values are stored encrypted without requiring manual copy-paste.
+
+After credentials are set, use the **Config Editor** to render and push `configuration.py` to nodes, or use **Sync Config** (Settings → General) to pull the live config from a source node and push it to destination nodes.
 
 ---
 
