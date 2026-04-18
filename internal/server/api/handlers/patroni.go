@@ -994,6 +994,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		AppTierAlwaysAvailable bool    `json:"app_tier_always_available"`
 		FailoverOnMaintenance  bool    `json:"failover_on_maintenance"`
 		FailoverDelaySecs      int     `json:"failover_delay_secs"`
+		FailbackMultiplier     int     `json:"failback_multiplier"`
 		VIP                    *string `json:"vip"`
 		RedisSentinelMaster    string  `json:"redis_sentinel_master"`
 		SaveBackup             bool    `json:"save_backup"`
@@ -1004,6 +1005,9 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 	if req.FailoverDelaySecs <= 0 {
 		req.FailoverDelaySecs = 30
+	}
+	if req.FailbackMultiplier <= 0 {
+		req.FailbackMultiplier = 3
 	}
 	if req.RedisSentinelMaster == "" {
 		req.RedisSentinelMaster = "netbox"
@@ -1042,6 +1046,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		AppTierAlwaysAvailable: req.AppTierAlwaysAvailable,
 		FailoverOnMaintenance:  req.FailoverOnMaintenance,
 		FailoverDelaySecs:      req.FailoverDelaySecs,
+		FailbackMultiplier:     req.FailbackMultiplier,
 		VIP:                    req.VIP,
 		RedisSentinelMaster:    req.RedisSentinelMaster,
 	}); err != nil {

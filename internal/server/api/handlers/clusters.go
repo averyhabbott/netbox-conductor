@@ -57,6 +57,7 @@ type clusterResponse struct {
 	AppTierAlwaysAvailable  bool     `json:"app_tier_always_available"`
 	FailoverOnMaintenance   bool     `json:"failover_on_maintenance"`
 	FailoverDelaySecs       int      `json:"failover_delay_secs"`
+	FailbackMultiplier      int      `json:"failback_multiplier"`
 	VIP                     *string  `json:"vip,omitempty"`
 	PatroniScope            string   `json:"patroni_scope"`
 	NetboxVersion           string   `json:"netbox_version"`
@@ -83,6 +84,7 @@ func toClusterResponse(c *queries.Cluster) clusterResponse {
 		AppTierAlwaysAvailable:  c.AppTierAlwaysAvailable,
 		FailoverOnMaintenance:   c.FailoverOnMaintenance,
 		FailoverDelaySecs:       c.FailoverDelaySecs,
+		FailbackMultiplier:      c.FailbackMultiplier,
 		VIP:                     c.VIP,
 		PatroniScope:            c.PatroniScope,
 		NetboxVersion:           c.NetboxVersion,
@@ -204,6 +206,7 @@ type updateFailoverRequest struct {
 	AppTierAlwaysAvailable bool    `json:"app_tier_always_available"`
 	FailoverOnMaintenance  bool    `json:"failover_on_maintenance"`
 	FailoverDelaySecs      int     `json:"failover_delay_secs"`
+	FailbackMultiplier     int     `json:"failback_multiplier"`
 	VIP                    *string `json:"vip"`
 	RedisSentinelMaster    string  `json:"redis_sentinel_master"`
 }
@@ -225,6 +228,9 @@ func (h *ClusterHandler) UpdateFailoverSettings(c echo.Context) error {
 	if req.FailoverDelaySecs <= 0 {
 		req.FailoverDelaySecs = 30
 	}
+	if req.FailbackMultiplier <= 0 {
+		req.FailbackMultiplier = 3
+	}
 
 	if err := h.clusters.UpdateFailoverSettings(c.Request().Context(), queries.UpdateClusterParams{
 		ID:                     id,
@@ -233,6 +239,7 @@ func (h *ClusterHandler) UpdateFailoverSettings(c echo.Context) error {
 		AppTierAlwaysAvailable: req.AppTierAlwaysAvailable,
 		FailoverOnMaintenance:  req.FailoverOnMaintenance,
 		FailoverDelaySecs:      req.FailoverDelaySecs,
+		FailbackMultiplier:     req.FailbackMultiplier,
 		VIP:                    req.VIP,
 		RedisSentinelMaster:    req.RedisSentinelMaster,
 	}); err != nil {

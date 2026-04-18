@@ -1076,6 +1076,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
   const [appTierAlwaysAvailable, setAppTierAlwaysAvailable] = useState(cluster.app_tier_always_available)
   const [failoverOnMaintenance, setFailoverOnMaintenance] = useState(cluster.failover_on_maintenance)
   const [delaySecs, setDelaySecs] = useState(String(cluster.failover_delay_secs || 30))
+  const [failbackMultiplier, setFailbackMultiplier] = useState(String(cluster.failback_multiplier || 3))
   const [sentinelMaster, setSentinelMaster] = useState(cluster.redis_sentinel_master || 'netbox')
   const [saveBackup, setSaveBackup] = useState(true)
   const [primaryNodeId, setPrimaryNodeId] = useState('')
@@ -1093,6 +1094,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
     setAppTierAlwaysAvailable(cluster.app_tier_always_available)
     setFailoverOnMaintenance(cluster.failover_on_maintenance)
     setDelaySecs(String(cluster.failover_delay_secs || 30))
+    setFailbackMultiplier(String(cluster.failback_multiplier || 3))
     setSentinelMaster(cluster.redis_sentinel_master || 'netbox')
   }, [
     cluster.auto_failover,
@@ -1100,6 +1102,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
     cluster.app_tier_always_available,
     cluster.failover_on_maintenance,
     cluster.failover_delay_secs,
+    cluster.failback_multiplier,
     cluster.redis_sentinel_master,
   ])
 
@@ -1111,6 +1114,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         app_tier_always_available: appTierAlwaysAvailable,
         failover_on_maintenance: failoverOnMaintenance,
         failover_delay_secs: Math.max(1, parseInt(delaySecs, 10) || 30),
+        failback_multiplier: Math.max(1, parseInt(failbackMultiplier, 10) || 3),
         vip: cluster.vip ?? null,
         redis_sentinel_master: sentinelMaster,
         save_backup: saveBackup,
@@ -1217,6 +1221,31 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
             className="w-20 text-sm text-right bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
           />
           <span className="text-xs text-gray-500">seconds</span>
+        </div>
+      </div>
+
+      {/* Failback multiplier */}
+      <div className="flex items-center justify-between py-3">
+        <div>
+          <p className="text-sm font-medium text-gray-200">Failback multiplier</p>
+          <p className="text-xs text-gray-500 mt-0.5">
+            Failback delay = failover delay &times; this value. A reconnected node must stay connected
+            for this long before Conductor moves services back to it.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <input
+            type="number"
+            min={1}
+            max={20}
+            value={failbackMultiplier}
+            onChange={(e) => setFailbackMultiplier(e.target.value)}
+            disabled={!isActiveStandby || !autoFailback || isPending}
+            className="w-20 text-sm text-right bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
+          />
+          <span className="text-xs text-gray-500">
+            &times; delay
+          </span>
         </div>
       </div>
 

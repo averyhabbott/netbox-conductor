@@ -37,6 +37,10 @@ import (
 // before treating the outage as permanent and triggering failover.
 const DefaultGracePeriod = 30 * time.Second
 
+// DefaultFailbackMultiplier is multiplied by the cluster's failover_delay_secs
+// to derive the failback stability window. Default 3 → 90s at 30s failover delay.
+const DefaultFailbackMultiplier = 3
+
 // startupSuppressWindow is how long after the manager starts during which
 // disconnect events do NOT arm failover timers. This prevents a conductor
 // restart from triggering mass failovers as all agents reconnect.
@@ -131,6 +135,7 @@ func (m *Manager) OnNodeDisconnect(nodeID, clusterID uuid.UUID) {
 
 // OnNodeConnect must be called whenever an agent WebSocket session is established.
 // It cancels any pending failover (the node came back) and arms a failback timer.
+// The failback delay is failover_delay_secs × failback_multiplier (default 90s).
 func (m *Manager) OnNodeConnect(nodeID, clusterID uuid.UUID) {
 	m.mu.Lock()
 	if t, ok := m.failTimers[nodeID]; ok {
@@ -138,14 +143,33 @@ func (m *Manager) OnNodeConnect(nodeID, clusterID uuid.UUID) {
 		delete(m.failTimers, nodeID)
 		slog.Info("failover: node reconnected within grace period — failover cancelled", "node", nodeID)
 	}
-	// Arm failback check — wait one grace period to let the first heartbeat land.
 	if t, ok := m.failbackTimers[nodeID]; ok {
 		t.Stop()
+		delete(m.failbackTimers, nodeID)
 	}
-	m.failbackTimers[nodeID] = time.AfterFunc(m.grace, func() {
+	m.mu.Unlock()
+
+	// Read per-cluster settings outside the lock to avoid holding it during a DB call.
+	grace := m.grace
+	multiplier := DefaultFailbackMultiplier
+	if cluster, err := m.clusters.GetByID(context.Background(), clusterID); err == nil {
+		if cluster.FailoverDelaySecs > 0 {
+			grace = time.Duration(cluster.FailoverDelaySecs) * time.Second
+		}
+		if cluster.FailbackMultiplier > 0 {
+			multiplier = cluster.FailbackMultiplier
+		}
+	}
+	failbackDelay := grace * time.Duration(multiplier)
+
+	m.mu.Lock()
+	m.failbackTimers[nodeID] = time.AfterFunc(failbackDelay, func() {
 		m.attemptFailback(nodeID, clusterID)
 	})
 	m.mu.Unlock()
+
+	slog.Info("failover: node connected — failback check scheduled",
+		"node", nodeID, "cluster", clusterID, "failback_delay", failbackDelay)
 }
 
 // ── Failover ──────────────────────────────────────────────────────────────────
@@ -305,7 +329,7 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 	ctx := context.Background()
 
 	if !m.h.IsConnected(nodeID) {
-		return // went away again during grace period
+		return // went away again during stability window
 	}
 
 	cluster, err := m.clusters.GetByID(ctx, clusterID)
@@ -318,20 +342,128 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 		return
 	}
 	if reconnected.Role == "db_only" {
-		return // db_only nodes never run NetBox
+		return
 	}
 
-	// Find which node is currently the active one (running NetBox and connected).
 	nodes, err := m.nodes.ListByCluster(ctx, clusterID)
 	if err != nil {
 		slog.Warn("failback: could not list cluster nodes", "cluster", clusterID, "error", err)
 		return
 	}
 
+	if cluster.AppTierAlwaysAvailable {
+		m.attemptFailbackAlwaysAvailable(ctx, cluster, reconnected, nodes)
+	} else {
+		m.attemptFailbackActiveStandby(ctx, cluster, reconnected, nodes)
+	}
+}
+
+// attemptFailbackAlwaysAvailable handles failback when app_tier_always_available=true.
+// All eligible app/HC nodes should always be running NetBox; no running node is ever
+// stopped. Actions:
+//   - If the reconnected node has higher priority than the current Patroni primary,
+//     trigger a switchover. The TypePatroniState cascade (dispatchDBHostUpdate with
+//     RestartAfter=true) will restart all nodes and start the reconnected node.
+//   - Otherwise, ensure the reconnected node is started with a fresh DB host config.
+func (m *Manager) attemptFailbackAlwaysAvailable(
+	ctx context.Context,
+	cluster *queries.Cluster,
+	reconnected *queries.Node,
+	nodes []queries.Node,
+) {
+	// Find the current Patroni primary (excluding the reconnected node itself).
+	var currentPrimary *queries.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if n.ID == reconnected.ID {
+			continue
+		}
+		role := nodestate.ExtractPatroniRole(n.PatroniState)
+		if role == "primary" || role == "master" {
+			currentPrimary = n
+			break
+		}
+	}
+
+	needsSwitchover := currentPrimary != nil &&
+		reconnected.FailoverPriority > currentPrimary.FailoverPriority
+
+	if needsSwitchover {
+		slog.Info("failback (always-available): moving DB primary to higher-priority node",
+			"cluster", cluster.ID,
+			"from", currentPrimary.Hostname, "priority", currentPrimary.FailoverPriority,
+			"to", reconnected.Hostname, "priority", reconnected.FailoverPriority,
+		)
+
+		reconnectedIP, _, _ := strings.Cut(reconnected.IPAddress, "/")
+		switchoverTriggered, switchoverErr := m.triggerPatroniSwitchover(ctx, cluster, reconnected, nodes, currentPrimary.ID)
+		if switchoverErr != nil {
+			slog.Warn("failback (always-available): patroni switchover failed",
+				"cluster", cluster.ID, "error", switchoverErr)
+		}
+		if switchoverTriggered {
+			// Fast-path: update DATABASE.HOST on all nodes (RestartAfter=false).
+			// The TypePatroniState cascade in the agent handler fires when the new
+			// primary reports its role, dispatching TaskUpdateDBHost{RestartAfter=true}
+			// to all nodes — this restarts running nodes and starts the reconnected one.
+			m.dispatchDBHostUpdate(ctx, nodes, reconnectedIP)
+			m.dispatchSentinelUpdate(ctx, cluster, nodes, reconnectedIP)
+		}
+		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+			ClusterID:      cluster.ID,
+			EventType:      "failback",
+			Trigger:        "reconnect",
+			FailedNodeID:   &currentPrimary.ID,
+			FailedNodeName: currentPrimary.Hostname,
+			TargetNodeID:   &reconnected.ID,
+			TargetNodeName: reconnected.Hostname,
+			Success:        switchoverTriggered,
+		})
+		m.publish(cluster.ID, reconnected.ID, sse.EventFailbackTriggered, map[string]any{
+			"from_node":     currentPrimary.Hostname,
+			"from_priority": currentPrimary.FailoverPriority,
+			"to_node":       reconnected.Hostname,
+			"to_priority":   reconnected.FailoverPriority,
+		})
+		return
+	}
+
+	// No switchover needed. If the reconnected node's NetBox is stopped (e.g. it
+	// received a TaskStopNetbox for split-brain prevention during a prior failover),
+	// start it. Update DATABASE.HOST first — it may have a stale value from when it
+	// was offline during the prior failover's dispatchDBHostUpdate.
+	if reconnected.NetboxRunning != nil && *reconnected.NetboxRunning {
+		return // already running — nothing to do
+	}
+
+	if currentPrimary != nil {
+		primaryIP, _, _ := strings.Cut(currentPrimary.IPAddress, "/")
+		m.dispatchDBHostUpdate(ctx, []queries.Node{*reconnected}, primaryIP)
+	}
+	if err := m.dispatchServiceTask(ctx, reconnected, protocol.TaskStartNetbox); err != nil {
+		slog.Error("failback (always-available): start dispatch failed",
+			"node", reconnected.ID, "error", err)
+		return
+	}
+	slog.Info("failback (always-available): started NetBox on reconnected node",
+		"cluster", cluster.ID, "node", reconnected.Hostname)
+}
+
+// attemptFailbackActiveStandby handles failback for standard active/standby clusters
+// (app_tier_always_available=false). Exactly one node runs NetBox at a time.
+// If the reconnected node has higher priority than the current active, NetBox
+// is moved back to it.
+func (m *Manager) attemptFailbackActiveStandby(
+	ctx context.Context,
+	cluster *queries.Cluster,
+	reconnected *queries.Node,
+	nodes []queries.Node,
+) {
+	// Find which node is currently the active one (running NetBox and connected).
 	var currentActive *queries.Node
 	for i := range nodes {
 		n := &nodes[i]
-		if n.ID == nodeID {
+		if n.ID == reconnected.ID {
 			continue
 		}
 		if n.NetboxRunning != nil && *n.NetboxRunning && m.h.IsConnected(n.ID) {
@@ -348,17 +480,18 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 	}
 
 	slog.Info("failback: moving NetBox to higher-priority node",
-		"cluster", clusterID,
+		"cluster", cluster.ID,
 		"from", currentActive.Hostname, "priority", currentActive.FailoverPriority,
 		"to", reconnected.Hostname, "priority", reconnected.FailoverPriority,
 	)
 
-	// Trigger a Patroni switchover so the DB primary follows the reconnected node.
 	switchoverTriggered, switchoverErr := m.triggerPatroniSwitchover(ctx, cluster, reconnected, nodes, currentActive.ID)
 	if switchoverErr != nil {
-		slog.Warn("failback: patroni switchover failed", "cluster", clusterID, "error", switchoverErr)
+		slog.Warn("failback: patroni switchover failed", "cluster", cluster.ID, "error", switchoverErr)
 	}
 	if switchoverTriggered && cluster.AppTierAlwaysAvailable {
+		// Should not reach here (AppTierAlwaysAvailable is handled by the other branch),
+		// but guard for safety.
 		reconnectedIP, _, _ := strings.Cut(reconnected.IPAddress, "/")
 		m.dispatchDBHostUpdate(ctx, nodes, reconnectedIP)
 		m.dispatchSentinelUpdate(ctx, cluster, nodes, reconnectedIP)
@@ -367,7 +500,7 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 	if err := m.dispatchServiceTask(ctx, currentActive, protocol.TaskStopNetbox); err != nil {
 		slog.Error("failback: stop dispatch failed", "node", currentActive.ID, "error", err)
 		m.recordEvent(ctx, queries.CreateFailoverEventParams{
-			ClusterID:      clusterID,
+			ClusterID:      cluster.ID,
 			EventType:      "failback",
 			Trigger:        "reconnect",
 			FailedNodeID:   &currentActive.ID,
@@ -382,7 +515,7 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 	if err := m.dispatchServiceTask(ctx, reconnected, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failback: start dispatch failed", "node", reconnected.ID, "error", err)
 		m.recordEvent(ctx, queries.CreateFailoverEventParams{
-			ClusterID:      clusterID,
+			ClusterID:      cluster.ID,
 			EventType:      "failback",
 			Trigger:        "reconnect",
 			FailedNodeID:   &currentActive.ID,
@@ -396,7 +529,7 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 	}
 
 	m.recordEvent(ctx, queries.CreateFailoverEventParams{
-		ClusterID:      clusterID,
+		ClusterID:      cluster.ID,
 		EventType:      "failback",
 		Trigger:        "reconnect",
 		FailedNodeID:   &currentActive.ID,
@@ -405,7 +538,7 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 		TargetNodeName: reconnected.Hostname,
 		Success:        true,
 	})
-	m.publish(clusterID, nodeID, sse.EventFailbackTriggered, map[string]any{
+	m.publish(cluster.ID, reconnected.ID, sse.EventFailbackTriggered, map[string]any{
 		"from_node":     currentActive.Hostname,
 		"from_priority": currentActive.FailoverPriority,
 		"to_node":       reconnected.Hostname,

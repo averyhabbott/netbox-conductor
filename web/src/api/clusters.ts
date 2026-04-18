@@ -9,6 +9,7 @@ export interface Cluster {
   app_tier_always_available: boolean
   failover_on_maintenance: boolean
   failover_delay_secs: number
+  failback_multiplier: number
   vip?: string
   patroni_scope: string
   netbox_version: string
@@ -27,6 +28,7 @@ export interface ConfigureFailoverBody {
   app_tier_always_available: boolean
   failover_on_maintenance: boolean
   failover_delay_secs: number
+  failback_multiplier: number
   vip?: string | null
   redis_sentinel_master: string
   save_backup: boolean
@@ -121,6 +123,7 @@ export const clustersApi = {
       app_tier_always_available: boolean
       failover_on_maintenance: boolean
       failover_delay_secs: number
+      failback_multiplier: number
       vip?: string | null
     }
   ) =>

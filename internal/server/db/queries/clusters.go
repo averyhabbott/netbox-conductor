@@ -18,6 +18,7 @@ type Cluster struct {
 	AppTierAlwaysAvailable bool
 	FailoverOnMaintenance  bool
 	FailoverDelaySecs      int
+	FailbackMultiplier     int
 	VIP              *string
 	PatroniScope     string
 	NetboxVersion    string
@@ -45,7 +46,7 @@ func NewClusterQuerier(pool *pgxpool.Pool) *ClusterQuerier {
 
 const clusterColumns = `
 	id, name, mode, auto_failover, auto_failback,
-	app_tier_always_available, failover_on_maintenance, failover_delay_secs,
+	app_tier_always_available, failover_on_maintenance, failover_delay_secs, failback_multiplier,
 	vip::text, patroni_scope,
 	netbox_version, netbox_secret_key, api_token_pepper,
 	media_sync_enabled, extra_folders_sync_enabled, extra_sync_folders,
@@ -58,7 +59,7 @@ func scanCluster(row interface {
 	var c Cluster
 	if err := row.Scan(
 		&c.ID, &c.Name, &c.Mode, &c.AutoFailover, &c.AutoFailback,
-		&c.AppTierAlwaysAvailable, &c.FailoverOnMaintenance, &c.FailoverDelaySecs,
+		&c.AppTierAlwaysAvailable, &c.FailoverOnMaintenance, &c.FailoverDelaySecs, &c.FailbackMultiplier,
 		&c.VIP, &c.PatroniScope, &c.NetboxVersion,
 		&c.NetboxSecretKey, &c.APITokenPepper,
 		&c.MediaSyncEnabled, &c.ExtraFoldersSyncEnabled, &c.ExtraSyncFolders,
@@ -123,6 +124,7 @@ type UpdateClusterParams struct {
 	AppTierAlwaysAvailable bool
 	FailoverOnMaintenance  bool
 	FailoverDelaySecs      int
+	FailbackMultiplier     int
 	VIP                    *string
 	RedisSentinelMaster    string
 }
@@ -139,13 +141,14 @@ func (q *ClusterQuerier) UpdateFailoverSettings(ctx context.Context, p UpdateClu
 		    app_tier_always_available = $4,
 		    failover_on_maintenance   = $5,
 		    failover_delay_secs       = $6,
-		    vip                       = $7::inet,
-		    redis_sentinel_master     = $8,
+		    failback_multiplier       = $7,
+		    vip                       = $8::inet,
+		    redis_sentinel_master     = $9,
 		    updated_at                = now()
 		WHERE id = $1
 	`, p.ID, p.AutoFailover, p.AutoFailback,
 		p.AppTierAlwaysAvailable, p.FailoverOnMaintenance, p.FailoverDelaySecs,
-		p.VIP, sentinel)
+		p.FailbackMultiplier, p.VIP, sentinel)
 	return err
 }
 
