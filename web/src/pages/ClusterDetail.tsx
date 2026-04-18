@@ -1113,7 +1113,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         auto_failback: autoFailback,
         app_tier_always_available: appTierAlwaysAvailable,
         failover_on_maintenance: failoverOnMaintenance,
-        failover_delay_secs: Math.max(1, parseInt(delaySecs, 10) || 30),
+        failover_delay_secs: Math.max(10, parseInt(delaySecs, 10) || 30),
         failback_multiplier: Math.max(1, parseInt(failbackMultiplier, 10) || 3),
         vip: cluster.vip ?? null,
         redis_sentinel_master: sentinelMaster,
@@ -1207,13 +1207,13 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         <div>
           <p className="text-sm font-medium text-gray-200">Failover delay</p>
           <p className="text-xs text-gray-500 mt-0.5">
-            Seconds Conductor waits for a disconnected node to reconnect before triggering failover.
+            Seconds Conductor waits for a disconnected node to reconnect before triggering failover. Minimum 10s.
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <input
             type="number"
-            min={1}
+            min={10}
             max={300}
             value={delaySecs}
             onChange={(e) => setDelaySecs(e.target.value)}

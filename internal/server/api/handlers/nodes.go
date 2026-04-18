@@ -23,6 +23,7 @@ import (
 // Defined as an interface to avoid a direct package dependency.
 type NodeFailoverManager interface {
 	OnMaintenanceEnabled(nodeID, clusterID uuid.UUID)
+	OnMaintenanceDisabled(nodeID, clusterID uuid.UUID)
 }
 
 // NodeHandler handles node CRUD and registration token endpoints.
@@ -559,10 +560,14 @@ func (h *NodeHandler) SetMaintenance(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch node")
 	}
 
-	// When enabling maintenance, give the failover manager a chance to move
-	// NetBox off this node if the cluster policy requires it.
-	if body.Enabled && h.failover != nil {
-		go h.failover.OnMaintenanceEnabled(nid, node.ClusterID)
+	if h.failover != nil {
+		if body.Enabled {
+			// Give the failover manager a chance to move NetBox off this node.
+			go h.failover.OnMaintenanceEnabled(nid, node.ClusterID)
+		} else {
+			// Node is back in service — schedule a failback check.
+			go h.failover.OnMaintenanceDisabled(nid, node.ClusterID)
+		}
 	}
 
 	return c.JSON(http.StatusOK, toNodeResponse(node))

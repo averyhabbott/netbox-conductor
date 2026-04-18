@@ -1003,8 +1003,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	if req.FailoverDelaySecs <= 0 {
-		req.FailoverDelaySecs = 30
+	if req.FailoverDelaySecs < 10 {
+		req.FailoverDelaySecs = 10
 	}
 	if req.FailbackMultiplier <= 0 {
 		req.FailbackMultiplier = 3

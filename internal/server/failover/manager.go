@@ -172,6 +172,40 @@ func (m *Manager) OnNodeConnect(nodeID, clusterID uuid.UUID) {
 		"node", nodeID, "cluster", clusterID, "failback_delay", failbackDelay)
 }
 
+// OnMaintenanceDisabled must be called when an operator removes a node from
+// maintenance mode. Arms a failback timer so the node can reclaim its role
+// as the highest-priority active node after a stability window.
+func (m *Manager) OnMaintenanceDisabled(nodeID, clusterID uuid.UUID) {
+	// Reset any stale failback timer for a fresh stability window.
+	m.mu.Lock()
+	if t, ok := m.failbackTimers[nodeID]; ok {
+		t.Stop()
+		delete(m.failbackTimers, nodeID)
+	}
+	m.mu.Unlock()
+
+	grace := m.grace
+	multiplier := DefaultFailbackMultiplier
+	if cluster, err := m.clusters.GetByID(context.Background(), clusterID); err == nil {
+		if cluster.FailoverDelaySecs > 0 {
+			grace = time.Duration(cluster.FailoverDelaySecs) * time.Second
+		}
+		if cluster.FailbackMultiplier > 0 {
+			multiplier = cluster.FailbackMultiplier
+		}
+	}
+	failbackDelay := grace * time.Duration(multiplier)
+
+	m.mu.Lock()
+	m.failbackTimers[nodeID] = time.AfterFunc(failbackDelay, func() {
+		m.attemptFailback(nodeID, clusterID)
+	})
+	m.mu.Unlock()
+
+	slog.Info("failover: maintenance disabled — failback check scheduled",
+		"node", nodeID, "cluster", clusterID, "failback_delay", failbackDelay)
+}
+
 // ── Failover ──────────────────────────────────────────────────────────────────
 
 // attemptFailover is the timer callback for both disconnect-triggered and

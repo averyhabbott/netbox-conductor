@@ -24,7 +24,7 @@ import (
 const (
 	minBackoff     = 5 * time.Second
 	maxBackoff     = 120 * time.Second
-	heartbeatEvery = 15 * time.Second
+	heartbeatEvery = 3 * time.Second
 	agentVersion   = "0.1.0"
 )
 

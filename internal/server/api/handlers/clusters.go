@@ -225,8 +225,8 @@ func (h *ClusterHandler) UpdateFailoverSettings(c echo.Context) error {
 	}
 
 	// Default delay to 30 s if caller omits or sends 0.
-	if req.FailoverDelaySecs <= 0 {
-		req.FailoverDelaySecs = 30
+	if req.FailoverDelaySecs < 10 {
+		req.FailoverDelaySecs = 10
 	}
 	if req.FailbackMultiplier <= 0 {
 		req.FailbackMultiplier = 3
