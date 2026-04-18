@@ -29,6 +29,7 @@ type ConfigHandler struct {
 	enc         *crypto.Encryptor
 	dispatcher  *hub.Dispatcher
 	broker      *sse.Broker
+	hub         *hub.Hub
 }
 
 func NewConfigHandler(
@@ -40,6 +41,7 @@ func NewConfigHandler(
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	broker *sse.Broker,
+	h *hub.Hub,
 ) *ConfigHandler {
 	return &ConfigHandler{
 		configs:     configs,
@@ -50,6 +52,7 @@ func NewConfigHandler(
 		enc:         enc,
 		dispatcher:  dispatcher,
 		broker:      broker,
+		hub:         h,
 	}
 }
 
@@ -342,6 +345,194 @@ func (h *ConfigHandler) PushStatus(c echo.Context) error {
 	})
 }
 
+// ReadNodeConfig reads the live configuration.py from a connected node.
+// POST /api/v1/clusters/:id/nodes/:nodeId/config/read
+func (h *ConfigHandler) ReadNodeConfig(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+	nodeID, err := uuid.Parse(c.Param("nodeId"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid node id")
+	}
+
+	ctx := c.Request().Context()
+
+	node, err := h.nodes.GetByID(ctx, nodeID)
+	if err != nil || node.ClusterID != clusterID {
+		return echo.NewHTTPError(http.StatusNotFound, "node not found")
+	}
+
+	taskID := uuid.New()
+	params, _ := json.Marshal(struct{}{})
+	_ = h.taskResults.Create(ctx, nodeID, taskID, string(protocol.TaskReadNetboxConfig), params)
+
+	// Register waiter before dispatching to avoid race.
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// Start waiting in background, dispatch immediately after.
+	type waitResult struct {
+		result *protocol.TaskResultPayload
+		err    error
+	}
+	ch := make(chan waitResult, 1)
+	go func() {
+		r, e := h.hub.WaitForTask(waitCtx, taskID, 15*time.Second)
+		ch <- waitResult{r, e}
+	}()
+
+	if dispErr := h.dispatcher.Dispatch(nodeID, protocol.TaskDispatchPayload{
+		TaskID:      taskID.String(),
+		TaskType:    protocol.TaskReadNetboxConfig,
+		Params:      json.RawMessage(params),
+		TimeoutSecs: 10,
+	}); dispErr != nil {
+		return echo.NewHTTPError(http.StatusBadGateway, "node not connected")
+	}
+	_ = h.taskResults.SetSent(ctx, taskID)
+
+	wr := <-ch
+	if wr.err != nil {
+		return echo.NewHTTPError(http.StatusGatewayTimeout, "timed out waiting for node response")
+	}
+	if !wr.result.Success {
+		return echo.NewHTTPError(http.StatusBadGateway, "agent error: "+wr.result.ErrorMsg)
+	}
+
+	parsed := configgen.ParseNetboxConfig(wr.result.Output)
+	return c.JSON(http.StatusOK, map[string]any{
+		"raw_config": wr.result.Output,
+		"parsed": map[string]string{
+			"netbox_secret_key":      parsed.SecretKey,
+			"netbox_api_token_pepper": parsed.APITokenPepper,
+			"netbox_db_user_password": parsed.DBPassword,
+			"redis_tasks_password":   parsed.RedisTasksPassword,
+			"redis_caching_password": parsed.RedisCachingPassword,
+		},
+	})
+}
+
+// SyncConfig reads the live config from a source node, strips secrets, saves the
+// template to DB, then renders and pushes to the destination nodes.
+// POST /api/v1/clusters/:id/config/sync
+func (h *ConfigHandler) SyncConfig(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+
+	var req struct {
+		SourceNodeID       string   `json:"source_node_id"`
+		DestinationNodeIDs []string `json:"destination_node_ids"`
+		Content            string   `json:"content"`
+		RestartAfter       bool     `json:"restart_after"`
+	}
+	if err := c.Bind(&req); err != nil || req.Content == "" || len(req.DestinationNodeIDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "content and destination_node_ids are required")
+	}
+
+	ctx := c.Request().Context()
+
+	// Strip known secret values from the content, replacing with template placeholders.
+	stripped, err := h.stripSecrets(ctx, clusterID, req.Content)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to strip secrets: "+err.Error())
+	}
+
+	// Save stripped template as new config version.
+	savedCfg, err := h.configs.Create(ctx, clusterID, stripped)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to save config template")
+	}
+
+	type nodeResult struct {
+		NodeID   string `json:"node_id"`
+		Hostname string `json:"hostname"`
+		TaskID   string `json:"task_id,omitempty"`
+		Status   string `json:"status"`
+		Error    string `json:"error,omitempty"`
+	}
+
+	results := make([]nodeResult, 0, len(req.DestinationNodeIDs))
+	dispatchCount := 0
+
+	for _, destIDStr := range req.DestinationNodeIDs {
+		destID, err := uuid.Parse(destIDStr)
+		if err != nil {
+			results = append(results, nodeResult{NodeID: destIDStr, Status: "error", Error: "invalid node id"})
+			continue
+		}
+
+		node, err := h.nodes.GetByID(ctx, destID)
+		if err != nil || node.ClusterID != clusterID {
+			results = append(results, nodeResult{NodeID: destIDStr, Status: "error", Error: "node not found"})
+			continue
+		}
+
+		nr := nodeResult{NodeID: destID.String(), Hostname: node.Hostname}
+
+		input, err := h.buildRenderInput(ctx, clusterID, destID)
+		if err != nil {
+			nr.Status = "error"
+			nr.Error = err.Error()
+			results = append(results, nr)
+			continue
+		}
+
+		content, sha256hex, err := configgen.Render(stripped, input)
+		if err != nil {
+			nr.Status = "error"
+			nr.Error = "render error: " + err.Error()
+			results = append(results, nr)
+			continue
+		}
+
+		writeTaskID := uuid.New()
+		writeParams, _ := json.Marshal(protocol.ConfigWriteParams{
+			Content:        content,
+			Sha256:         sha256hex,
+			BackupExisting: true,
+			RestartAfter:   req.RestartAfter,
+		})
+		_ = h.taskResults.Create(ctx, destID, writeTaskID, string(protocol.TaskWriteConfig), writeParams)
+
+		if dispErr := h.dispatcher.Dispatch(destID, protocol.TaskDispatchPayload{
+			TaskID:      writeTaskID.String(),
+			TaskType:    protocol.TaskWriteConfig,
+			Params:      json.RawMessage(writeParams),
+			TimeoutSecs: 60,
+		}); dispErr != nil {
+			nr.Status = "offline"
+			nr.Error = dispErr.Error()
+			results = append(results, nr)
+			continue
+		}
+
+		_ = h.taskResults.SetSent(ctx, writeTaskID)
+		nr.TaskID = writeTaskID.String()
+		nr.Status = "dispatched"
+		dispatchCount++
+		results = append(results, nr)
+	}
+
+	overallStatus := "success"
+	if dispatchCount == 0 {
+		overallStatus = "failed"
+	} else if dispatchCount < len(req.DestinationNodeIDs) {
+		overallStatus = "partial"
+	}
+	_ = h.configs.UpdatePushStatus(ctx, savedCfg.ID, overallStatus, "")
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"config_id": savedCfg.ID.String(),
+		"version":   savedCfg.Version,
+		"status":    overallStatus,
+		"nodes":     results,
+	})
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // buildRenderInput gathers decrypted credentials and node network info.
@@ -351,17 +542,19 @@ func (h *ConfigHandler) buildRenderInput(ctx context.Context, clusterID, nodeID 
 		return configgen.RenderInput{}, fmt.Errorf("cluster not found")
 	}
 
-	secretKey, err := h.enc.Decrypt(cluster.NetboxSecretKey)
-	if err != nil {
-		return configgen.RenderInput{}, fmt.Errorf("decrypting secret key: %w", err)
+	secretKey, apiPepper := "", ""
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "netbox_secret_key"); err == nil {
+		if v, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			secretKey = string(v)
+		}
 	}
-	apiPepper, err := h.enc.Decrypt(cluster.APITokenPepper)
-	if err != nil {
-		return configgen.RenderInput{}, fmt.Errorf("decrypting api pepper: %w", err)
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "netbox_api_token_pepper"); err == nil {
+		if v, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			apiPepper = string(v)
+		}
 	}
 
-	dbName, dbUser, dbPassword, redisPassword := "netbox", "netbox", "", ""
-
+	dbName, dbUser, dbPassword := "netbox", "netbox", ""
 	if cred, err := h.creds.GetByKind(ctx, clusterID, "netbox_db_user"); err == nil {
 		dbUser = cred.Username
 		if cred.DBName != nil {
@@ -372,16 +565,20 @@ func (h *ConfigHandler) buildRenderInput(ctx context.Context, clusterID, nodeID 
 		}
 	}
 
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_password"); err == nil {
+	redisTasksPw, redisCachingPw := "", ""
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			redisPassword = string(pw)
+			redisTasksPw = string(pw)
+		}
+	}
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_caching_password"); err == nil {
+		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+			redisCachingPw = string(pw)
 		}
 	}
 
 	allNodes, _ := h.nodes.ListByCluster(ctx, clusterID)
 
-	// Derive Redis Sentinel addresses from hyperconverged and app nodes (port 26379).
-	// If none found, configgen will default to 127.0.0.1:26379.
 	var sentinelAddrs []string
 	for _, n := range allNodes {
 		if n.Role == "hyperconverged" || n.Role == "app" {
@@ -408,19 +605,50 @@ func (h *ConfigHandler) buildRenderInput(ctx context.Context, clusterID, nodeID 
 	}
 
 	return configgen.RenderInput{
-		SecretKey:      string(secretKey),
-		APITokenPepper: string(apiPepper),
-		DBHost:         dbHost,
-		DBPort:         5432,
-		DBName:         dbName,
-		DBUser:         dbUser,
-		DBPassword:     dbPassword,
-		AllowedHosts:   allowedHosts,
-		SentinelAddrs:  sentinelAddrs,
-		PatroniScope:   cluster.PatroniScope,
-		RedisPassword:  redisPassword,
-		NetboxVersion:  cluster.NetboxVersion,
+		SecretKey:            secretKey,
+		APITokenPepper:       apiPepper,
+		DBHost:               dbHost,
+		DBPort:               5432,
+		DBName:               dbName,
+		DBUser:               dbUser,
+		DBPassword:           dbPassword,
+		AllowedHosts:         allowedHosts,
+		SentinelAddrs:        sentinelAddrs,
+		PatroniScope:         cluster.PatroniScope,
+		RedisTasksPassword:   redisTasksPw,
+		RedisCachingPassword: redisCachingPw,
+		NetboxVersion:        cluster.NetboxVersion,
 	}, nil
+}
+
+// stripSecrets replaces plaintext credential values in content with Go template
+// placeholders so the saved template does not contain secrets at rest.
+func (h *ConfigHandler) stripSecrets(ctx context.Context, clusterID uuid.UUID, content string) (string, error) {
+	type replacement struct {
+		kind        string
+		placeholder string
+	}
+	replacements := []replacement{
+		{"netbox_secret_key", "{{.SecretKey}}"},
+		{"netbox_api_token_pepper", "{{.APITokenPepper}}"},
+		{"netbox_db_user", "{{.DBPassword}}"},
+		{"redis_tasks_password", "{{.RedisTasksPassword}}"},
+		{"redis_caching_password", "{{.RedisCachingPassword}}"},
+	}
+
+	result := content
+	for _, r := range replacements {
+		cred, err := h.creds.GetByKind(ctx, clusterID, r.kind)
+		if err != nil {
+			continue // credential not set — nothing to strip
+		}
+		plaintext, err := h.enc.Decrypt(cred.PasswordEnc)
+		if err != nil || len(plaintext) == 0 {
+			continue
+		}
+		result = strings.ReplaceAll(result, string(plaintext), r.placeholder)
+	}
+	return result, nil
 }
 
 func stripCIDR(ip string) string {

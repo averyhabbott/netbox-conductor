@@ -1,8 +1,11 @@
 package hub
 
 import (
+	"context"
 	"sync"
+	"time"
 
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
 )
 
@@ -12,6 +15,9 @@ type Hub struct {
 	mu              sync.RWMutex
 	sessions        map[uuid.UUID]*Session // keyed by NodeID (assigned agents)
 	stagingSessions map[uuid.UUID]*Session // keyed by StagingAgentID (unassigned agents)
+
+	taskWaitersMu sync.Mutex
+	taskWaiters   map[uuid.UUID]chan protocol.TaskResultPayload
 }
 
 // New creates an empty Hub.
@@ -19,6 +25,7 @@ func New() *Hub {
 	return &Hub{
 		sessions:        make(map[uuid.UUID]*Session),
 		stagingSessions: make(map[uuid.UUID]*Session),
+		taskWaiters:     make(map[uuid.UUID]chan protocol.TaskResultPayload),
 	}
 }
 
@@ -175,6 +182,46 @@ func (h *Hub) UnregisterCluster(clusterID uuid.UUID) {
 		if s.ClusterID == clusterID {
 			close(s.send)
 			delete(h.sessions, nodeID)
+		}
+	}
+}
+
+// ── Synchronous task result waiting ─────────────────────────────────────────
+
+// WaitForTask blocks until the agent posts a result for taskID or the context /
+// timeout fires. Callers register before dispatching the task to avoid a race.
+func (h *Hub) WaitForTask(ctx context.Context, taskID uuid.UUID, timeout time.Duration) (*protocol.TaskResultPayload, error) {
+	ch := make(chan protocol.TaskResultPayload, 1)
+	h.taskWaitersMu.Lock()
+	h.taskWaiters[taskID] = ch
+	h.taskWaitersMu.Unlock()
+
+	defer func() {
+		h.taskWaitersMu.Lock()
+		delete(h.taskWaiters, taskID)
+		h.taskWaitersMu.Unlock()
+	}()
+
+	select {
+	case result := <-ch:
+		return &result, nil
+	case <-time.After(timeout):
+		return nil, context.DeadlineExceeded
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// NotifyTaskResult delivers a task result to any registered waiter.
+// Called by handleTaskResult after the result is persisted.
+func (h *Hub) NotifyTaskResult(taskID uuid.UUID, result protocol.TaskResultPayload) {
+	h.taskWaitersMu.Lock()
+	ch, ok := h.taskWaiters[taskID]
+	h.taskWaitersMu.Unlock()
+	if ok {
+		select {
+		case ch <- result:
+		default:
 		}
 	}
 }

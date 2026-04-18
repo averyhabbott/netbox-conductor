@@ -5,8 +5,10 @@ import { clustersApi } from '../api/clusters'
 import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import type { Node, EditNodeBody } from '../api/nodes'
-import { credentialsApi, credentialLabels } from '../api/credentials'
+import { credentialsApi, credentialLabels, secretOnlyKinds } from '../api/credentials'
 import type { Credential, CredentialKind, GeneratedCredential } from '../api/credentials'
+import { configsApi } from '../api/configs'
+import type { ReadNodeConfigResult } from '../api/configs'
 import { patroniApi } from '../api/patroni'
 import type { PushResult } from '../api/patroni'
 import { alertsApi } from '../api/alerts'
@@ -352,7 +354,10 @@ const CRED_KINDS: CredentialKind[] = [
   'postgres_superuser',
   'postgres_replication',
   'netbox_db_user',
-  'redis_password',
+  'redis_tasks_password',
+  'redis_caching_password',
+  'netbox_secret_key',
+  'netbox_api_token_pepper',
   'patroni_rest_password',
 ]
 
@@ -371,11 +376,12 @@ function CredentialRow({
   const [password, setPassword] = useState('')
   const [dbName, setDbName] = useState(cred?.db_name ?? '')
   const [error, setError] = useState('')
+  const isSecretOnly = secretOnlyKinds.has(kind)
 
   const save = useMutation({
     mutationFn: () =>
       credentialsApi.upsert(clusterId, kind, {
-        username,
+        username: isSecretOnly ? '' : username,
         password,
         db_name: kind === 'netbox_db_user' ? dbName || undefined : undefined,
       }),
@@ -395,9 +401,9 @@ function CredentialRow({
           <p className="text-sm font-medium">{credentialLabels[kind]}</p>
           {cred ? (
             <p className="text-xs text-gray-500 mt-0.5">
-              {cred.username}
+              {!isSecretOnly && cred.username}
               {cred.db_name ? ` · db: ${cred.db_name}` : ''}
-              {' · '}last set {new Date(cred.rotated_at ?? cred.created_at).toLocaleDateString()}
+              {!isSecretOnly && ' · '}last set {new Date(cred.rotated_at ?? cred.created_at).toLocaleDateString()}
             </p>
           ) : (
             <p className="text-xs text-yellow-600 mt-0.5">Not configured</p>
@@ -421,23 +427,25 @@ function CredentialRow({
   return (
     <div className="py-3 border-b border-gray-800 last:border-0">
       <p className="text-sm font-medium mb-2">{credentialLabels[kind]}</p>
-      <div className="grid grid-cols-2 gap-2 mb-2">
-        <input
-          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"
-          placeholder="Username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-        />
+      <div className="space-y-2 mb-2">
+        {!isSecretOnly && (
+          <input
+            className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"
+            placeholder="Username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+        )}
         <input
           type="password"
-          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"
-          placeholder="Password"
+          className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"
+          placeholder={isSecretOnly ? 'Value' : 'Password'}
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
         {kind === 'netbox_db_user' && (
           <input
-            className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm col-span-2"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"
             placeholder="Database name (default: netbox)"
             value={dbName}
             onChange={(e) => setDbName(e.target.value)}
@@ -448,7 +456,7 @@ function CredentialRow({
       <div className="flex gap-2">
         <button
           onClick={() => save.mutate()}
-          disabled={save.isPending || !username || !password}
+          disabled={save.isPending || (!isSecretOnly && !username) || !password}
           className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-xs px-3 py-1 rounded"
         >
           {save.isPending ? 'Saving…' : 'Save'}
@@ -459,6 +467,385 @@ function CredentialRow({
         >
           Cancel
         </button>
+      </div>
+    </div>
+  )
+}
+
+// ── Import From Existing wizard ───────────────────────────────────────────────
+
+function ImportFromExistingModal({
+  clusterId,
+  nodes,
+  onClose,
+}: {
+  clusterId: string
+  nodes: { node_id: string; hostname: string; agent_status: string }[]
+  onClose: () => void
+}) {
+  const qc = useQueryClient()
+  const [step, setStep] = useState<1 | 2>(1)
+  const [selectedNodeId, setSelectedNodeId] = useState(
+    nodes.find((n) => n.agent_status === 'connected')?.node_id ?? nodes[0]?.node_id ?? ''
+  )
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [parsed, setParsed] = useState<ReadNodeConfigResult['parsed'] | null>(null)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [importing, setImporting] = useState(false)
+  const [importSuccess, setImportSuccess] = useState(false)
+
+  const kindMap: Record<string, CredentialKind> = {
+    netbox_secret_key: 'netbox_secret_key',
+    netbox_api_token_pepper: 'netbox_api_token_pepper',
+    netbox_db_user_password: 'netbox_db_user',
+    redis_tasks_password: 'redis_tasks_password',
+    redis_caching_password: 'redis_caching_password',
+  }
+
+  async function fetchConfig() {
+    setLoading(true)
+    setError('')
+    try {
+      const result = await configsApi.readNodeConfig(clusterId, selectedNodeId)
+      const found = new Set<string>()
+      for (const [k, v] of Object.entries(result.parsed)) {
+        if (v) found.add(k)
+      }
+      setParsed(result.parsed)
+      setSelected(found)
+      setStep(2)
+    } catch (e: any) {
+      setError(e.response?.data?.message ?? 'Failed to read config from node')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function doImport() {
+    if (!parsed) return
+    setImporting(true)
+    setError('')
+    try {
+      for (const key of selected) {
+        const kind = kindMap[key]
+        if (!kind) continue
+        const value = parsed[key as keyof typeof parsed]
+        if (!value) continue
+        await credentialsApi.upsert(clusterId, kind, {
+          username: '',
+          password: value,
+        })
+      }
+      qc.invalidateQueries({ queryKey: ['credentials', clusterId] })
+      setImportSuccess(true)
+    } catch (e: any) {
+      setError(e.response?.data?.message ?? 'Import failed')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const parsedLabels: Record<string, string> = {
+    netbox_secret_key: 'NetBox Secret Key',
+    netbox_api_token_pepper: 'API Token Pepper',
+    netbox_db_user_password: 'NetBox DB Password',
+    redis_tasks_password: 'Redis Password (Tasks)',
+    redis_caching_password: 'Redis Password (Caching)',
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+      <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-md p-6">
+        <h3 className="text-lg font-semibold mb-1">Import From Existing</h3>
+        <p className="text-xs text-gray-500 mb-4">
+          Read credentials from a live node's configuration.py
+        </p>
+
+        {importSuccess ? (
+          <div>
+            <p className="text-sm text-emerald-400 mb-4">Credentials imported successfully.</p>
+            <button
+              onClick={onClose}
+              className="w-full bg-gray-800 hover:bg-gray-700 rounded-lg py-2 text-sm"
+            >
+              Close
+            </button>
+          </div>
+        ) : step === 1 ? (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Source Node</label>
+              <select
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                value={selectedNodeId}
+                onChange={(e) => setSelectedNodeId(e.target.value)}
+              >
+                {nodes.map((n) => (
+                  <option key={n.node_id} value={n.node_id}>
+                    {n.hostname} {n.agent_status !== 'connected' ? '(offline)' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {error && <p className="text-sm text-red-400">{error}</p>}
+            <div className="flex gap-3">
+              <button
+                onClick={fetchConfig}
+                disabled={loading || !selectedNodeId}
+                className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-medium"
+              >
+                {loading ? 'Reading…' : 'Next →'}
+              </button>
+              <button
+                onClick={onClose}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 rounded-lg py-2 text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-sm text-gray-400">Select credentials to import:</p>
+            {parsed && Object.entries(parsed).map(([key, value]) => {
+              if (!value) return null
+              return (
+                <label key={key} className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(key)}
+                    onChange={(e) => {
+                      const next = new Set(selected)
+                      if (e.target.checked) next.add(key)
+                      else next.delete(key)
+                      setSelected(next)
+                    }}
+                    className="rounded"
+                  />
+                  <span className="text-sm flex-1">{parsedLabels[key] ?? key}</span>
+                  <span className="text-xs text-gray-500 font-mono">
+                    {value.slice(0, 4)}{'*'.repeat(Math.min(8, value.length - 4))}
+                  </span>
+                </label>
+              )
+            })}
+            {error && <p className="text-sm text-red-400">{error}</p>}
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={doImport}
+                disabled={importing || selected.size === 0}
+                className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-medium"
+              >
+                {importing ? 'Importing…' : 'Import'}
+              </button>
+              <button
+                onClick={onClose}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 rounded-lg py-2 text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Sync Config modal ─────────────────────────────────────────────────────────
+
+function SyncConfigModal({
+  clusterId,
+  nodes,
+  onClose,
+}: {
+  clusterId: string
+  nodes: { node_id: string; hostname: string; agent_status: string }[]
+  onClose: () => void
+}) {
+  const connectedNodes = nodes.filter((n) => n.agent_status === 'connected')
+  const [step, setStep] = useState<1 | 2>(1)
+  const [sourceNodeId, setSourceNodeId] = useState(connectedNodes[0]?.node_id ?? '')
+  const [destIds, setDestIds] = useState<Set<string>>(
+    new Set(nodes.filter((n) => n.node_id !== sourceNodeId).map((n) => n.node_id))
+  )
+  const [restartAfter, setRestartAfter] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [content, setContent] = useState('')
+  const [pushResult, setPushResult] = useState<{ nodes: { node_id: string; hostname: string; status: string; error?: string }[] } | null>(null)
+  const [syncing, setSyncing] = useState(false)
+
+  async function fetchLiveConfig() {
+    if (!sourceNodeId) return
+    setLoading(true)
+    setError('')
+    try {
+      const result = await configsApi.readNodeConfig(clusterId, sourceNodeId)
+      setContent(result.raw_config)
+      setStep(2)
+    } catch (e: any) {
+      setError(e.response?.data?.message ?? 'Failed to read config from node')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function doSync() {
+    setSyncing(true)
+    setError('')
+    try {
+      const result = await configsApi.syncConfig(clusterId, {
+        source_node_id: sourceNodeId,
+        destination_node_ids: Array.from(destIds),
+        content,
+        restart_after: restartAfter,
+      })
+      setPushResult(result)
+    } catch (e: any) {
+      setError(e.response?.data?.message ?? 'Sync failed')
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  const destNodes = nodes.filter((n) => n.node_id !== sourceNodeId)
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+      <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-2xl p-6">
+        <h3 className="text-lg font-semibold mb-1">Sync Config</h3>
+        <p className="text-xs text-gray-500 mb-4">
+          Read the live configuration.py from a source node, review and edit it, then push to destinations.
+        </p>
+
+        {pushResult ? (
+          <div className="space-y-2">
+            <p className="text-sm font-medium mb-3">Push results:</p>
+            {pushResult.nodes.map((n) => (
+              <div key={n.node_id} className="flex items-center justify-between text-sm py-1.5 border-b border-gray-800 last:border-0">
+                <span className="text-gray-300">{n.hostname}</span>
+                <span className={
+                  n.status === 'dispatched' ? 'text-emerald-400' :
+                  n.status === 'offline' ? 'text-red-400' : 'text-amber-400'
+                }>
+                  {n.status}{n.error ? `: ${n.error}` : ''}
+                </span>
+              </div>
+            ))}
+            <button
+              onClick={onClose}
+              className="w-full mt-4 bg-gray-800 hover:bg-gray-700 rounded-lg py-2 text-sm"
+            >
+              Close
+            </button>
+          </div>
+        ) : step === 1 ? (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Source Node</label>
+              <select
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                value={sourceNodeId}
+                onChange={(e) => {
+                  setSourceNodeId(e.target.value)
+                  setDestIds(new Set(nodes.filter((n) => n.node_id !== e.target.value).map((n) => n.node_id)))
+                }}
+              >
+                {connectedNodes.map((n) => (
+                  <option key={n.node_id} value={n.node_id}>{n.hostname}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-2">Destination Nodes</label>
+              <div className="space-y-1.5">
+                {destNodes.map((n) => (
+                  <label key={n.node_id} className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={destIds.has(n.node_id)}
+                      onChange={(e) => {
+                        const next = new Set(destIds)
+                        if (e.target.checked) next.add(n.node_id)
+                        else next.delete(n.node_id)
+                        setDestIds(next)
+                      }}
+                      className="rounded"
+                    />
+                    <span className="text-sm">{n.hostname}</span>
+                    {n.agent_status !== 'connected' && (
+                      <span className="text-xs text-red-400">(offline)</span>
+                    )}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={restartAfter}
+                onChange={(e) => setRestartAfter(e.target.checked)}
+                className="rounded"
+              />
+              <span className="text-sm text-gray-300">Restart NetBox after sync</span>
+            </label>
+            {error && <p className="text-sm text-red-400">{error}</p>}
+            <div className="flex gap-3">
+              <button
+                onClick={fetchLiveConfig}
+                disabled={loading || !sourceNodeId || destIds.size === 0}
+                className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-medium"
+              >
+                {loading ? 'Reading config…' : 'Next →'}
+              </button>
+              <button
+                onClick={onClose}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 rounded-lg py-2 text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div>
+              <p className="text-xs text-gray-500 mb-1">
+                Pushing to: {destNodes.filter((n) => destIds.has(n.node_id)).map((n) => n.hostname).join(', ')}
+                {restartAfter && ' · Will restart NetBox'}
+              </p>
+              <textarea
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs font-mono h-72 resize-y"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                spellCheck={false}
+              />
+            </div>
+            {error && <p className="text-sm text-red-400">{error}</p>}
+            <div className="flex gap-3">
+              <button
+                onClick={doSync}
+                disabled={syncing || !content}
+                className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-medium"
+              >
+                {syncing ? 'Syncing…' : 'Sync'}
+              </button>
+              <button
+                onClick={() => setStep(1)}
+                className="bg-gray-800 hover:bg-gray-700 rounded-lg py-2 px-4 text-sm"
+              >
+                ← Back
+              </button>
+              <button
+                onClick={onClose}
+                className="bg-gray-800 hover:bg-gray-700 rounded-lg py-2 px-4 text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -2026,6 +2413,9 @@ export default function ClusterDetail() {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const [generatedCreds, setGeneratedCreds] = useState<GeneratedCredential[] | null>(null)
+  const [showImportWizard, setShowImportWizard] = useState(false)
+  const [generateConfirmStep, setGenerateConfirmStep] = useState(0) // 0=off 1=first 2=second
+  const [showSyncModal, setShowSyncModal] = useState(false)
 
   const { data: cluster, isLoading: loadingCluster } = useQuery({
     queryKey: ['cluster', id],
@@ -2231,12 +2621,21 @@ export default function ClusterDetail() {
                   <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">configuration.py</code>{' '}
                   to all nodes in this cluster.
                 </p>
-                <Link
-                  to={`/clusters/${id}/config`}
-                  className="inline-block bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-                >
-                  Open Config Editor →
-                </Link>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <Link
+                    to={`/clusters/${id}/config`}
+                    className="inline-block bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+                  >
+                    Open Config Editor →
+                  </Link>
+                  <button
+                    onClick={() => setShowSyncModal(true)}
+                    disabled={!nodes || nodes.filter((n) => n.agent_status === 'connected').length === 0}
+                    className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+                  >
+                    Sync Config
+                  </button>
+                </div>
               </div>
 
               {/* Backup Retention */}
@@ -2266,13 +2665,62 @@ export default function ClusterDetail() {
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
               <div className="flex items-center justify-between mb-1">
                 <h3 className="font-medium">Credentials</h3>
-                <button
-                  onClick={() => generateCreds.mutate()}
-                  disabled={generateCreds.isPending}
-                  className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 px-3 py-1 rounded-lg"
-                >
-                  {generateCreds.isPending ? 'Generating…' : 'Auto-generate'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setShowImportWizard(true)}
+                    className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded-lg"
+                  >
+                    Import From Existing
+                  </button>
+                  {generateConfirmStep === 0 ? (
+                    <button
+                      onClick={() => {
+                        if (credentials && credentials.length > 0) {
+                          setGenerateConfirmStep(1)
+                        } else {
+                          generateCreds.mutate()
+                        }
+                      }}
+                      disabled={generateCreds.isPending}
+                      className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 px-3 py-1 rounded-lg"
+                    >
+                      {generateCreds.isPending ? 'Generating…' : 'Auto-generate'}
+                    </button>
+                  ) : generateConfirmStep === 1 ? (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-yellow-400">Overwrite existing credentials?</span>
+                      <button
+                        onClick={() => setGenerateConfirmStep(2)}
+                        className="text-xs bg-yellow-700 hover:bg-yellow-600 px-2 py-1 rounded"
+                      >
+                        Yes
+                      </button>
+                      <button
+                        onClick={() => setGenerateConfirmStep(0)}
+                        className="text-xs text-gray-400 hover:text-gray-300"
+                      >
+                        No
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-red-400">Are you sure? Cannot be undone.</span>
+                      <button
+                        onClick={() => { generateCreds.mutate(); setGenerateConfirmStep(0) }}
+                        disabled={generateCreds.isPending}
+                        className="text-xs bg-red-700 hover:bg-red-600 disabled:opacity-40 px-2 py-1 rounded"
+                      >
+                        {generateCreds.isPending ? 'Generating…' : 'Confirm'}
+                      </button>
+                      <button
+                        onClick={() => setGenerateConfirmStep(0)}
+                        className="text-xs text-gray-400 hover:text-gray-300"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
               <p className="text-xs text-gray-500 mb-4">
                 Passwords are stored AES-256-GCM encrypted. Only the server decrypts them at render time.
@@ -2354,6 +2802,22 @@ export default function ClusterDetail() {
         <GeneratedCredsModal
           generated={generatedCreds}
           onClose={() => setGeneratedCreds(null)}
+        />
+      )}
+
+      {showImportWizard && nodes && (
+        <ImportFromExistingModal
+          clusterId={id!}
+          nodes={nodes.map((n) => ({ node_id: n.id, hostname: n.hostname, agent_status: n.agent_status }))}
+          onClose={() => setShowImportWizard(false)}
+        />
+      )}
+
+      {showSyncModal && nodes && (
+        <SyncConfigModal
+          clusterId={id!}
+          nodes={nodes.map((n) => ({ node_id: n.id, hostname: n.hostname, agent_status: n.agent_status }))}
+          onClose={() => setShowSyncModal(false)}
         />
       )}
     </Layout>

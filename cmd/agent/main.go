@@ -517,6 +517,15 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskReadNetboxConfig:
+		content, err := os.ReadFile(cfg.NetboxConfigPath)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			output = string(content)
+			success = true
+		}
+
 	default:
 		errMsg = "unknown task type: " + string(task.TaskType)
 	}

@@ -23,8 +23,6 @@ type Cluster struct {
 	VIP              *string
 	PatroniScope     string
 	NetboxVersion    string
-	NetboxSecretKey  []byte // encrypted
-	APITokenPepper   []byte // encrypted
 	// Media sync
 	MediaSyncEnabled        bool
 	ExtraFoldersSyncEnabled bool
@@ -48,8 +46,7 @@ func NewClusterQuerier(pool *pgxpool.Pool) *ClusterQuerier {
 const clusterColumns = `
 	id, name, description, mode, auto_failover, auto_failback,
 	app_tier_always_available, failover_on_maintenance, failover_delay_secs, failback_multiplier,
-	vip::text, patroni_scope,
-	netbox_version, netbox_secret_key, api_token_pepper,
+	vip::text, patroni_scope, netbox_version,
 	media_sync_enabled, extra_folders_sync_enabled, extra_sync_folders,
 	patroni_configured, redis_sentinel_master,
 	created_at, updated_at`
@@ -62,7 +59,6 @@ func scanCluster(row interface {
 		&c.ID, &c.Name, &c.Description, &c.Mode, &c.AutoFailover, &c.AutoFailback,
 		&c.AppTierAlwaysAvailable, &c.FailoverOnMaintenance, &c.FailoverDelaySecs, &c.FailbackMultiplier,
 		&c.VIP, &c.PatroniScope, &c.NetboxVersion,
-		&c.NetboxSecretKey, &c.APITokenPepper,
 		&c.MediaSyncEnabled, &c.ExtraFoldersSyncEnabled, &c.ExtraSyncFolders,
 		&c.PatroniConfigured, &c.RedisSentinelMaster,
 		&c.CreatedAt, &c.UpdatedAt,
@@ -98,23 +94,20 @@ func (q *ClusterQuerier) GetByID(ctx context.Context, id uuid.UUID) (*Cluster, e
 }
 
 type CreateClusterParams struct {
-	Name            string
-	Description     string
-	Mode            string
-	PatroniScope    string
-	NetboxVersion   string
-	NetboxSecretKey []byte
-	APITokenPepper  []byte
+	Name          string
+	Description   string
+	Mode          string
+	PatroniScope  string
+	NetboxVersion string
 }
 
 func (q *ClusterQuerier) Create(ctx context.Context, p CreateClusterParams) (*Cluster, error) {
 	row := q.pool.QueryRow(ctx, `
 		INSERT INTO clusters
-			(name, description, mode, patroni_scope, netbox_version, netbox_secret_key, api_token_pepper)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(name, description, mode, patroni_scope, netbox_version)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING`+clusterColumns,
 		p.Name, p.Description, p.Mode, p.PatroniScope, p.NetboxVersion,
-		p.NetboxSecretKey, p.APITokenPepper,
 	)
 	return scanCluster(row)
 }

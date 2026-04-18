@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
@@ -24,7 +23,6 @@ type ClusterHandler struct {
 	nodes     *queries.NodeQuerier
 	regToks   *queries.RegistrationTokenQuerier
 	hub       *hub.Hub
-	enc       *crypto.Encryptor
 	witnesses WitnessManager
 }
 
@@ -33,7 +31,6 @@ func NewClusterHandler(
 	nodes *queries.NodeQuerier,
 	regToks *queries.RegistrationTokenQuerier,
 	h *hub.Hub,
-	enc *crypto.Encryptor,
 	witnesses *patroni.WitnessManager,
 ) *ClusterHandler {
 	return &ClusterHandler{
@@ -41,7 +38,6 @@ func NewClusterHandler(
 		nodes:     nodes,
 		regToks:   regToks,
 		hub:       h,
-		enc:       enc,
 		witnesses: witnesses,
 	}
 }
@@ -149,33 +145,12 @@ func (h *ClusterHandler) Create(c echo.Context) error {
 		req.NetboxVersion = "4.x"
 	}
 
-	// Generate and encrypt secret key + pepper
-	rawSecret, err := crypto.GenerateToken(50)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate secret key")
-	}
-	encSecret, err := h.enc.Encrypt([]byte(rawSecret))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt secret key")
-	}
-
-	rawPepper, err := crypto.GenerateToken(32)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate pepper")
-	}
-	encPepper, err := h.enc.Encrypt([]byte(rawPepper))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt pepper")
-	}
-
 	cluster, err := h.clusters.Create(c.Request().Context(), queries.CreateClusterParams{
-		Name:            req.Name,
-		Description:     req.Description,
-		Mode:            req.Mode,
-		PatroniScope:    req.PatroniScope,
-		NetboxVersion:   req.NetboxVersion,
-		NetboxSecretKey: encSecret,
-		APITokenPepper:  encPepper,
+		Name:          req.Name,
+		Description:   req.Description,
+		Mode:          req.Mode,
+		PatroniScope:  req.PatroniScope,
+		NetboxVersion: req.NetboxVersion,
 	})
 	if err != nil {
 		return echo.NewHTTPError(http.StatusConflict, "cluster name already exists")

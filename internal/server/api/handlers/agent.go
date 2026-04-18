@@ -735,6 +735,7 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 			"duration_ms": result.DurationMs,
 		})
 		_ = h.taskResults.Complete(ctx, taskID, result.Success, responseJSON)
+		h.hub.NotifyTaskResult(taskID, result)
 	}
 
 	h.broker.Publish(sse.Event{

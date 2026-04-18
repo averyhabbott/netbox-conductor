@@ -40,11 +40,12 @@ const (
 	TaskRestartSentinel   TaskType = "service.restart.redis-sentinel"
 	TaskWriteSentinelConf TaskType = "sentinel.write_config"
 	TaskMediaSync         TaskType = "media.sync"
-	TaskDBRestore         TaskType = "db.restore"    // reinitialize a replica or restore from backup
-	TaskDBBackup          TaskType = "db.backup"     // pg_dump the primary database before destructive ops
-	TaskRunCommand        TaskType = "exec.run"       // admin-only ad-hoc
-	TaskEnforceRetention  TaskType = "backup.expire"  // run pgbackrest expire / retention enforcement
-	TaskAgentUpgrade      TaskType = "agent.upgrade"  // self-upgrade the agent binary
+	TaskDBRestore         TaskType = "db.restore"     // reinitialize a replica or restore from backup
+	TaskDBBackup          TaskType = "db.backup"      // pg_dump the primary database before destructive ops
+	TaskRunCommand        TaskType = "exec.run"        // admin-only ad-hoc
+	TaskEnforceRetention  TaskType = "backup.expire"   // run pgbackrest expire / retention enforcement
+	TaskAgentUpgrade      TaskType = "agent.upgrade"   // self-upgrade the agent binary
+	TaskReadNetboxConfig  TaskType = "config.read"     // read /opt/netbox/.../configuration.py from agent
 )
 
 // Envelope wraps every WebSocket message.

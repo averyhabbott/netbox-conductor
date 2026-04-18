@@ -132,6 +132,8 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/clusters/:id/config/:ver/push", cfg.ConfigHandler.Push, mw.RequireRole("operator"))
 	protected.GET("/clusters/:id/config/:ver/push-status", cfg.ConfigHandler.PushStatus)
 	protected.POST("/clusters/:id/config/preview", cfg.ConfigHandler.Preview)
+	protected.POST("/clusters/:id/config/sync", cfg.ConfigHandler.SyncConfig, mw.RequireRole("operator"))
+	protected.POST("/clusters/:id/nodes/:nodeId/config/read", cfg.ConfigHandler.ReadNodeConfig, mw.RequireRole("operator"))
 
 	// ── Patroni ─────────────────────────────────────────────────────────────
 	protected.GET("/clusters/:id/patroni/topology", cfg.PatroniHandler.Topology)

@@ -641,7 +641,7 @@ func (h *PatroniHandler) PushSentinelConfig(c echo.Context) error {
 
 	// Load Redis password from credentials (best effort — empty string if not set)
 	redisPassword := ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_password"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			redisPassword = string(pw)
 		}
@@ -1064,7 +1064,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		{"postgres_superuser", "postgres", nil},
 		{"postgres_replication", "replicator", nil},
 		{"patroni_rest_password", "patroni", nil},
-		{"redis_password", "redis", nil},
+		{"redis_tasks_password", "", nil},
+		{"redis_caching_password", "", nil},
 	} {
 		if _, err := h.creds.GetByKind(ctx, clusterID, def.kind); err != nil {
 			raw, genErr := crypto.GenerateToken(32)
@@ -1115,7 +1116,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			restPass = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_password"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			redisPassword = string(pw)
 		}
@@ -1373,7 +1374,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 
 	// Push Sentinel config when app tier is always available.
-	// Sentinel auth password (redis_password) is written into sentinel.conf
+	// Sentinel auth password (redis_tasks_password) is written into sentinel.conf
 	// so all nodes and the Redis client library use the same secret.
 	sentinelTasks := make([]taskRef, 0)
 	if req.AppTierAlwaysAvailable {

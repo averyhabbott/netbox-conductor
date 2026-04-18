@@ -73,11 +73,14 @@ type upsertCredentialRequest struct {
 }
 
 var validCredKinds = map[string]bool{
-	"postgres_superuser":     true,
-	"postgres_replication":   true,
-	"netbox_db_user":         true,
-	"redis_password":         true,
-	"patroni_rest_password":  true,
+	"postgres_superuser":      true,
+	"postgres_replication":    true,
+	"netbox_db_user":          true,
+	"redis_tasks_password":    true,
+	"redis_caching_password":  true,
+	"netbox_secret_key":       true,
+	"netbox_api_token_pepper": true,
+	"patroni_rest_password":   true,
 }
 
 // autoGenDefaults maps credential kind → default username (and optional db name).
@@ -89,7 +92,8 @@ var autoGenDefaults = []struct {
 	{Kind: "postgres_superuser", Username: "postgres"},
 	{Kind: "postgres_replication", Username: "replicator"},
 	{Kind: "netbox_db_user", Username: "netbox", DBName: strPtr("netbox")},
-	{Kind: "redis_password", Username: "redis"},
+	{Kind: "redis_tasks_password", Username: ""},
+	{Kind: "redis_caching_password", Username: ""},
 	{Kind: "patroni_rest_password", Username: "patroni"},
 }
 

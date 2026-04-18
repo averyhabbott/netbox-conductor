@@ -923,7 +923,7 @@ func (m *Manager) dispatchSentinelUpdate(ctx context.Context, cluster *queries.C
 	}
 	redisPassword := ""
 	if m.creds != nil && m.enc != nil {
-		if cred, err := m.creds.GetByKind(ctx, cluster.ID, "redis_password"); err == nil {
+		if cred, err := m.creds.GetByKind(ctx, cluster.ID, "redis_tasks_password"); err == nil {
 			if pw, err := m.enc.Decrypt(cred.PasswordEnc); err == nil {
 				redisPassword = string(pw)
 			}

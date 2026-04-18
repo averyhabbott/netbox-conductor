@@ -38,6 +38,24 @@ export interface PushResult {
   nodes: PushNodeResult[]
 }
 
+export interface ReadNodeConfigResult {
+  raw_config: string
+  parsed: {
+    netbox_secret_key: string
+    netbox_api_token_pepper: string
+    netbox_db_user_password: string
+    redis_tasks_password: string
+    redis_caching_password: string
+  }
+}
+
+export interface SyncConfigBody {
+  source_node_id?: string
+  destination_node_ids: string[]
+  content: string
+  restart_after: boolean
+}
+
 export const configsApi = {
   getOrCreate: (clusterId: string) =>
     client.get<ConfigWithOverrides>(`/clusters/${clusterId}/config`).then((r) => r.data),
@@ -67,5 +85,15 @@ export const configsApi = {
       .get<{ config_id: string; version: number; push_status?: string; pushed_at?: string }>(
         `/clusters/${clusterId}/config/${version}/push-status`
       )
+      .then((r) => r.data),
+
+  readNodeConfig: (clusterId: string, nodeId: string) =>
+    client
+      .post<ReadNodeConfigResult>(`/clusters/${clusterId}/nodes/${nodeId}/config/read`)
+      .then((r) => r.data),
+
+  syncConfig: (clusterId: string, body: SyncConfigBody) =>
+    client
+      .post<PushResult>(`/clusters/${clusterId}/config/sync`, body)
       .then((r) => r.data),
 }
