@@ -51,6 +51,7 @@ func NewClusterHandler(
 type clusterResponse struct {
 	ID                      string   `json:"id"`
 	Name                    string   `json:"name"`
+	Description             string   `json:"description"`
 	Mode                    string   `json:"mode"`
 	AutoFailover            bool     `json:"auto_failover"`
 	AutoFailback            bool     `json:"auto_failback"`
@@ -78,6 +79,7 @@ func toClusterResponse(c *queries.Cluster) clusterResponse {
 	return clusterResponse{
 		ID:                      c.ID.String(),
 		Name:                    c.Name,
+		Description:             c.Description,
 		Mode:                    c.Mode,
 		AutoFailover:            c.AutoFailover,
 		AutoFailback:            c.AutoFailback,
@@ -121,6 +123,7 @@ func (h *ClusterHandler) List(c echo.Context) error {
 
 type createClusterRequest struct {
 	Name          string `json:"name"`
+	Description   string `json:"description"`
 	Mode          string `json:"mode"`
 	PatroniScope  string `json:"patroni_scope"`
 	NetboxVersion string `json:"netbox_version"`
@@ -167,6 +170,7 @@ func (h *ClusterHandler) Create(c echo.Context) error {
 
 	cluster, err := h.clusters.Create(c.Request().Context(), queries.CreateClusterParams{
 		Name:            req.Name,
+		Description:     req.Description,
 		Mode:            req.Mode,
 		PatroniScope:    req.PatroniScope,
 		NetboxVersion:   req.NetboxVersion,

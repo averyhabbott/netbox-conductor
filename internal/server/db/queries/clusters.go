@@ -12,6 +12,7 @@ import (
 type Cluster struct {
 	ID               uuid.UUID
 	Name             string
+	Description      string
 	Mode             string // "active_standby" | "ha"
 	AutoFailover     bool
 	AutoFailback     bool
@@ -45,7 +46,7 @@ func NewClusterQuerier(pool *pgxpool.Pool) *ClusterQuerier {
 }
 
 const clusterColumns = `
-	id, name, mode, auto_failover, auto_failback,
+	id, name, description, mode, auto_failover, auto_failback,
 	app_tier_always_available, failover_on_maintenance, failover_delay_secs, failback_multiplier,
 	vip::text, patroni_scope,
 	netbox_version, netbox_secret_key, api_token_pepper,
@@ -58,7 +59,7 @@ func scanCluster(row interface {
 }) (*Cluster, error) {
 	var c Cluster
 	if err := row.Scan(
-		&c.ID, &c.Name, &c.Mode, &c.AutoFailover, &c.AutoFailback,
+		&c.ID, &c.Name, &c.Description, &c.Mode, &c.AutoFailover, &c.AutoFailback,
 		&c.AppTierAlwaysAvailable, &c.FailoverOnMaintenance, &c.FailoverDelaySecs, &c.FailbackMultiplier,
 		&c.VIP, &c.PatroniScope, &c.NetboxVersion,
 		&c.NetboxSecretKey, &c.APITokenPepper,
@@ -98,6 +99,7 @@ func (q *ClusterQuerier) GetByID(ctx context.Context, id uuid.UUID) (*Cluster, e
 
 type CreateClusterParams struct {
 	Name            string
+	Description     string
 	Mode            string
 	PatroniScope    string
 	NetboxVersion   string
@@ -108,10 +110,10 @@ type CreateClusterParams struct {
 func (q *ClusterQuerier) Create(ctx context.Context, p CreateClusterParams) (*Cluster, error) {
 	row := q.pool.QueryRow(ctx, `
 		INSERT INTO clusters
-			(name, mode, patroni_scope, netbox_version, netbox_secret_key, api_token_pepper)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(name, description, mode, patroni_scope, netbox_version, netbox_secret_key, api_token_pepper)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING`+clusterColumns,
-		p.Name, p.Mode, p.PatroniScope, p.NetboxVersion,
+		p.Name, p.Description, p.Mode, p.PatroniScope, p.NetboxVersion,
 		p.NetboxSecretKey, p.APITokenPepper,
 	)
 	return scanCluster(row)

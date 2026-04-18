@@ -3,6 +3,7 @@ import client from './client'
 export interface Cluster {
   id: string
   name: string
+  description: string
   mode: 'active_standby' | 'ha'
   auto_failover: boolean
   auto_failback: boolean
@@ -70,6 +71,7 @@ export interface ClusterSyncResult {
 
 export interface CreateClusterBody {
   name: string
+  description?: string
   mode: 'active_standby' | 'ha'
   patroni_scope?: string
   netbox_version?: string

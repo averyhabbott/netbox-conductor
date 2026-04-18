@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { useParams, Link, useNavigate } from 'react-router-dom'
+import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
 import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent } from '../api/clusters'
@@ -151,7 +151,6 @@ function EditNodeModal({
         </div>
 
         <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
-          {/* Warning */}
           <div className="flex gap-2.5 bg-amber-950/60 border border-amber-800/60 rounded-lg px-4 py-3">
             <span className="text-amber-400 text-base flex-shrink-0">⚠</span>
             <p className="text-xs text-amber-300 leading-relaxed">
@@ -270,13 +269,11 @@ function NodeRow({
         </div>
         <div className="text-xs text-gray-500 font-mono">{node.ip_address}</div>
       </td>
-      {/* Active App — green checkmark when connected and NetBox is running */}
       <td className="px-6 py-4 text-center">
         {!disconnected && node.netbox_running === true && (
           <span className="text-emerald-400 text-base" title="Active app node">✓</span>
         )}
       </td>
-      {/* Active DB — green checkmark when healthy and Patroni primary */}
       <td className="px-6 py-4 text-center">
         {node.health_status === 'healthy' && (node.patroni_role === 'primary' || node.patroni_role === 'master') && (
           <span className="text-emerald-400 text-base" title="Active DB (Patroni primary)">✓</span>
@@ -303,18 +300,19 @@ function NodeRow({
           </div>
         )}
       </td>
+      {/* Core */}
       <td className="px-6 py-4">
         <div className="flex gap-3">
           <ServiceBadge running={node.netbox_running} label="NetBox" unknown={disconnected} />
           <ServiceBadge running={node.rq_running} label="RQ" unknown={disconnected} />
         </div>
-        <div className="flex gap-3 mt-1">
-          <ServiceBadgeWithRole
-            running={node.patroni_running}
-            label="Patroni"
-            role={node.patroni_role}
-            unknown={disconnected}
-          />
+        {node.netbox_version && (
+          <div className="text-xs text-gray-500 mt-0.5">nb {node.netbox_version}</div>
+        )}
+      </td>
+      {/* App Tier */}
+      <td className="px-6 py-4">
+        <div className="flex gap-3">
           <ServiceBadgeWithRole
             running={node.redis_running}
             label="Redis"
@@ -322,11 +320,19 @@ function NodeRow({
             unknown={disconnected}
           />
           <ServiceBadge running={node.sentinel_running} label="Sentinel" unknown={disconnected} />
+        </div>
+      </td>
+      {/* DB Tier */}
+      <td className="px-6 py-4">
+        <div className="flex gap-3">
+          <ServiceBadgeWithRole
+            running={node.patroni_running}
+            label="Patroni"
+            role={node.patroni_role}
+            unknown={disconnected}
+          />
           <ServiceBadge running={node.postgres_running} label="DB" unknown={disconnected} />
         </div>
-        {node.netbox_version && (
-          <div className="text-xs text-gray-500 mt-0.5">nb {node.netbox_version}</div>
-        )}
       </td>
       <td className="px-6 py-4 text-gray-400 text-sm">{node.failover_priority}</td>
       <td className="px-4 py-4 text-right">
@@ -696,339 +702,19 @@ function PushResultList({ results }: { results: PushResult[] }) {
   )
 }
 
-// ── Database tab (topology, history, failover ops, retention) ─────────────────
+// ── Witness row ───────────────────────────────────────────────────────────────
 
-function DatabaseTab({ clusterId }: { clusterId: string }) {
-  const [failoverMsg, setFailoverMsg] = useState<string | null>(null)
-
-  const { data: topology, isLoading: topoLoading, refetch: refetchTopo } = useQuery({
+function WitnessRow({ clusterId }: { clusterId: string }) {
+  const { data } = useQuery({
     queryKey: ['patroni-topology', clusterId],
     queryFn: () => patroniApi.topology(clusterId),
     refetchInterval: 15_000,
   })
-
-  const { data: history, isLoading: histLoading } = useQuery({
-    queryKey: ['patroni-history', clusterId],
-    queryFn: () => patroniApi.history(clusterId),
-    refetchInterval: 30_000,
-  })
-
-  const switchover = useMutation({
-    mutationFn: () => patroniApi.switchover(clusterId),
-    onSuccess: () => refetchTopo(),
-  })
-
-  const primaryNode = topology?.nodes.find((n) => n.patroni_role === 'primary')
-
-  const failover = useMutation({
-    mutationFn: () => patroniApi.failover(clusterId, primaryNode?.hostname ?? ''),
-    onSuccess: () => { refetchTopo(); setFailoverMsg('Failover dispatched.') },
-    onError: (e: any) => setFailoverMsg(e?.response?.data?.message ?? 'Failover failed'),
-  })
-
-  const roleColor: Record<string, string> = {
-    primary: 'text-emerald-400',
-    replica: 'text-blue-400',
-    standby_leader: 'text-amber-400',
-  }
-
+  if (!data?.witness_addr) return null
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {/* Topology + History */}
-      <div className="lg:col-span-2 space-y-4">
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-medium">Topology</h3>
-            <button
-              onClick={() => refetchTopo()}
-              className="text-xs text-gray-500 hover:text-gray-300"
-            >
-              Refresh
-            </button>
-          </div>
-          {topoLoading ? (
-            <p className="text-gray-500 text-sm">Loading…</p>
-          ) : topology?.nodes.length === 0 ? (
-            <p className="text-gray-500 text-sm">No nodes found.</p>
-          ) : (
-            <div className="space-y-2">
-              {topology?.nodes.map((n) => (
-                <div
-                  key={n.node_id}
-                  className="flex items-center justify-between text-sm bg-gray-800/50 rounded-lg px-4 py-3"
-                >
-                  <div>
-                    <span className="font-medium">{n.hostname}</span>
-                    <span className="text-gray-500 text-xs ml-2">{n.role.replace('_', ' ')}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className={`text-xs font-mono ${roleColor[n.patroni_role] ?? 'text-gray-500'}`}>
-                      {n.patroni_role || '—'}
-                    </span>
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded ${
-                        n.agent_status === 'connected'
-                          ? 'bg-emerald-900/50 text-emerald-400'
-                          : 'bg-gray-800 text-gray-500'
-                      }`}
-                    >
-                      {n.agent_status}
-                    </span>
-                  </div>
-                </div>
-              ))}
-              {topology?.witness_addr && (
-                <div className="text-xs text-gray-500 mt-2">
-                  Witness: <span className="font-mono">{topology.witness_addr}</span>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <h3 className="font-medium mb-3">Task History</h3>
-          {histLoading ? (
-            <p className="text-gray-500 text-sm">Loading…</p>
-          ) : !history?.history.length ? (
-            <p className="text-gray-500 text-sm">No tasks yet.</p>
-          ) : (
-            <div className="space-y-1 max-h-64 overflow-y-auto">
-              {history.history.map((row) => (
-                <div
-                  key={row.task_id}
-                  className="flex items-center justify-between text-xs px-3 py-1.5 hover:bg-gray-800/40 rounded"
-                >
-                  <div className="flex items-center gap-3">
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                        row.status === 'success'
-                          ? 'bg-emerald-400'
-                          : row.status === 'failure' || row.status === 'timeout'
-                          ? 'bg-red-400'
-                          : 'bg-amber-400'
-                      }`}
-                    />
-                    <span className="font-mono text-gray-400">{row.task_type}</span>
-                    <span className="text-gray-600">{row.hostname}</span>
-                  </div>
-                  <div className="flex items-center gap-3 text-gray-500">
-                    <span className={row.status === 'success' ? 'text-emerald-400' : row.status === 'failure' ? 'text-red-400' : ''}>{row.status}</span>
-                    <span>{new Date(row.queued_at).toLocaleString()}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Actions */}
-      <div className="space-y-4">
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <h3 className="font-medium mb-1">Switchover</h3>
-          <p className="text-xs text-gray-500 mb-3">
-            Trigger a graceful Patroni switchover. The current primary will step down and a replica will be promoted.
-          </p>
-          <button
-            onClick={() => switchover.mutate()}
-            disabled={switchover.isPending}
-            className="w-full text-sm py-2 bg-amber-700 hover:bg-amber-600 disabled:opacity-40 rounded-lg transition-colors"
-          >
-            {switchover.isPending ? 'Switching…' : 'Initiate switchover'}
-          </button>
-          {switchover.isSuccess && (
-            <p className="text-xs text-emerald-400 mt-2">Switchover dispatched.</p>
-          )}
-          {switchover.isError && (
-            <p className="text-xs text-red-400 mt-2">
-              {(switchover.error as any)?.response?.data?.message ?? 'Switchover failed'}
-            </p>
-          )}
-        </div>
-
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <h3 className="font-medium mb-1">Manual Failover</h3>
-          <p className="text-xs text-gray-500 mb-3">
-            Force an immediate Patroni failover. Use only when the primary is unresponsive and switchover is not possible.
-          </p>
-          <button
-            onClick={() => { setFailoverMsg(null); failover.mutate() }}
-            disabled={failover.isPending}
-            className="w-full text-sm py-2 bg-red-800 hover:bg-red-700 disabled:opacity-40 rounded-lg transition-colors"
-          >
-            {failover.isPending ? 'Failing over…' : 'Force failover'}
-          </button>
-          {failoverMsg && (
-            <p className={`text-xs mt-2 ${failover.isError ? 'text-red-400' : 'text-emerald-400'}`}>
-              {failoverMsg}
-            </p>
-          )}
-        </div>
-
-        <RetentionCard clusterId={clusterId} />
-      </div>
-    </div>
-  )
-}
-
-// ── Deployment tab (config editor + push Patroni + push Sentinel) ─────────────
-
-function DeploymentTab({ clusterId }: { clusterId: string }) {
-  const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
-  const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)
-  const [sentinelRestart, setSentinelRestart] = useState(false)
-
-  const pushPatroni = useMutation({
-    mutationFn: () => patroniApi.pushPatroniConfig(clusterId),
-    onSuccess: (data) => setPatroniPushResult(data.nodes),
-  })
-
-  const pushSentinel = useMutation({
-    mutationFn: () => patroniApi.pushSentinelConfig(clusterId, sentinelRestart),
-    onSuccess: (data) => setSentinelPushResult(data.nodes),
-  })
-
-  return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-      {/* NetBox configuration.py */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-        <h3 className="font-medium mb-1">NetBox Configuration</h3>
-        <p className="text-xs text-gray-500 mb-4">
-          Edit and push <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">configuration.py</code> to all nodes in this cluster.
-        </p>
-        <Link
-          to={`/clusters/${clusterId}/config`}
-          className="inline-block bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-        >
-          Open Config Editor →
-        </Link>
-      </div>
-
-      {/* Push Patroni config */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-        <h3 className="font-medium mb-1">Push Patroni Config</h3>
-        <p className="text-xs text-gray-500 mb-4">
-          Renders and writes <code className="font-mono text-xs">patroni.yml</code> to all DB/hyperconverged nodes.
-        </p>
-        <button
-          onClick={() => { setPatroniPushResult(null); pushPatroni.mutate() }}
-          disabled={pushPatroni.isPending}
-          className="w-full text-sm py-2 bg-blue-700 hover:bg-blue-600 disabled:opacity-40 rounded-lg transition-colors"
-        >
-          {pushPatroni.isPending ? 'Pushing…' : 'Push patroni.yml'}
-        </button>
-        {patroniPushResult && <PushResultList results={patroniPushResult} />}
-      </div>
-
-      {/* Push Sentinel config */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-        <h3 className="font-medium mb-1">Push Sentinel Config</h3>
-        <p className="text-xs text-gray-500 mb-4">
-          Renders and writes <code className="font-mono text-xs">sentinel.conf</code> to all nodes using the Redis password credential.
-        </p>
-        <label className="flex items-center gap-2 text-xs text-gray-400 mb-3 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={sentinelRestart}
-            onChange={(e) => setSentinelRestart(e.target.checked)}
-            className="rounded border-gray-600"
-          />
-          Restart redis-sentinel after write
-        </label>
-        <button
-          onClick={() => { setSentinelPushResult(null); pushSentinel.mutate() }}
-          disabled={pushSentinel.isPending}
-          className="w-full text-sm py-2 bg-purple-700 hover:bg-purple-600 disabled:opacity-40 rounded-lg transition-colors"
-        >
-          {pushSentinel.isPending ? 'Pushing…' : 'Push sentinel.conf'}
-        </button>
-        {sentinelPushResult && <PushResultList results={sentinelPushResult} />}
-      </div>
-    </div>
-  )
-}
-
-// ── Cluster audit tab ─────────────────────────────────────────────────────────
-
-function AuditTab({ clusterId }: { clusterId: string }) {
-  const { data: logs = [], isLoading, refetch } = useQuery({
-    queryKey: ['cluster-audit', clusterId],
-    queryFn: () =>
-      client.get<any[]>(`/clusters/${clusterId}/audit-logs`).then((r) => r.data),
-    refetchInterval: 30_000,
-  })
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="font-medium">Audit Log</h3>
-        <button
-          onClick={() => refetch()}
-          className="text-xs text-gray-500 hover:text-gray-300"
-        >
-          Refresh
-        </button>
-      </div>
-
-      {isLoading ? (
-        <p className="text-gray-500 text-sm">Loading…</p>
-      ) : logs.length === 0 ? (
-        <p className="text-gray-500 text-sm">No audit entries for this cluster yet.</p>
-      ) : (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-gray-800 text-gray-400 text-xs uppercase">
-                <th className="text-left px-4 py-3">Time</th>
-                <th className="text-left px-4 py-3">Action</th>
-                <th className="text-left px-4 py-3">Target</th>
-                <th className="text-left px-4 py-3">Actor</th>
-                <th className="text-left px-4 py-3">Outcome</th>
-              </tr>
-            </thead>
-            <tbody>
-              {logs.map((l: any) => (
-                <tr key={l.id} className="border-b border-gray-800 last:border-0 hover:bg-gray-800/30">
-                  <td className="px-4 py-2 text-xs text-gray-500 whitespace-nowrap">
-                    {new Date(l.created_at).toLocaleString()}
-                  </td>
-                  <td className="px-4 py-2 font-mono text-xs text-gray-300">{l.action}</td>
-                  <td className="px-4 py-2 text-xs text-gray-400">
-                    {l.target_type ?? '—'}
-                    {l.target_id ? (
-                      <span className="ml-1 text-gray-600 font-mono">
-                        {String(l.target_id).slice(0, 8)}…
-                      </span>
-                    ) : null}
-                  </td>
-                  <td className="px-4 py-2 text-xs font-mono text-gray-400">
-                    {l.actor_user_id
-                      ? String(l.actor_user_id).slice(0, 8) + '…'
-                      : l.actor_agent_node_id
-                      ? 'agent:' + String(l.actor_agent_node_id).slice(0, 8) + '…'
-                      : '—'}
-                  </td>
-                  <td className="px-4 py-2 text-xs">
-                    <span
-                      className={
-                        l.outcome === 'success'
-                          ? 'text-emerald-400'
-                          : l.outcome === 'failure'
-                          ? 'text-red-400'
-                          : 'text-gray-500'
-                      }
-                    >
-                      {l.outcome ?? '—'}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
+    <p className="text-xs text-gray-500">
+      Witness: <span className="font-mono">{data.witness_addr}</span>
+    </p>
   )
 }
 
@@ -1048,7 +734,7 @@ function FailoverToggle({
   disabled?: boolean
 }) {
   return (
-    <label className="flex items-start justify-between gap-4 py-3 border-b border-gray-800 cursor-pointer last:border-0">
+    <label className="flex items-start justify-between gap-4 py-3 border-b border-gray-800 cursor-pointer">
       <div className="min-w-0">
         <p className="text-sm font-medium text-gray-200">{label}</p>
         <p className="text-xs text-gray-500 mt-0.5">{description}</p>
@@ -1081,13 +767,13 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
   const [saveBackup, setSaveBackup] = useState(true)
   const [primaryNodeId, setPrimaryNodeId] = useState('')
 
-  // Warning modal state (shown when Patroni is already configured)
   const [showWarning, setShowWarning] = useState(false)
-
-  // Result panel shown after a successful configure
   const [result, setResult] = useState<ConfigureFailoverResult | null>(null)
 
-  // Stay in sync if parent cluster data refreshes
+  const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
+  const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)
+  const [sentinelRestart, setSentinelRestart] = useState(false)
+
   useEffect(() => {
     setAutoFailover(cluster.auto_failover)
     setAutoFailback(cluster.auto_failback)
@@ -1127,8 +813,22 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
     },
   })
 
+  const pushPatroni = useMutation({
+    mutationFn: () => patroniApi.pushPatroniConfig(cluster.id),
+    onSuccess: (data) => setPatroniPushResult(data.nodes),
+  })
+
+  const pushSentinel = useMutation({
+    mutationFn: () => patroniApi.pushSentinelConfig(cluster.id, sentinelRestart),
+    onSuccess: (data) => setSentinelPushResult(data.nodes),
+  })
+
   const isActiveStandby = cluster.mode === 'active_standby'
   const isPending = configure.isPending
+
+  const computedFailbackDelay =
+    Math.max(10, parseInt(delaySecs, 10) || 30) *
+    Math.max(1, parseInt(failbackMultiplier, 10) || 3)
 
   function handleConfigureClick() {
     if (cluster.patroni_configured) {
@@ -1139,7 +839,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
   }
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 col-span-full">
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
       <div className="flex items-center justify-between mb-1">
         <h3 className="font-medium">Failover</h3>
         {!isActiveStandby && (
@@ -1152,6 +852,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         (if enabled) Sentinel configs to all nodes and starts the Patroni witness on the conductor.
       </p>
 
+      {/* App tier is always available */}
       <FailoverToggle
         label="App tier is always available"
         description="All nodes run NetBox pointed at the current Patroni primary. A reverse proxy health check steers traffic to healthy nodes automatically. Redis Sentinel handles Redis HA."
@@ -1159,10 +860,8 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         onChange={setAppTierAlwaysAvailable}
         disabled={!isActiveStandby || isPending}
       />
-
-      {/* Sentinel master name — only relevant when app tier is always available */}
       {appTierAlwaysAvailable && (
-        <div className="flex items-center justify-between py-3 pl-10">
+        <div className="flex items-center justify-between py-3 pl-10 border-b border-gray-800">
           <div>
             <p className="text-sm font-medium text-gray-300">Redis Sentinel master name</p>
             <p className="text-xs text-gray-500 mt-0.5">
@@ -1180,6 +879,7 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         </div>
       )}
 
+      {/* Automatic failover */}
       <FailoverToggle
         label="Automatic failover"
         description="When the active node disconnects, Conductor starts NetBox on the highest-priority standby after the delay below."
@@ -1187,23 +887,8 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
         onChange={setAutoFailover}
         disabled={!isActiveStandby || isPending}
       />
-      <FailoverToggle
-        label="Automatic failback"
-        description="When a higher-priority node reconnects and is healthy, Conductor moves NetBox back to it automatically."
-        checked={autoFailback}
-        onChange={setAutoFailback}
-        disabled={!isActiveStandby || !autoFailover || isPending}
-      />
-      <FailoverToggle
-        label="Failover on maintenance mode"
-        description="When a node is put into maintenance mode while running NetBox, Conductor immediately moves it to the next candidate."
-        checked={failoverOnMaintenance}
-        onChange={setFailoverOnMaintenance}
-        disabled={!isActiveStandby || !autoFailover || isPending}
-      />
-
-      {/* Failover delay */}
-      <div className="flex items-center justify-between py-3">
+      {/* Failover delay — sub-item */}
+      <div className="flex items-center justify-between py-3 pl-10 border-b border-gray-800">
         <div>
           <p className="text-sm font-medium text-gray-200">Failover delay</p>
           <p className="text-xs text-gray-500 mt-0.5">
@@ -1223,14 +908,35 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
           <span className="text-xs text-gray-500">seconds</span>
         </div>
       </div>
+      {/* Failover on maintenance mode — sub-item */}
+      <div className="pl-10">
+        <FailoverToggle
+          label="Failover on maintenance mode"
+          description="When a node is put into maintenance mode while running NetBox, Conductor immediately moves it to the next candidate."
+          checked={failoverOnMaintenance}
+          onChange={setFailoverOnMaintenance}
+          disabled={!isActiveStandby || !autoFailover || isPending}
+        />
+      </div>
 
-      {/* Failback multiplier */}
-      <div className="flex items-center justify-between py-3">
+      {/* Automatic failback */}
+      <FailoverToggle
+        label="Automatic failback"
+        description="When a higher-priority node reconnects and is healthy, Conductor moves NetBox back to it automatically."
+        checked={autoFailback}
+        onChange={setAutoFailback}
+        disabled={!isActiveStandby || !autoFailover || isPending}
+      />
+      {/* Failback multiplier — sub-item */}
+      <div className="flex items-center justify-between py-3 pl-10 border-b border-gray-800">
         <div>
           <p className="text-sm font-medium text-gray-200">Failback multiplier</p>
           <p className="text-xs text-gray-500 mt-0.5">
             Failback delay = failover delay &times; this value. A reconnected node must stay connected
             for this long before Conductor moves services back to it.
+          </p>
+          <p className="text-xs text-gray-600 mt-0.5">
+            = {computedFailbackDelay}s at current delay
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -1243,124 +949,169 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
             disabled={!isActiveStandby || !autoFailback || isPending}
             className="w-20 text-sm text-right bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
           />
-          <span className="text-xs text-gray-500">
-            &times; delay
-          </span>
+          <span className="text-xs text-gray-500">&times; delay</span>
         </div>
       </div>
 
-      {/* Standby-mode notice */}
-      {!appTierAlwaysAvailable && isActiveStandby && (
-        <p className="text-xs text-amber-500/80 bg-amber-950/30 border border-amber-900/40 rounded px-3 py-2 mt-1">
-          Standby nodes will return database errors for write operations. Only the active
-          (Patroni-primary) node serves traffic. Clients must be pointed at the active node directly.
-        </p>
-      )}
+      {/* Configure section */}
+      <div className="border-t border-gray-800 mt-2 pt-4">
+        <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-3">Configure</p>
 
-      {/* Backup checkbox */}
-      {isActiveStandby && (
-        <label className="flex items-start gap-3 py-3 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={saveBackup}
-            onChange={(e) => setSaveBackup(e.target.checked)}
-            disabled={isPending}
-            className="mt-0.5 accent-blue-500"
-          />
-          <div>
-            <p className="text-sm font-medium text-gray-200">Back up primary database before configuring</p>
-            <p className="text-xs text-gray-500 mt-0.5">
-              Runs <code className="text-gray-400">pg_dump</code> on the primary node and saves the dump to{' '}
-              <code className="text-gray-400">/var/lib/postgresql/backups/</code>. Recommended on first setup.
-            </p>
-          </div>
-        </label>
-      )}
-
-      {/* Primary node selector — shown when multiple nodes exist so the operator can
-          pin the primary explicitly. When left on "Auto", the backend picks the
-          highest-priority connected node that's running NetBox. */}
-      {nodes && nodes.length > 1 && isActiveStandby && (
-        <div className="flex items-center justify-between py-3 border-b border-gray-800">
-          <div>
-            <p className="text-sm font-medium text-gray-200">Primary node</p>
-            <p className="text-xs text-gray-500 mt-0.5">
-              The node that will become the Patroni primary. Auto selects the highest-priority running node.
-            </p>
-          </div>
-          <select
-            value={primaryNodeId}
-            onChange={(e) => setPrimaryNodeId(e.target.value)}
-            disabled={isPending}
-            className="w-44 text-sm bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
-          >
-            <option value="">Auto</option>
-            {nodes.map((n) => (
-              <option key={n.id} value={n.id}>
-                {n.hostname}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
-
-      {/* Result panel */}
-      {result && (
-        <div className="mt-4 p-4 bg-gray-800/60 border border-gray-700 rounded-lg text-xs space-y-2">
-          <p className="text-emerald-400 font-medium">Configuration dispatched</p>
-          <p className="text-gray-400">Primary: <span className="text-gray-200">{result.primary_node}</span></p>
-          {result.witness_addr && (
-            <p className="text-gray-400">Witness: <span className="text-gray-200">{result.witness_addr}</span></p>
-          )}
-          {result.backup_task && (
-            <p className="text-gray-400">
-              Backup task: <span className="text-gray-200">{result.backup_task.task_id}</span>
-              {' '}on {result.backup_task.hostname}
-            </p>
-          )}
-          <p className="text-gray-400">
-            Patroni tasks: <span className="text-gray-200">{result.patroni_tasks.length}</span>
-            {result.sentinel_tasks.length > 0 && (
-              <>, Sentinel tasks: <span className="text-gray-200">{result.sentinel_tasks.length}</span></>
-            )}
-          </p>
-          {result.warnings.length > 0 && (
-            <ul className="text-amber-400 space-y-0.5">
-              {result.warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
-            </ul>
-          )}
-          <div className="flex items-center gap-4 mt-1">
-            <button
-              onClick={() => setResult(null)}
-              className="text-gray-500 hover:text-gray-300 text-xs"
-            >
-              Dismiss
-            </button>
-            <Link
-              to={`/clusters/${cluster.id}?tab=logs`}
-              className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
-            >
-              Follow →
-            </Link>
-          </div>
-        </div>
-      )}
-
-      {/* Action row */}
-      <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-800">
-        {configure.isError && (
-          <p className="text-xs text-red-400">
-            {(configure.error as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Configuration failed — check node connectivity and try again'}
+        {/* Standby-mode notice */}
+        {!appTierAlwaysAvailable && isActiveStandby && (
+          <p className="text-xs text-amber-500/80 bg-amber-950/30 border border-amber-900/40 rounded px-3 py-2 mb-3">
+            Standby nodes will return database errors for write operations. Only the active
+            (Patroni-primary) node serves traffic. Clients must be pointed at the active node directly.
           </p>
         )}
-        {!configure.isError && <span />}
-        <button
-          onClick={handleConfigureClick}
-          disabled={!isActiveStandby || isPending}
-          className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-1.5 rounded-lg transition-colors font-medium"
-        >
-          {isPending ? 'Configuring…' : 'Configure Failover'}
-        </button>
+
+        {/* Backup checkbox */}
+        {isActiveStandby && (
+          <label className="flex items-start gap-3 py-3 border-b border-gray-800 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={saveBackup}
+              onChange={(e) => setSaveBackup(e.target.checked)}
+              disabled={isPending}
+              className="mt-0.5 accent-blue-500"
+            />
+            <div>
+              <p className="text-sm font-medium text-gray-200">Back up primary database before configuring</p>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Runs <code className="text-gray-400">pg_dump</code> on the primary node and saves the dump to{' '}
+                <code className="text-gray-400">/var/lib/postgresql/backups/</code>. Recommended on first setup.
+              </p>
+            </div>
+          </label>
+        )}
+
+        {/* Primary node selector */}
+        {nodes && nodes.length > 1 && isActiveStandby && (
+          <div className="flex items-center justify-between py-3 border-b border-gray-800">
+            <div>
+              <p className="text-sm font-medium text-gray-200">Primary node</p>
+              <p className="text-xs text-gray-500 mt-0.5">
+                The node that will become the Patroni primary. Auto selects the highest-priority running node.
+              </p>
+            </div>
+            <select
+              value={primaryNodeId}
+              onChange={(e) => setPrimaryNodeId(e.target.value)}
+              disabled={isPending}
+              className="w-44 text-sm bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
+            >
+              <option value="">Auto</option>
+              {nodes.map((n) => (
+                <option key={n.id} value={n.id}>
+                  {n.hostname}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* Result panel */}
+        {result && (
+          <div className="mt-4 p-4 bg-gray-800/60 border border-gray-700 rounded-lg text-xs space-y-2">
+            <p className="text-emerald-400 font-medium">Configuration dispatched</p>
+            <p className="text-gray-400">Primary: <span className="text-gray-200">{result.primary_node}</span></p>
+            {result.witness_addr && (
+              <p className="text-gray-400">Witness: <span className="text-gray-200">{result.witness_addr}</span></p>
+            )}
+            {result.backup_task && (
+              <p className="text-gray-400">
+                Backup task: <span className="text-gray-200">{result.backup_task.task_id}</span>
+                {' '}on {result.backup_task.hostname}
+              </p>
+            )}
+            <p className="text-gray-400">
+              Patroni tasks: <span className="text-gray-200">{result.patroni_tasks.length}</span>
+              {result.sentinel_tasks.length > 0 && (
+                <>, Sentinel tasks: <span className="text-gray-200">{result.sentinel_tasks.length}</span></>
+              )}
+            </p>
+            {result.warnings.length > 0 && (
+              <ul className="text-amber-400 space-y-0.5">
+                {result.warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
+              </ul>
+            )}
+            <div className="flex items-center gap-4 mt-1">
+              <button
+                onClick={() => setResult(null)}
+                className="text-gray-500 hover:text-gray-300 text-xs"
+              >
+                Dismiss
+              </button>
+              <Link
+                to={`?tab=history&sub=cluster-logs`}
+                className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
+              >
+                Follow →
+              </Link>
+            </div>
+          </div>
+        )}
+
+        {/* Push results */}
+        {(patroniPushResult || sentinelPushResult) && (
+          <div className="mt-3 space-y-3">
+            {patroniPushResult && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Patroni config push</p>
+                <PushResultList results={patroniPushResult} />
+              </div>
+            )}
+            {sentinelPushResult && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Sentinel config push</p>
+                <PushResultList results={sentinelPushResult} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Action row */}
+        <div className="flex flex-wrap items-center justify-between gap-3 mt-4 pt-4 border-t border-gray-800">
+          <div>
+            {configure.isError && (
+              <p className="text-xs text-red-400">
+                {(configure.error as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Configuration failed — check node connectivity and try again'}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2 ml-auto">
+            <button
+              onClick={() => pushPatroni.mutate()}
+              disabled={pushPatroni.isPending}
+              className="text-sm bg-gray-700 hover:bg-gray-600 disabled:opacity-40 px-4 py-1.5 rounded-lg transition-colors"
+            >
+              {pushPatroni.isPending ? 'Pushing…' : 'Push Patroni Config'}
+            </button>
+            <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={sentinelRestart}
+                onChange={(e) => setSentinelRestart(e.target.checked)}
+                className="accent-blue-500"
+              />
+              Restart Sentinel
+            </label>
+            <button
+              onClick={() => pushSentinel.mutate()}
+              disabled={pushSentinel.isPending}
+              className="text-sm bg-gray-700 hover:bg-gray-600 disabled:opacity-40 px-4 py-1.5 rounded-lg transition-colors"
+            >
+              {pushSentinel.isPending ? 'Pushing…' : 'Push Sentinel Config'}
+            </button>
+            <button
+              onClick={handleConfigureClick}
+              disabled={!isActiveStandby || isPending}
+              className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-1.5 rounded-lg transition-colors font-medium"
+            >
+              {isPending ? 'Configuring…' : 'Configure Failover'}
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Restart warning modal */}
@@ -1394,12 +1145,11 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
   )
 }
 
-// ── Media sync card ───────────────────────────────────────────────────────────
+// ── File sync card (was: Media Sync) ─────────────────────────────────────────
 
-function MediaSyncCard({ cluster }: { cluster: Cluster }) {
+function FileSyncCard({ cluster }: { cluster: Cluster }) {
   const qc = useQueryClient()
 
-  // rows mirrors the editable folder list; always has at least one row
   const serverFolders = cluster.extra_sync_folders ?? []
   const [rows, setRows] = useState<string[]>(() =>
     serverFolders.length > 0 ? serverFolders : ['']
@@ -1408,7 +1158,6 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
   const [syncResult, setSyncResult] = useState<ClusterSyncResult | null>(null)
   const [syncError, setSyncError] = useState<string | null>(null)
 
-  // Sync rows back from server after a successful save
   useEffect(() => {
     const f = cluster.extra_sync_folders ?? []
     setRows(f.length > 0 ? f : [''])
@@ -1466,14 +1215,14 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
   }
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 col-span-full">
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="font-medium">Media Sync</h3>
+        <h3 className="font-medium">File Sync</h3>
         <button
           onClick={() => { setSyncResult(null); setSyncError(null); syncNow.mutate() }}
           disabled={!cluster.media_sync_enabled || syncNow.isPending}
           className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-1.5 rounded-lg transition-colors"
-          title={!cluster.media_sync_enabled ? 'Enable media sync first' : 'Pull from active node, push to others'}
+          title={!cluster.media_sync_enabled ? 'Enable file sync first' : 'Pull from active node, push to others'}
         >
           {syncNow.isPending ? 'Syncing…' : 'Sync Now'}
         </button>
@@ -1484,7 +1233,6 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
         node and pushes to all other connected nodes of the same type.
       </p>
 
-      {/* Toggle: Sync Media */}
       <label className="flex items-center justify-between py-2 border-b border-gray-800 cursor-pointer">
         <span className="text-sm">Sync Media Root (<code className="text-xs text-gray-400">NETBOX_MEDIA_ROOT</code>)</span>
         <button
@@ -1498,7 +1246,6 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
         </button>
       </label>
 
-      {/* Toggle: Sync Additional Folders */}
       <label className="flex items-center justify-between py-2 border-b border-gray-800 cursor-pointer">
         <span className="text-sm text-gray-300">Sync Additional Folders</span>
         <button
@@ -1512,7 +1259,6 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
         </button>
       </label>
 
-      {/* Editable folder rows */}
       {cluster.extra_folders_sync_enabled && cluster.media_sync_enabled && (
         <div className="mt-3 space-y-1.5">
           {rows.map((row, i) => (
@@ -1550,7 +1296,6 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
         </div>
       )}
 
-      {/* Sync result / error */}
       {syncResult && (
         <div className="mt-4 text-xs text-emerald-400 bg-emerald-900/20 border border-emerald-800 rounded-lg p-3">
           <p className="font-medium mb-1">Sync started — source: <span className="font-mono">{syncResult.source_hostname}</span></p>
@@ -1571,6 +1316,8 @@ function MediaSyncCard({ cluster }: { cluster: Cluster }) {
     </div>
   )
 }
+
+// ── Failover history tab ──────────────────────────────────────────────────────
 
 function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
   if (events.length === 0) {
@@ -1642,7 +1389,7 @@ function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
   )
 }
 
-// ── Logs tab ──────────────────────────────────────────────────────────────────
+// ── Cluster logs tab ──────────────────────────────────────────────────────────
 
 const LOG_LEVEL_COLOR: Record<string, string> = {
   debug: 'text-gray-500',
@@ -1657,7 +1404,7 @@ const LOG_SOURCE_BADGE: Record<string, string> = {
   netbox: 'bg-emerald-900/40 text-emerald-300',
 }
 
-function LogsTab({ clusterId }: { clusterId: string }) {
+function ClusterLogsTab({ clusterId }: { clusterId: string }) {
   const [minLevel, setMinLevel] = useState('')
   const { data: entries = [], isLoading, refetch } = useQuery({
     queryKey: ['cluster-logs', clusterId, minLevel],
@@ -1718,30 +1465,566 @@ function LogsTab({ clusterId }: { clusterId: string }) {
   )
 }
 
-type Tab = 'nodes' | 'database' | 'settings' | 'deployment' | 'history' | 'audit' | 'logs'
+// ── Node logs tab ─────────────────────────────────────────────────────────────
+
+function NodeLogView({
+  clusterId,
+  nodeId,
+  source,
+  filter,
+}: {
+  clusterId: string
+  nodeId: string
+  source: 'agent' | 'netbox'
+  filter: string
+}) {
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['node-logs', clusterId, nodeId, source],
+    queryFn: () => nodesApi.getLogs(clusterId, nodeId, 200, source),
+    refetchInterval: 15_000,
+  })
+
+  const lines = data?.lines ?? []
+  const filtered = filter
+    ? lines.filter((l) => l.toLowerCase().includes(filter.toLowerCase()))
+    : lines
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
+        <span className="text-xs text-gray-500 font-mono">{data?.path ?? '…'}</span>
+        <button onClick={() => refetch()} className="text-xs text-gray-500 hover:text-gray-300">
+          Refresh
+        </button>
+      </div>
+      {isLoading ? (
+        <p className="px-4 py-3 text-gray-500 text-sm">Loading…</p>
+      ) : filtered.length === 0 ? (
+        <p className="px-4 py-3 text-gray-500 text-sm">
+          No log entries{filter ? ' matching filter' : ''}.
+        </p>
+      ) : (
+        <div className="max-h-[32rem] overflow-y-auto">
+          {filtered.map((line, i) => (
+            <div
+              key={i}
+              className="px-4 py-0.5 font-mono text-xs text-gray-300 hover:bg-gray-800/30 break-all"
+            >
+              {line}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function NodeLogsTab({ clusterId, nodes }: { clusterId: string; nodes: Node[] }) {
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(() => nodes.map((n) => n.id))
+  const [source, setSource] = useState<'agent' | 'netbox'>('agent')
+  const [filter, setFilter] = useState('')
+  const [activeNodeId, setActiveNodeId] = useState(nodes[0]?.id ?? '')
+
+  const selectedNodes = nodes.filter((n) => selectedNodeIds.includes(n.id))
+
+  useEffect(() => {
+    if (!selectedNodeIds.includes(activeNodeId) && selectedNodes.length > 0) {
+      setActiveNodeId(selectedNodes[0].id)
+    }
+  }, [selectedNodeIds, activeNodeId, selectedNodes])
+
+  function toggleNode(nodeId: string) {
+    setSelectedNodeIds((prev) =>
+      prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId]
+    )
+  }
+
+  if (nodes.length === 0) {
+    return <p className="text-gray-500 text-sm">No nodes in this cluster.</p>
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-500">Source:</span>
+          <select
+            value={source}
+            onChange={(e) => setSource(e.target.value as 'agent' | 'netbox')}
+            className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 focus:outline-none"
+          >
+            <option value="agent">Agent</option>
+            <option value="netbox">NetBox</option>
+          </select>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="text-xs text-gray-500">Nodes:</span>
+          {nodes.map((n) => (
+            <label
+              key={n.id}
+              className="flex items-center gap-1.5 text-xs cursor-pointer text-gray-300"
+            >
+              <input
+                type="checkbox"
+                checked={selectedNodeIds.includes(n.id)}
+                onChange={() => toggleNode(n.id)}
+                className="accent-blue-500"
+              />
+              {n.hostname}
+            </label>
+          ))}
+        </div>
+        <input
+          type="text"
+          placeholder="Filter lines…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          className="flex-1 min-w-32 text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-gray-500"
+        />
+      </div>
+
+      {selectedNodes.length === 0 ? (
+        <p className="text-gray-500 text-sm">Select at least one node to view logs.</p>
+      ) : (
+        <>
+          <div className="border-b border-gray-800 flex">
+            {selectedNodes.map((n) => (
+              <button
+                key={n.id}
+                onClick={() => setActiveNodeId(n.id)}
+                className={`px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+                  n.id === activeNodeId
+                    ? 'border-blue-500 text-white'
+                    : 'border-transparent text-gray-400 hover:text-white'
+                }`}
+              >
+                {n.hostname}
+              </button>
+            ))}
+          </div>
+          {selectedNodes.map(
+            (n) =>
+              n.id === activeNodeId && (
+                <NodeLogView
+                  key={n.id}
+                  clusterId={clusterId}
+                  nodeId={n.id}
+                  source={source}
+                  filter={filter}
+                />
+              )
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ── Database events tab ───────────────────────────────────────────────────────
+
+function DatabaseEventsTab({ clusterId }: { clusterId: string }) {
+  const { data: history, isLoading } = useQuery({
+    queryKey: ['patroni-history', clusterId],
+    queryFn: () => patroniApi.history(clusterId),
+    refetchInterval: 30_000,
+  })
+
+  return (
+    <div>
+      {isLoading ? (
+        <p className="text-gray-500 text-sm">Loading…</p>
+      ) : !history?.history.length ? (
+        <p className="text-gray-500 text-sm">No database events yet.</p>
+      ) : (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+          <div className="divide-y divide-gray-800">
+            {history.history.map((row) => (
+              <div
+                key={row.task_id}
+                className="flex items-center justify-between text-xs px-4 py-2 hover:bg-gray-800/40"
+              >
+                <div className="flex items-center gap-3">
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                      row.status === 'success'
+                        ? 'bg-emerald-400'
+                        : row.status === 'failure' || row.status === 'timeout'
+                        ? 'bg-red-400'
+                        : 'bg-amber-400'
+                    }`}
+                  />
+                  <span className="font-mono text-gray-400">{row.task_type}</span>
+                  <span className="text-gray-600">{row.hostname}</span>
+                </div>
+                <div className="flex items-center gap-3 text-gray-500">
+                  <span
+                    className={
+                      row.status === 'success'
+                        ? 'text-emerald-400'
+                        : row.status === 'failure'
+                        ? 'text-red-400'
+                        : ''
+                    }
+                  >
+                    {row.status}
+                  </span>
+                  <span>{new Date(row.queued_at).toLocaleString()}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Audit tab ─────────────────────────────────────────────────────────────────
+
+function AuditTab({ clusterId }: { clusterId: string }) {
+  const { data: logs = [], isLoading, refetch } = useQuery({
+    queryKey: ['cluster-audit', clusterId],
+    queryFn: () =>
+      client.get<any[]>(`/clusters/${clusterId}/audit-logs`).then((r) => r.data),
+    refetchInterval: 30_000,
+  })
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-medium">API History</h3>
+        <button
+          onClick={() => refetch()}
+          className="text-xs text-gray-500 hover:text-gray-300"
+        >
+          Refresh
+        </button>
+      </div>
+
+      {isLoading ? (
+        <p className="text-gray-500 text-sm">Loading…</p>
+      ) : logs.length === 0 ? (
+        <p className="text-gray-500 text-sm">No audit entries for this cluster yet.</p>
+      ) : (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-800 text-gray-400 text-xs uppercase">
+                <th className="text-left px-4 py-3">Time</th>
+                <th className="text-left px-4 py-3">Action</th>
+                <th className="text-left px-4 py-3">Target</th>
+                <th className="text-left px-4 py-3">Actor</th>
+                <th className="text-left px-4 py-3">Outcome</th>
+              </tr>
+            </thead>
+            <tbody>
+              {logs.map((l: any) => (
+                <tr key={l.id} className="border-b border-gray-800 last:border-0 hover:bg-gray-800/30">
+                  <td className="px-4 py-2 text-xs text-gray-500 whitespace-nowrap">
+                    {new Date(l.created_at).toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-xs text-gray-300">{l.action}</td>
+                  <td className="px-4 py-2 text-xs text-gray-400">
+                    {l.target_type ?? '—'}
+                    {l.target_id ? (
+                      <span className="ml-1 text-gray-600 font-mono">
+                        {String(l.target_id).slice(0, 8)}…
+                      </span>
+                    ) : null}
+                  </td>
+                  <td className="px-4 py-2 text-xs font-mono text-gray-400">
+                    {l.actor_user_id
+                      ? String(l.actor_user_id).slice(0, 8) + '…'
+                      : l.actor_agent_node_id
+                      ? 'agent:' + String(l.actor_agent_node_id).slice(0, 8) + '…'
+                      : '—'}
+                  </td>
+                  <td className="px-4 py-2 text-xs">
+                    <span
+                      className={
+                        l.outcome === 'success'
+                          ? 'text-emerald-400'
+                          : l.outcome === 'failure'
+                          ? 'text-red-400'
+                          : 'text-gray-500'
+                      }
+                    >
+                      {l.outcome ?? '—'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Sub-tab bar ───────────────────────────────────────────────────────────────
+
+function SubTabBar({
+  tabs,
+  active,
+  onChange,
+}: {
+  tabs: { id: string; label: string }[]
+  active: string
+  onChange: (id: string) => void
+}) {
+  return (
+    <div className="flex gap-1 mb-6 flex-wrap">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+            t.id === active
+              ? 'bg-gray-700 text-white'
+              : 'text-gray-400 hover:text-white hover:bg-gray-800'
+          }`}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// ── Cluster actions dropdown ──────────────────────────────────────────────────
+
+function ClusterActionsDropdown({ clusterId, onAddNode }: { clusterId: string; onAddNode: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [showSwitchoverModal, setShowSwitchoverModal] = useState(false)
+  const [showFailoverModal, setShowFailoverModal] = useState(false)
+  const [switchoverCandidate, setSwitchoverCandidate] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as HTMLElement)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  const { data: topology, refetch: refetchTopo } = useQuery({
+    queryKey: ['patroni-topology', clusterId],
+    queryFn: () => patroniApi.topology(clusterId),
+    enabled: showSwitchoverModal || showFailoverModal,
+  })
+
+  const primaryNode = topology?.nodes.find(
+    (n) => n.patroni_role === 'primary' || n.patroni_role === 'master'
+  )
+  const replicaNodes =
+    topology?.nodes.filter(
+      (n) => n.patroni_role !== 'primary' && n.patroni_role !== 'master'
+    ) ?? []
+
+  const switchover = useMutation({
+    mutationFn: () => patroniApi.switchover(clusterId, switchoverCandidate || undefined),
+    onSuccess: () => {
+      setShowSwitchoverModal(false)
+      refetchTopo()
+    },
+  })
+
+  const failover = useMutation({
+    mutationFn: () => patroniApi.failover(clusterId, primaryNode?.hostname ?? ''),
+    onSuccess: () => {
+      setShowFailoverModal(false)
+      refetchTopo()
+    },
+  })
+
+  return (
+    <>
+      <div className="relative" ref={ref}>
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="text-sm text-gray-300 hover:text-white border border-gray-700 hover:border-gray-500 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5"
+        >
+          Cluster Actions
+          <span className="text-gray-500 text-xs">▾</span>
+        </button>
+        {open && (
+          <div className="absolute right-0 top-full mt-1 bg-gray-900 border border-gray-700 rounded-lg shadow-xl z-10 min-w-56 py-1">
+            <button
+              onClick={() => { setOpen(false); onAddNode() }}
+              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-800 transition-colors"
+            >
+              Add Node
+            </button>
+            <div className="border-t border-gray-800 my-1" />
+            <button
+              disabled
+              className="w-full text-left px-4 py-2 text-sm text-gray-500 cursor-not-allowed opacity-50"
+            >
+              Cluster Maintenance Mode
+            </button>
+            <div className="border-t border-gray-800 my-1" />
+            <button
+              onClick={() => { setOpen(false); setShowSwitchoverModal(true) }}
+              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-800 transition-colors"
+            >
+              Initiate Graceful DB Switchover
+            </button>
+            <button
+              onClick={() => { setOpen(false); setShowFailoverModal(true) }}
+              className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-gray-800 transition-colors"
+            >
+              Initiate Database Failover
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Switchover modal */}
+      {showSwitchoverModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md">
+            <h3 className="font-semibold mb-1">Graceful DB Switchover</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              Trigger a graceful Patroni switchover. The current primary will step down and a
+              replica will be promoted.
+            </p>
+            {replicaNodes.length > 1 && (
+              <div className="mb-4">
+                <label className="block text-xs text-gray-400 mb-1">Candidate (optional)</label>
+                <select
+                  value={switchoverCandidate}
+                  onChange={(e) => setSwitchoverCandidate(e.target.value)}
+                  className="w-full text-sm bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500"
+                >
+                  <option value="">Auto (highest-priority replica)</option>
+                  {replicaNodes.map((n) => (
+                    <option key={n.node_id} value={n.hostname}>
+                      {n.hostname}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {switchover.isSuccess && (
+              <p className="text-xs text-emerald-400 mb-3">Switchover dispatched.</p>
+            )}
+            {switchover.isError && (
+              <p className="text-xs text-red-400 mb-3">
+                {(switchover.error as any)?.response?.data?.message ?? 'Switchover failed'}
+              </p>
+            )}
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowSwitchoverModal(false)}
+                className="text-sm px-4 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => switchover.mutate()}
+                disabled={switchover.isPending}
+                className="text-sm px-4 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white font-medium"
+              >
+                {switchover.isPending ? 'Switching…' : 'Initiate Switchover'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DB Failover modal */}
+      {showFailoverModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md">
+            <h3 className="font-semibold text-red-400 mb-1">Force Database Failover</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              Force an immediate Patroni failover. Use only when the primary is unresponsive and
+              switchover is not possible.
+              {primaryNode && (
+                <>
+                  {' '}Current primary:{' '}
+                  <span className="font-mono text-gray-200">{primaryNode.hostname}</span>.
+                </>
+              )}
+            </p>
+            {failover.isSuccess && (
+              <p className="text-xs text-emerald-400 mb-3">Failover dispatched.</p>
+            )}
+            {failover.isError && (
+              <p className="text-xs text-red-400 mb-3">
+                {(failover.error as any)?.response?.data?.message ?? 'Failover failed'}
+              </p>
+            )}
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowFailoverModal(false)}
+                className="text-sm px-4 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => failover.mutate()}
+                disabled={failover.isPending || !primaryNode}
+                className="text-sm px-4 py-1.5 rounded-lg bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white font-medium"
+              >
+                {failover.isPending ? 'Failing over…' : 'Force Failover'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+// ── Tab / sub-tab type definitions ────────────────────────────────────────────
+
+type Tab = 'overview' | 'settings' | 'history'
+
+const SETTINGS_TABS = [
+  { id: 'general', label: 'General' },
+  { id: 'credentials', label: 'Credentials' },
+  { id: 'failover', label: 'Failover' },
+]
+
+const HISTORY_TABS = [
+  { id: 'events', label: 'Events' },
+  { id: 'api-history', label: 'API History' },
+  { id: 'cluster-logs', label: 'Cluster Logs' },
+  { id: 'node-logs', label: 'Node Logs' },
+  { id: 'db-events', label: 'Database Events' },
+]
+
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function ClusterDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const qc = useQueryClient()
-  const initialTab = (new URLSearchParams(window.location.search).get('tab') as Tab | null) ?? 'nodes'
-  const [tab, setTab] = useState<Tab>(initialTab)
+
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tab = (searchParams.get('tab') ?? 'overview') as Tab
+  const rawSub = searchParams.get('sub') ?? ''
+  const settingsSub = rawSub || 'general'
+  const historySub = rawSub || 'events'
+
+  function goToTab(t: Tab) {
+    const defaults: Partial<Record<Tab, string>> = { settings: 'general', history: 'events' }
+    const sub = defaults[t]
+    setSearchParams(sub ? { tab: t, sub } : { tab: t })
+  }
+
+  function goToSub(s: string) {
+    setSearchParams({ tab, sub: s })
+  }
+
   const [showWizard, setShowWizard] = useState(false)
   const [editingNode, setEditingNode] = useState<Node | null>(null)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
-  const [showAgentMenu, setShowAgentMenu] = useState(false)
-  const agentMenuRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    if (!showAgentMenu) return
-    const handler = (e: MouseEvent) => {
-      if (agentMenuRef.current && !agentMenuRef.current.contains(e.target as HTMLElement)) {
-        setShowAgentMenu(false)
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [showAgentMenu])
   const [generatedCreds, setGeneratedCreds] = useState<GeneratedCredential[] | null>(null)
 
   const { data: cluster, isLoading: loadingCluster } = useQuery({
@@ -1805,8 +2088,6 @@ export default function ClusterDetail() {
 
   const connectedCount = nodes?.filter((n) => n.agent_status === 'connected').length ?? 0
 
-  // Prefer the live version reported by any connected node over the DB-stored cluster field,
-  // which may still be the coarse "4.x" value set at cluster creation.
   const netboxVersion =
     nodes?.find((n) => n.agent_status === 'connected' && n.netbox_version)?.netbox_version
     ?? cluster.netbox_version
@@ -1819,31 +2100,45 @@ export default function ClusterDetail() {
           Clusters
         </Link>
         <span>/</span>
-        <span className="text-white">{cluster.name}</span>
+        <button
+          onClick={() => goToTab('overview')}
+          className="text-white hover:text-gray-300 transition-colors"
+        >
+          {cluster.name}
+        </button>
       </div>
 
       {/* Header */}
       <div className="flex items-start justify-between mb-6">
         <div>
-          <h2 className="text-2xl font-semibold">{cluster.name}</h2>
-          <div className="flex items-center gap-3 mt-1 text-sm text-gray-400">
-            <span>{cluster.mode === 'active_standby' ? 'Active / Standby' : 'HA'}</span>
-            <span>·</span>
+          <button
+            onClick={() => goToTab('overview')}
+            className="text-2xl font-semibold hover:text-gray-300 transition-colors text-left"
+          >
+            {cluster.name}
+          </button>
+          {cluster.description && (
+            <p className="text-sm text-gray-400 mt-0.5">{cluster.description}</p>
+          )}
+          <div className="flex items-center gap-3 mt-1 text-sm text-gray-400 flex-wrap">
+            {cluster.vip && (
+              <>
+                <span className="font-mono text-xs">{cluster.vip}</span>
+                <span>·</span>
+              </>
+            )}
             <span>Patroni scope: <code className="font-mono text-xs">{cluster.patroni_scope}</code></span>
             <span>·</span>
             <span>NetBox {netboxVersion}</span>
+            <span>·</span>
+            <span>Created {new Date(cluster.created_at).toLocaleDateString()}</span>
             <span>·</span>
             <span className={cluster.auto_failover ? 'text-emerald-400' : 'text-gray-500'}>
               Auto-failover {cluster.auto_failover ? 'on' : 'off'}
             </span>
           </div>
         </div>
-        <button
-          onClick={() => setShowDeleteDialog(true)}
-          className="text-sm text-red-500 hover:text-red-400 border border-red-900 hover:border-red-700 px-3 py-1.5 rounded-lg transition-colors"
-        >
-          Delete cluster
-        </button>
+        <ClusterActionsDropdown clusterId={id!} onAddNode={() => setShowWizard(true)} />
       </div>
 
       {/* Stats row */}
@@ -1851,7 +2146,7 @@ export default function ClusterDetail() {
         {[
           { label: 'Nodes', value: nodes?.length ?? '—' },
           { label: 'Connected', value: connectedCount },
-          { label: 'Mode', value: cluster.mode === 'active_standby' ? 'A/S' : 'HA' },
+          { label: 'Mode', value: cluster.mode === 'active_standby' ? 'Active/Standby' : 'HA' },
         ].map((s) => (
           <div key={s.label} className="bg-gray-900 border border-gray-800 rounded-xl p-4">
             <p className="text-xs text-gray-500 mb-1">{s.label}</p>
@@ -1860,12 +2155,12 @@ export default function ClusterDetail() {
         ))}
       </div>
 
-      {/* Tabs */}
+      {/* Top-level tabs */}
       <div className="border-b border-gray-800 mb-6">
-        {(['nodes', 'database', 'settings', 'deployment', 'history', 'audit', 'logs'] as Tab[]).map((t) => (
+        {(['overview', 'settings', 'history'] as Tab[]).map((t) => (
           <button
             key={t}
-            onClick={() => setTab(t)}
+            onClick={() => goToTab(t)}
             className={`px-4 py-2 text-sm capitalize border-b-2 -mb-px transition-colors ${
               tab === t
                 ? 'border-blue-500 text-white'
@@ -1877,50 +2172,9 @@ export default function ClusterDetail() {
         ))}
       </div>
 
-      {/* Nodes tab */}
-      {tab === 'nodes' && (
-        <div>
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-medium">Nodes ({nodes?.length ?? 0})</h3>
-            <div className="flex gap-2">
-              {/* Download agent dropdown */}
-              <div className="relative" ref={agentMenuRef}>
-                <button
-                  onClick={() => setShowAgentMenu((v) => !v)}
-                  className="bg-gray-800 hover:bg-gray-700 text-sm px-3 py-2 rounded-lg transition-colors"
-                >
-                  Download agent ▾
-                </button>
-                {showAgentMenu && (
-                  <div className="absolute right-0 top-full mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-10 min-w-max">
-                    <a
-                      href="/api/v1/downloads/agent-linux-amd64"
-                      download
-                      onClick={() => setShowAgentMenu(false)}
-                      className="block px-4 py-2 text-sm hover:bg-gray-700 rounded-t-lg"
-                    >
-                      Linux amd64
-                    </a>
-                    <a
-                      href="/api/v1/downloads/agent-linux-arm64"
-                      download
-                      onClick={() => setShowAgentMenu(false)}
-                      className="block px-4 py-2 text-sm hover:bg-gray-700 rounded-b-lg"
-                    >
-                      Linux arm64
-                    </a>
-                  </div>
-                )}
-              </div>
-              <button
-                onClick={() => setShowWizard(true)}
-                className="bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-              >
-                + Add Node
-              </button>
-            </div>
-          </div>
-
+      {/* ── Overview tab ── */}
+      {tab === 'overview' && (
+        <div className="space-y-6">
           {loadingNodes ? (
             <p className="text-gray-500 text-sm">Loading…</p>
           ) : nodes && nodes.length > 0 ? (
@@ -1933,7 +2187,9 @@ export default function ClusterDetail() {
                     <th className="px-6 py-3 font-medium text-center">Active DB</th>
                     <th className="text-left px-6 py-3 font-medium">Role</th>
                     <th className="text-left px-6 py-3 font-medium">Agent</th>
-                    <th className="text-left px-6 py-3 font-medium">Services</th>
+                    <th className="text-left px-6 py-3 font-medium">Core</th>
+                    <th className="text-left px-6 py-3 font-medium">App Tier</th>
+                    <th className="text-left px-6 py-3 font-medium">DB Tier</th>
                     <th className="text-left px-6 py-3 font-medium">Priority</th>
                     <th className="px-4 py-3"></th>
                   </tr>
@@ -1956,82 +2212,116 @@ export default function ClusterDetail() {
               </button>
             </div>
           )}
+          {id && <WitnessRow clusterId={id} />}
         </div>
       )}
 
-      {/* Database tab */}
-      {tab === 'database' && id && (
-        <DatabaseTab clusterId={id} />
-      )}
-
-      {/* Deployment tab */}
-      {tab === 'deployment' && id && (
-        <DeploymentTab clusterId={id} />
-      )}
-
-      {/* Settings tab */}
+      {/* ── Settings tab ── */}
       {tab === 'settings' && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Cluster info */}
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-            <h3 className="font-medium mb-4">Cluster Info</h3>
-            <dl className="space-y-3 text-sm">
-              {[
-                { label: 'Mode', value: cluster.mode === 'active_standby' ? 'Active / Standby' : 'HA' },
-                { label: 'Patroni Scope', value: cluster.patroni_scope },
-                { label: 'NetBox Version', value: netboxVersion },
-                { label: 'VIP', value: cluster.vip ?? '—' },
-                { label: 'Created', value: new Date(cluster.created_at).toLocaleDateString() },
-              ].map(({ label, value }) => (
-                <div key={label} className="flex justify-between">
-                  <dt className="text-gray-500">{label}</dt>
-                  <dd className="text-gray-200 font-mono text-xs">{value}</dd>
-                </div>
-              ))}
-            </dl>
-          </div>
+        <div>
+          <SubTabBar tabs={SETTINGS_TABS} active={settingsSub} onChange={goToSub} />
 
-          {/* Credentials */}
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-            <div className="flex items-center justify-between mb-1">
-              <h3 className="font-medium">Credentials</h3>
-              <button
-                onClick={() => generateCreds.mutate()}
-                disabled={generateCreds.isPending}
-                className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 px-3 py-1 rounded-lg"
-              >
-                {generateCreds.isPending ? 'Generating…' : 'Auto-generate'}
-              </button>
+          {settingsSub === 'general' && (
+            <div className="space-y-6">
+              {/* NetBox Configuration */}
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+                <h3 className="font-medium mb-1">NetBox Configuration</h3>
+                <p className="text-xs text-gray-500 mb-4">
+                  Edit and push{' '}
+                  <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">configuration.py</code>{' '}
+                  to all nodes in this cluster.
+                </p>
+                <Link
+                  to={`/clusters/${id}/config`}
+                  className="inline-block bg-blue-600 hover:bg-blue-500 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+                >
+                  Open Config Editor →
+                </Link>
+              </div>
+
+              {/* Backup Retention */}
+              {id && <RetentionCard clusterId={id} />}
+
+              {/* File Sync */}
+              <FileSyncCard cluster={cluster} />
+
+              {/* Delete cluster */}
+              <div className="border-t border-gray-800 pt-6">
+                <h3 className="font-medium text-red-400 mb-1">Danger Zone</h3>
+                <p className="text-sm text-gray-500 mb-4">
+                  Permanently delete this cluster, all nodes, credentials, configuration, and history.
+                  This cannot be undone.
+                </p>
+                <button
+                  onClick={() => setShowDeleteDialog(true)}
+                  className="text-sm text-red-500 hover:text-red-400 border border-red-900 hover:border-red-700 px-4 py-2 rounded-lg transition-colors"
+                >
+                  Delete Cluster
+                </button>
+              </div>
             </div>
-            <p className="text-xs text-gray-500 mb-4">
-              Passwords are stored AES-256-GCM encrypted. Only the server decrypts them at render time.
-            </p>
-            {CRED_KINDS.map((kind) => (
-              <CredentialRow
-                key={kind}
-                kind={kind}
-                cred={credentials?.find((c) => c.kind === kind)}
-                clusterId={id!}
-              />
-            ))}
-          </div>
+          )}
 
-          {/* Failover */}
-          <FailoverCard cluster={cluster} nodes={nodes} />
+          {settingsSub === 'credentials' && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="font-medium">Credentials</h3>
+                <button
+                  onClick={() => generateCreds.mutate()}
+                  disabled={generateCreds.isPending}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 px-3 py-1 rounded-lg"
+                >
+                  {generateCreds.isPending ? 'Generating…' : 'Auto-generate'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mb-4">
+                Passwords are stored AES-256-GCM encrypted. Only the server decrypts them at render time.
+              </p>
+              {CRED_KINDS.map((kind) => (
+                <CredentialRow
+                  key={kind}
+                  kind={kind}
+                  cred={credentials?.find((c) => c.kind === kind)}
+                  clusterId={id!}
+                />
+              ))}
+            </div>
+          )}
 
-          {/* Media Sync */}
-          <MediaSyncCard cluster={cluster} />
+          {settingsSub === 'failover' && (
+            <FailoverCard cluster={cluster} nodes={nodes} />
+          )}
         </div>
       )}
 
-      {tab === 'history' && (
-        <FailoverHistoryTab events={failoverEvents ?? []} />
+      {/* ── History tab ── */}
+      {tab === 'history' && id && (
+        <div>
+          <SubTabBar tabs={HISTORY_TABS} active={historySub} onChange={goToSub} />
+
+          {historySub === 'events' && (
+            <FailoverHistoryTab events={failoverEvents ?? []} />
+          )}
+
+          {historySub === 'api-history' && (
+            <AuditTab clusterId={id} />
+          )}
+
+          {historySub === 'cluster-logs' && (
+            <ClusterLogsTab clusterId={id} />
+          )}
+
+          {historySub === 'node-logs' && (
+            <NodeLogsTab clusterId={id} nodes={nodes ?? []} />
+          )}
+
+          {historySub === 'db-events' && (
+            <DatabaseEventsTab clusterId={id} />
+          )}
+        </div>
       )}
 
-      {tab === 'audit' && id && <AuditTab clusterId={id} />}
-
-      {tab === 'logs' && id && <LogsTab clusterId={id} />}
-
+      {/* Modals */}
       {showWizard && (
         <AddNodeWizard
           clusterId={id!}
