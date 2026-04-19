@@ -67,6 +67,7 @@ type configResponse struct {
 	PushedAt       *string `json:"pushed_at,omitempty"`
 	PushStatus     *string `json:"push_status,omitempty"`
 	CreatedAt      string  `json:"created_at"`
+	IsDefault      bool    `json:"is_default"`
 }
 
 func toConfigResponse(c *queries.NetboxConfig) configResponse {
@@ -104,6 +105,7 @@ func (h *ConfigHandler) GetOrCreate(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 
+	isDefault := false
 	cfg, err := h.configs.GetLatest(ctx, clusterID)
 	if err != nil {
 		// None yet — ensure cluster exists, then auto-create
@@ -114,7 +116,11 @@ func (h *ConfigHandler) GetOrCreate(c echo.Context) error {
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to create default config")
 		}
+		isDefault = true
 	}
+
+	cfgResp := toConfigResponse(cfg)
+	cfgResp.IsDefault = isDefault
 
 	overrides, _ := h.configs.ListOverrides(ctx, cfg.ID)
 	overrideSlice := make([]overrideResp, 0, len(overrides))
@@ -128,7 +134,7 @@ func (h *ConfigHandler) GetOrCreate(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"config":    toConfigResponse(cfg),
+		"config":    cfgResp,
 		"overrides": overrideSlice,
 	})
 }

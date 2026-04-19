@@ -1164,7 +1164,7 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
     queryKey: ['config', cluster.id],
     queryFn: () => configsApi.getOrCreate(cluster.id),
   })
-  const hasConfigTemplate = !!configData?.config?.config_template?.trim()
+  const hasConfigTemplate = !!configData && !configData.config?.is_default
 
   const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
   const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)

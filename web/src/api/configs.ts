@@ -9,6 +9,7 @@ export interface NetboxConfig {
   pushed_at?: string
   push_status?: string
   created_at: string
+  is_default?: boolean
 }
 
 export interface ConfigOverride {
