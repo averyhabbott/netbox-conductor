@@ -35,7 +35,7 @@ END $$;`,
 		params.RoleName, opts, params.Password,
 		params.RoleName, opts, params.Password)
 
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(120 * time.Second)
 	for {
 		cmd := exec.Command("sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-c", sql)
 		out, err := cmd.CombinedOutput()
@@ -51,10 +51,13 @@ END $$;`,
 }
 
 // pgIsUnavailable returns true when psql/pg_dump output indicates PostgreSQL
-// is not yet listening — the caller should retry rather than fail permanently.
+// is not yet ready — the caller should retry rather than fail permanently.
 func pgIsUnavailable(out []byte) bool {
 	s := string(out)
 	return strings.Contains(s, "No such file or directory") ||
 		strings.Contains(s, "Connection refused") ||
-		strings.Contains(s, "could not connect")
+		strings.Contains(s, "could not connect") ||
+		strings.Contains(s, "the database system is starting up") ||
+		strings.Contains(s, "the database system is in recovery mode") ||
+		strings.Contains(s, "cannot execute") // read-only standby during Patroni leader election
 }

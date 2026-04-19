@@ -115,10 +115,10 @@ else
   echo "  WARNING: no supported package manager found — install patroni and redis-sentinel manually"
 fi
 
-# Stop and disable the stock postgresql service — Patroni manages PostgreSQL exclusively.
-# On Debian/Ubuntu, both services try to own the same data directory; the stock service
-# must be stopped before Patroni can start postgres cleanly.
-systemctl stop postgresql 2>/dev/null || true
+# Disable the stock postgresql service so it does not restart on reboot.
+# Do NOT stop it here — Configure Failover dispatches postgres.create_role tasks
+# before starting Patroni, so roles are created against the still-running stock
+# instance. Patroni will adopt the running postgres when it starts.
 systemctl disable postgresql 2>/dev/null || true
 
 # Patroni raft data directory — patroni runs as postgres, which cannot create dirs
@@ -160,9 +160,13 @@ systemctl enable patroni 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 
 # ── Redis/Sentinel configuration directory ───────────────────────────────────
-# Add agent to the redis group for sentinel.conf write access
+# Add agent to the redis group for sentinel.conf write access, and to the
+# postgres group for local socket access when creating PostgreSQL roles.
 if getent group redis >/dev/null 2>&1; then
   usermod -aG redis netbox-agent
+fi
+if getent group postgres >/dev/null 2>&1; then
+  usermod -aG postgres netbox-agent
 fi
 
 echo "→ Installing sudoers drop-in"

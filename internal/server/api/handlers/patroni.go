@@ -1262,6 +1262,45 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// Create/update PostgreSQL roles before starting Patroni. Dispatching these
+	// tasks first ensures they run against the still-running stock PostgreSQL
+	// instance, avoiding the race where Patroni is mid-bootstrap when psql runs.
+	// The pgrole executor retries for up to 120 seconds as a safety net.
+	rp, _ := json.Marshal(protocol.CreatePgRoleParams{
+		RoleName: replicaUser,
+		Password: replicaPass,
+		Options:  []string{"LOGIN", "REPLICATION"},
+	})
+	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 150); err != nil {
+		dispatchWarn(err, "create replicator role")
+	}
+	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
+		RoleName: superUser,
+		Password: superPass,
+		Options:  []string{},
+	})
+	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 150); err != nil {
+		dispatchWarn(err, "set postgres superuser password")
+	}
+
+	// Optional database backup — runs before Patroni restart so the database is
+	// in a clean, writable state when pg_dump executes.
+	var backupTask *taskRef
+	if req.SaveBackup {
+		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
+		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
+		if err != nil {
+			dispatchWarn(err, "backup")
+		} else {
+			backupTask = &taskRef{
+				NodeID:   primaryNode.ID.String(),
+				Hostname: primaryNode.Hostname,
+				TaskID:   tid,
+				Status:   "dispatched",
+			}
+		}
+	}
+
 	// Push patroni.yml to every node, then restart Patroni.
 	// Tasks are dispatched in order: install → write_config → restart.
 	// The agent serializes tasks in a queue, so each step completes before the
@@ -1340,47 +1379,6 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				NodeID: node.ID.String(), Hostname: node.Hostname,
 				TaskID: tid, Status: "dispatched",
 			})
-		}
-	}
-
-	// Create/update PostgreSQL roles after Patroni restarts — these tasks queue
-	// behind the Patroni restart on the primary node's task queue, so PostgreSQL
-	// will be running when they execute. Patroni's bootstrap.users only fires
-	// during initdb and is skipped on existing clusters, so roles must be
-	// created explicitly here. Both tasks are idempotent.
-	rp, _ := json.Marshal(protocol.CreatePgRoleParams{
-		RoleName: replicaUser,
-		Password: replicaPass,
-		Options:  []string{"LOGIN", "REPLICATION"},
-	})
-	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 30); err != nil {
-		dispatchWarn(err, "create replicator role")
-	}
-	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
-		RoleName: superUser,
-		Password: superPass,
-		Options:  []string{},
-	})
-	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 30); err != nil {
-		dispatchWarn(err, "set postgres superuser password")
-	}
-
-	// Optional database backup — dispatched after role creation so PostgreSQL is
-	// running and the superuser password is set when pg_dump executes.
-	// Fire-and-forget: the operator can track progress via the task list.
-	var backupTask *taskRef
-	if req.SaveBackup {
-		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
-		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
-		if err != nil {
-			dispatchWarn(err, "backup")
-		} else {
-			backupTask = &taskRef{
-				NodeID:   primaryNode.ID.String(),
-				Hostname: primaryNode.Hostname,
-				TaskID:   tid,
-				Status:   "dispatched",
-			}
 		}
 	}
 
