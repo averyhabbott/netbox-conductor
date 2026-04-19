@@ -23,6 +23,9 @@ const (
 // parallel restore, and allows selective table restores — better than plain SQL
 // for the typical NetBox database sizes.
 //
+// Retries for up to 60 seconds when PostgreSQL is not yet accepting connections
+// (common when this task runs immediately after a Patroni restart).
+//
 // The full path of the dump file is returned as the task output so it can be
 // surfaced in the conductor UI and used by the future restore-from-backup feature.
 func RunDBBackup(params protocol.DBBackupParams) (string, error) {
@@ -52,21 +55,30 @@ func RunDBBackup(params protocol.DBBackupParams) (string, error) {
 	// Run pg_dump as the postgres OS user so peer authentication works without
 	// needing a password. The -U flag selects the Postgres role; peer auth maps
 	// the OS user (postgres) to that role when they match.
-	cmd := exec.Command(
-		"sudo", "-u", "postgres",
-		"pg_dump",
-		"-Fc",
-		"-U", dbUser,
-		"-f", destPath,
-		"-v",
-		dbName,
-	)
-	cmd.Env = os.Environ()
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// Remove the partial dump so it is not mistaken for a valid backup.
+	// Retries until PostgreSQL is available or the deadline is reached.
+	deadline := time.Now().Add(60 * time.Second)
+	var out []byte
+	var err error
+	for {
+		cmd := exec.Command(
+			"sudo", "-u", "postgres",
+			"pg_dump",
+			"-Fc",
+			"-U", dbUser,
+			"-f", destPath,
+			"-v",
+			dbName,
+		)
+		cmd.Env = os.Environ()
+		out, err = cmd.CombinedOutput()
+		if err == nil {
+			break
+		}
 		_ = os.Remove(destPath)
+		if pgIsUnavailable(out) && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Second)
+			continue
+		}
 		return string(out), fmt.Errorf("pg_dump failed: %w\n%s", err, out)
 	}
 

@@ -1143,7 +1143,7 @@ function FailoverToggle({
   )
 }
 
-function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) {
+function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; nodes?: Node[]; onOpenSyncModal: () => void }) {
   const qc = useQueryClient()
 
   const [autoFailover, setAutoFailover] = useState(cluster.auto_failover)
@@ -1157,7 +1157,14 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
   const [primaryNodeId, setPrimaryNodeId] = useState('')
 
   const [showWarning, setShowWarning] = useState(false)
+  const [showNoConfigWarning, setShowNoConfigWarning] = useState(false)
   const [result, setResult] = useState<ConfigureFailoverResult | null>(null)
+
+  const { data: configData } = useQuery({
+    queryKey: ['config', cluster.id],
+    queryFn: () => configsApi.getOrCreate(cluster.id),
+  })
+  const hasConfigTemplate = !!configData?.config?.config_template?.trim()
 
   const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
   const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)
@@ -1220,7 +1227,9 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
     Math.max(1, parseInt(failbackMultiplier, 10) || 3)
 
   function handleConfigureClick() {
-    if (cluster.patroni_configured) {
+    if (!hasConfigTemplate) {
+      setShowNoConfigWarning(true)
+    } else if (cluster.patroni_configured) {
       setShowWarning(true)
     } else {
       configure.mutate()
@@ -1504,6 +1513,44 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
               >
                 Follow →
               </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* No config template warning modal */}
+      {showNoConfigWarning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-md w-full shadow-2xl">
+            <h4 className="font-semibold text-gray-100 mb-2">No configuration synced</h4>
+            <p className="text-sm text-gray-400 mb-4">
+              No <code className="text-gray-300">configuration.py</code> template has been saved for
+              this cluster. Configure Failover will generate credentials but won't be able to push an
+              updated config to nodes — run the Sync Config utility first to capture the live config.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowNoConfigWarning(false)
+                  if (cluster.patroni_configured) {
+                    setShowWarning(true)
+                  } else {
+                    configure.mutate()
+                  }
+                }}
+                className="text-sm px-4 py-1.5 rounded-lg bg-red-700 hover:bg-red-600 text-white transition-colors font-medium"
+              >
+                Proceed anyway
+              </button>
+              <button
+                onClick={() => {
+                  setShowNoConfigWarning(false)
+                  onOpenSyncModal()
+                }}
+                className="text-sm px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors font-medium"
+              >
+                Sync Config
+              </button>
             </div>
           </div>
         </div>
@@ -2730,7 +2777,7 @@ export default function ClusterDetail() {
           )}
 
           {settingsSub === 'failover' && (
-            <FailoverCard cluster={cluster} nodes={nodes} />
+            <FailoverCard cluster={cluster} nodes={nodes} onOpenSyncModal={() => setShowSyncModal(true)} />
           )}
         </div>
       )}
