@@ -1399,47 +1399,6 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
           </div>
         )}
 
-        {/* Result panel */}
-        {result && (
-          <div className="mt-4 p-4 bg-gray-800/60 border border-gray-700 rounded-lg text-xs space-y-2">
-            <p className="text-emerald-400 font-medium">Configuration dispatched</p>
-            <p className="text-gray-400">Primary: <span className="text-gray-200">{result.primary_node}</span></p>
-            {result.witness_addr && (
-              <p className="text-gray-400">Witness: <span className="text-gray-200">{result.witness_addr}</span></p>
-            )}
-            {result.backup_task && (
-              <p className="text-gray-400">
-                Backup task: <span className="text-gray-200">{result.backup_task.task_id}</span>
-                {' '}on {result.backup_task.hostname}
-              </p>
-            )}
-            <p className="text-gray-400">
-              Patroni tasks: <span className="text-gray-200">{result.patroni_tasks.length}</span>
-              {result.sentinel_tasks.length > 0 && (
-                <>, Sentinel tasks: <span className="text-gray-200">{result.sentinel_tasks.length}</span></>
-              )}
-            </p>
-            {result.warnings.length > 0 && (
-              <ul className="text-amber-400 space-y-0.5">
-                {result.warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
-              </ul>
-            )}
-            <div className="flex items-center gap-4 mt-1">
-              <button
-                onClick={() => setResult(null)}
-                className="text-gray-500 hover:text-gray-300 text-xs"
-              >
-                Dismiss
-              </button>
-              <Link
-                to={`?tab=history&sub=cluster-logs`}
-                className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
-              >
-                Follow →
-              </Link>
-            </div>
-          </div>
-        )}
 
         {/* Push results */}
         {(patroniPushResult || sentinelPushResult) && (
@@ -1502,6 +1461,53 @@ function FailoverCard({ cluster, nodes }: { cluster: Cluster; nodes?: Node[] }) 
           </div>
         </div>
       </div>
+
+      {/* Configure Failover result modal */}
+      {result && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-md w-full shadow-2xl">
+            <h4 className="font-semibold text-emerald-400 mb-3">Configuration dispatched</h4>
+            <div className="text-sm space-y-1.5 mb-4">
+              <p className="text-gray-400">Primary: <span className="text-gray-200">{result.primary_node}</span></p>
+              {result.witness_addr && (
+                <p className="text-gray-400">Witness: <span className="text-gray-200">{result.witness_addr}</span></p>
+              )}
+              {result.backup_task && (
+                <p className="text-gray-400">
+                  Backup task: <span className="text-gray-200 font-mono text-xs">{result.backup_task.task_id}</span>
+                  {' '}on {result.backup_task.hostname}
+                </p>
+              )}
+              <p className="text-gray-400">
+                Patroni tasks: <span className="text-gray-200">{result.patroni_tasks.length}</span>
+                {result.sentinel_tasks.length > 0 && (
+                  <>, Sentinel tasks: <span className="text-gray-200">{result.sentinel_tasks.length}</span></>
+                )}
+              </p>
+            </div>
+            {result.warnings.length > 0 && (
+              <ul className="text-amber-400 text-sm space-y-0.5 mb-4">
+                {result.warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
+              </ul>
+            )}
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setResult(null)}
+                className="text-sm px-4 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors"
+              >
+                Dismiss
+              </button>
+              <Link
+                to={`?tab=history&sub=cluster-logs`}
+                onClick={() => setResult(null)}
+                className="text-sm px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors font-medium"
+              >
+                Follow →
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Restart warning modal */}
       {showWarning && (
