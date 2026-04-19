@@ -1213,6 +1213,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 
 	// Helper: create + dispatch a task, advance to sent on success.
+	// When the node is offline the task is still written to the DB and will be
+	// sent automatically when the agent reconnects — it is not lost.
 	dispatch := func(nodeID uuid.UUID, taskType protocol.TaskType, params []byte, timeoutSecs int) (string, error) {
 		tid := uuid.New()
 		_ = h.taskResults.Create(ctx, nodeID, tid, string(taskType), params)
@@ -1228,6 +1230,17 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		return tid.String(), nil
 	}
 
+	// dispatchWarn appends a warning when dispatch fails. If the node is simply
+	// offline the task is already queued in the DB, so the message says "queued"
+	// rather than "failed" to avoid implying the task was dropped.
+	dispatchWarn := func(err error, label string) {
+		if strings.Contains(err.Error(), "is not connected") {
+			warnings = append(warnings, label+" — node offline, task queued and will run on reconnect")
+		} else {
+			warnings = append(warnings, label+": "+err.Error())
+		}
+	}
+
 	// Stop NetBox on all non-primary nodes before configuring Patroni.
 	// This prevents split-brain while Patroni is being reconfigured. The primary
 	// keeps running so operators don't see an outage during the config push.
@@ -1240,7 +1253,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 		stopParams, _ := json.Marshal(struct{}{})
 		if tid, err := dispatch(node.ID, protocol.TaskStopNetbox, stopParams, 30); err != nil {
-			warnings = append(warnings, fmt.Sprintf("stop-netbox dispatch failed for %s: %v", node.Hostname, err))
+			dispatchWarn(err, fmt.Sprintf("stop-netbox for %s", node.Hostname))
 		} else {
 			stopTasks = append(stopTasks, taskRef{
 				NodeID: node.ID.String(), Hostname: node.Hostname,
@@ -1341,7 +1354,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		Options:  []string{"LOGIN", "REPLICATION"},
 	})
 	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 30); err != nil {
-		warnings = append(warnings, "create replicator role dispatch failed: "+err.Error())
+		dispatchWarn(err, "create replicator role")
 	}
 	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
 		RoleName: superUser,
@@ -1349,7 +1362,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		Options:  []string{},
 	})
 	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 30); err != nil {
-		warnings = append(warnings, "set postgres superuser password dispatch failed: "+err.Error())
+		dispatchWarn(err, "set postgres superuser password")
 	}
 
 	// Optional database backup — dispatched after role creation so PostgreSQL is
@@ -1360,8 +1373,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
 		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf(
-				"backup dispatch failed (primary not connected?): %v — proceeding without backup", err))
+			dispatchWarn(err, "backup")
 		} else {
 			backupTask = &taskRef{
 				NodeID:   primaryNode.ID.String(),
