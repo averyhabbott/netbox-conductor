@@ -409,17 +409,12 @@ func (h *NodeHandler) GenerateRegToken(c echo.Context) error {
 		wsURL = "wss://your-conductor"
 	}
 	envSnippet := fmt.Sprintf(
-		"# — Required ————————————————————————————————————————————————————————\n\n"+
-			"# Assigned by the conductor during node registration\n"+
+		"# Assigned by the conductor during node registration\n"+
 			"AGENT_NODE_ID=%s\n\n"+
 			"# Bearer token for WebSocket authentication\n"+
 			"AGENT_TOKEN=%s\n\n"+
 			"# Conductor WebSocket URL — must use wss:// and include the port if not on 443\n"+
-			"AGENT_SERVER_URL=%s/api/v1/agent/connect\n\n"+
-			"# — TLS ─────────────────────────────────────────────────────────────\n\n"+
-			"# On first start the agent downloads the conductor's CA cert automatically.\n"+
-			"# Set to false once the cert has been saved (/etc/netbox-agent/ca.crt).\n"+
-			"UPDATE_CERT=true",
+			"AGENT_SERVER_URL=%s/api/v1/agent/connect",
 		node.ID.String(), rawToken, wsURL)
 
 	return c.JSON(http.StatusOK, map[string]any{

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1215,20 +1216,25 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// Helper: create + dispatch a task, advance to sent on success.
 	// When the node is offline the task is still written to the DB and will be
 	// sent automatically when the agent reconnects — it is not lost.
-	dispatch := func(nodeID uuid.UUID, taskType protocol.TaskType, params []byte, timeoutSecs int) (string, error) {
-		tid := uuid.New()
-		_ = h.taskResults.Create(ctx, nodeID, tid, string(taskType), params)
-		if err := h.dispatcher.Dispatch(nodeID, protocol.TaskDispatchPayload{
-			TaskID:      tid.String(),
-			TaskType:    taskType,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: timeoutSecs,
-		}); err != nil {
-			return "", err
+	// useCtx is separated from the request ctx so the goroutine below can pass
+	// context.Background() after the HTTP response has been sent.
+	mkDispatch := func(useCtx context.Context) func(uuid.UUID, protocol.TaskType, []byte, int) (string, error) {
+		return func(nodeID uuid.UUID, taskType protocol.TaskType, params []byte, timeoutSecs int) (string, error) {
+			tid := uuid.New()
+			_ = h.taskResults.Create(useCtx, nodeID, tid, string(taskType), params)
+			if err := h.dispatcher.Dispatch(nodeID, protocol.TaskDispatchPayload{
+				TaskID:      tid.String(),
+				TaskType:    taskType,
+				Params:      json.RawMessage(params),
+				TimeoutSecs: timeoutSecs,
+			}); err != nil {
+				return "", err
+			}
+			_ = h.taskResults.SetSent(useCtx, tid)
+			return tid.String(), nil
 		}
-		_ = h.taskResults.SetSent(ctx, tid)
-		return tid.String(), nil
 	}
+	dispatch := mkDispatch(ctx)
 
 	// dispatchWarn appends a warning when dispatch fails. If the node is simply
 	// offline the task is already queued in the DB, so the message says "queued"
@@ -1301,38 +1307,33 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
-	// Push patroni.yml to every node, then restart Patroni.
-	// Tasks are dispatched in order: install → write_config → restart.
-	// The agent serializes tasks in a queue, so each step completes before the
-	// next begins — install finishes before write_config, write_config before restart.
-	patroniTasks := make([]taskRef, 0, len(nodes)*3)
-	for _, node := range nodes {
+	masterHost := stripCIDR(primaryNode.IPAddress)
+
+	// Fetch the latest config template once — used for both primary and replica dispatch.
+	latestCfg, cfgFetchErr := h.configs.GetLatest(ctx, clusterID)
+	if cfgFetchErr != nil {
+		warnings = append(warnings, "no configuration template found — credentials saved but configuration.py not pushed; use Config Editor or Sync Config to apply")
+	}
+
+	// dispatchPatroniForNode renders and dispatches install→write_config→restart for one node.
+	dispatchPatroniForNode := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) []taskRef {
+		refs := make([]taskRef, 0, 3)
 		nodeIP := stripCIDR(node.IPAddress)
 
-		// Step 1: Install Patroni (idempotent — apt/yum no-ops if already installed).
-		// Uses a generous 5-minute timeout; package installs can be slow.
 		installParams, _ := json.Marshal(protocol.PatroniInstallParams{})
-		if tid, err := dispatch(node.ID, protocol.TaskInstallPatroni, installParams, 300); err != nil {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "offline", Error: "install dispatch: " + err.Error(),
-			})
-			continue // skip write_config and restart if node is unreachable
-		} else {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				TaskID: tid, Status: "dispatched",
-			})
+		tid, err := d(node.ID, protocol.TaskInstallPatroni, installParams, 300)
+		if err != nil {
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: "install: " + err.Error()})
+			return refs
 		}
+		refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"})
 
-		// Per-node partner list excludes self
 		partners := make([]string, 0, len(raftPeers)-1)
 		for _, p := range raftPeers {
 			if !strings.HasPrefix(p, nodeIP+":") {
 				partners = append(partners, p)
 			}
 		}
-
 		content, err := configgen.RenderPatroni(configgen.PatroniInput{
 			Scope:         cluster.PatroniScope,
 			NodeName:      node.Hostname,
@@ -1348,46 +1349,26 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			DBReplicaPass: replicaPass,
 		})
 		if err != nil {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "error", Error: "render: " + err.Error(),
-			})
-			continue
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()})
+			return refs
 		}
-
-		cfgParams, _ := json.Marshal(protocol.PatroniConfigWriteParams{Content: content})
-		if tid, err := dispatch(node.ID, protocol.TaskWritePatroniConf, cfgParams, 30); err != nil {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "offline", Error: err.Error(),
-			})
+		cfgP, _ := json.Marshal(protocol.PatroniConfigWriteParams{Content: content})
+		if tid, err := d(node.ID, protocol.TaskWritePatroniConf, cfgP, 30); err != nil {
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: err.Error()})
 		} else {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				TaskID: tid, Status: "dispatched",
-			})
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"})
 		}
-
-		restartParams, _ := json.Marshal(struct{}{})
-		if tid, err := dispatch(node.ID, protocol.TaskRestartPatroni, restartParams, 60); err != nil {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "offline", Error: "restart: " + err.Error(),
-			})
+		restartP, _ := json.Marshal(struct{}{})
+		if tid, err := d(node.ID, protocol.TaskRestartPatroni, restartP, 60); err != nil {
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: "restart: " + err.Error()})
 		} else {
-			patroniTasks = append(patroniTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				TaskID: tid, Status: "dispatched",
-			})
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"})
 		}
+		return refs
 	}
 
-	// Push Sentinel config to all nodes. sentinel.conf must match configuration.py
-	// (which always uses PatroniScope as the service name), regardless of whether
-	// app_tier_always_available is set.
-	sentinelTasks := make([]taskRef, 0, len(nodes))
-	masterHost := stripCIDR(primaryNode.IPAddress)
-	for _, node := range nodes {
+	// dispatchSentinelForNode dispatches sentinel.write_config for one node.
+	dispatchSentinelForNode := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) taskRef {
 		nodeIP := stripCIDR(node.IPAddress)
 		content, sha256hex, err := configgen.RenderSentinel(configgen.SentinelInput{
 			Scope:      cluster.PatroniScope,
@@ -1396,100 +1377,107 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			Password:   redisPassword,
 		})
 		if err != nil {
-			sentinelTasks = append(sentinelTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "error", Error: "render: " + err.Error(),
-			})
-			continue
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()}
 		}
-		sParams, _ := json.Marshal(protocol.SentinelConfigWriteParams{
-			Content:      content,
-			Sha256:       sha256hex,
-			RestartAfter: true,
-		})
-		if tid, err := dispatch(node.ID, protocol.TaskWriteSentinelConf, sParams, 30); err != nil {
-			sentinelTasks = append(sentinelTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "offline", Error: err.Error(),
-			})
+		sParams, _ := json.Marshal(protocol.SentinelConfigWriteParams{Content: content, Sha256: sha256hex, RestartAfter: true})
+		if tid, err := d(node.ID, protocol.TaskWriteSentinelConf, sParams, 30); err != nil {
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: err.Error()}
 		} else {
-			sentinelTasks = append(sentinelTasks, taskRef{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				TaskID: tid, Status: "dispatched",
-			})
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"}
 		}
 	}
 
-	// For app_tier_always_available clusters, pre-set DATABASE.HOST on every
-	// node to the identified primary's IP. This ensures all NetBox instances
-	// connect to the correct primary before Patroni finishes electing a leader.
-	// RestartAfter=false here — the config push below restarts netbox/netbox-rq
-	// on all nodes with the fully updated configuration.
+	// dispatchConfigForNode dispatches config.write for one node.
+	dispatchConfigForNode := func(useCtx context.Context, d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) taskRef {
+		if cfgFetchErr != nil {
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "skipped", Error: "no config template"}
+		}
+		input, err := renderInputFor(useCtx, h.clusters, h.creds, h.nodes, h.enc, clusterID, node.ID)
+		if err != nil {
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: err.Error()}
+		}
+		content, sha256hex, err := configgen.Render(latestCfg.ConfigTemplate, input)
+		if err != nil {
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()}
+		}
+		cfgParams, _ := json.Marshal(protocol.ConfigWriteParams{Content: content, Sha256: sha256hex, BackupExisting: true, RestartAfter: true})
+		if tid, err := d(node.ID, protocol.TaskWriteConfig, cfgParams, 60); err != nil {
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: err.Error()}
+		} else {
+			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"}
+		}
+	}
+
+	// Phase 1 (synchronous): Dispatch Patroni→Sentinel→config tasks to the primary only.
+	// Patroni tasks are dispatched in order: install → write_config → restart.
+	// The agent serializes tasks in a queue, so each step completes before the next begins.
+	patroniTasks := dispatchPatroniForNode(dispatch, *primaryNode)
+
+	// Push Sentinel config to the primary. sentinel.conf must match configuration.py
+	// (which always uses PatroniScope as the service name).
+	sentinelTasks := []taskRef{dispatchSentinelForNode(dispatch, *primaryNode)}
+
+	// For app_tier_always_available clusters, pre-set DATABASE.HOST on every node.
+	// RestartAfter=false here — the config push below restarts netbox/netbox-rq.
 	if req.AppTierAlwaysAvailable {
 		primaryIP := stripCIDR(primaryNode.IPAddress)
-		dbParams, _ := json.Marshal(protocol.DBHostUpdateParams{
-			Host:         primaryIP,
-			RestartAfter: false,
-		})
+		dbParams, _ := json.Marshal(protocol.DBHostUpdateParams{Host: primaryIP, RestartAfter: false})
 		for _, node := range nodes {
 			tid, err := dispatch(node.ID, protocol.TaskUpdateDBHost, dbParams, 30)
 			if err != nil {
-				slog.Warn("configure-failover: db-host-update dispatch failed",
-					"node", node.Hostname, "error", err)
-				warnings = append(warnings, fmt.Sprintf(
-					"db-host-update dispatch failed for %s: %v", node.Hostname, err))
+				slog.Warn("configure-failover: db-host-update dispatch failed", "node", node.Hostname, "error", err)
+				warnings = append(warnings, fmt.Sprintf("db-host-update dispatch failed for %s: %v", node.Hostname, err))
 			} else {
-				slog.Info("configure-failover: db-host-update dispatched",
-					"node", node.Hostname, "host", primaryIP, "task", tid)
+				slog.Info("configure-failover: db-host-update dispatched", "node", node.Hostname, "host", primaryIP, "task", tid)
 			}
 		}
 	}
 
-	// Push a full configuration.py to all nodes with the current credentials.
-	// This ensures the REDIS section (and any other credential-bearing sections)
-	// reflects the credentials that were just generated or already stored.
-	// restart_after=true so netbox-rq picks up the new Redis passwords immediately.
+	// Push full configuration.py to the primary.
 	var configTasks []taskRef
-	if latestCfg, cfgErr := h.configs.GetLatest(ctx, clusterID); cfgErr != nil {
-		warnings = append(warnings, "no configuration template found — credentials saved but configuration.py not pushed; use Config Editor or Sync Config to apply")
-	} else {
-		configTasks = make([]taskRef, 0, len(nodes))
-		for _, node := range nodes {
-			input, err := renderInputFor(ctx, h.clusters, h.creds, h.nodes, h.enc, clusterID, node.ID)
-			if err != nil {
-				configTasks = append(configTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					Status: "error", Error: err.Error(),
-				})
-				continue
-			}
-			content, sha256hex, err := configgen.Render(latestCfg.ConfigTemplate, input)
-			if err != nil {
-				configTasks = append(configTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					Status: "error", Error: "render: " + err.Error(),
-				})
-				continue
-			}
-			cfgParams, _ := json.Marshal(protocol.ConfigWriteParams{
-				Content:        content,
-				Sha256:         sha256hex,
-				BackupExisting: true,
-				RestartAfter:   true,
-			})
-			tid, err := dispatch(node.ID, protocol.TaskWriteConfig, cfgParams, 60)
-			if err != nil {
-				configTasks = append(configTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					Status: "offline", Error: err.Error(),
-				})
-			} else {
-				configTasks = append(configTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					TaskID: tid, Status: "dispatched",
-				})
-			}
+	if cfgFetchErr == nil {
+		configTasks = []taskRef{dispatchConfigForNode(ctx, dispatch, *primaryNode)}
+	}
+
+	// Phase 2 (background): Once the primary is confirmed as Patroni leader via its
+	// REST API, dispatch Patroni→Sentinel→config tasks to each replica. This prevents
+	// a race where a replica with an existing PostgreSQL data directory wins the initial
+	// Raft leader election before the intended primary can establish itself.
+	replicaNodes := make([]queries.Node, 0, len(nodes)-1)
+	for _, node := range nodes {
+		if node.ID != primaryNode.ID {
+			replicaNodes = append(replicaNodes, node)
 		}
+	}
+	if len(replicaNodes) > 0 {
+		go func(replicas []queries.Node, primaryIP, restU, restP string) {
+			bgCtx := context.Background()
+			bgDispatch := mkDispatch(bgCtx)
+
+			// Poll GET /primary — returns 200 when this node is the Patroni leader.
+			deadline := time.Now().Add(90 * time.Second)
+			for time.Now().Before(deadline) {
+				url := fmt.Sprintf("http://%s:8008/primary", primaryIP)
+				req, err := http.NewRequestWithContext(bgCtx, http.MethodGet, url, nil)
+				if err == nil {
+					req.SetBasicAuth(restU, restP)
+					resp, err := http.DefaultClient.Do(req)
+					if err == nil {
+						resp.Body.Close()
+						if resp.StatusCode == http.StatusOK {
+							break
+						}
+					}
+				}
+				time.Sleep(5 * time.Second)
+			}
+
+			for _, node := range replicas {
+				dispatchPatroniForNode(bgDispatch, node)
+				dispatchSentinelForNode(bgDispatch, node)
+				dispatchConfigForNode(bgCtx, bgDispatch, node)
+			}
+		}(replicaNodes, masterHost, restUser, restPass)
 	}
 
 	if err := h.clusters.SetPatroniConfigured(ctx, clusterID); err != nil {
@@ -1508,16 +1496,17 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	)
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id":          clusterID.String(),
-		"witness_addr":        witnessAddr,
-		"primary_node":        primaryNode.Hostname,
-		"started_at":          startedAt.UTC().Format(time.RFC3339),
-		"backup_task":         backupTask,
-		"stop_tasks":          stopTasks,
-		"patroni_tasks":       patroniTasks,
-		"sentinel_tasks":      sentinelTasks,
-		"config_tasks":        configTasks,
-		"warnings":            warnings,
+		"cluster_id":                  clusterID.String(),
+		"witness_addr":                witnessAddr,
+		"primary_node":                primaryNode.Hostname,
+		"started_at":                  startedAt.UTC().Format(time.RFC3339),
+		"backup_task":                 backupTask,
+		"stop_tasks":                  stopTasks,
+		"patroni_tasks":               patroniTasks,
+		"sentinel_tasks":              sentinelTasks,
+		"config_tasks":                configTasks,
+		"patroni_replica_tasks":       "staged — dispatching once primary is leader",
+		"warnings":                    warnings,
 	})
 }
 

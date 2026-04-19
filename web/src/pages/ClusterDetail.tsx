@@ -2814,6 +2814,7 @@ export default function ClusterDetail() {
         <AddNodeWizard
           clusterId={id!}
           clusterName={cluster.name}
+          existingNodes={nodes ?? []}
           onClose={() => {
             setShowWizard(false)
             refetchNodes()

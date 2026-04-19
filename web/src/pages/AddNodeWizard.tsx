@@ -9,12 +9,13 @@ type Arch = 'amd64' | 'arm64'
 interface Props {
   clusterId: string
   clusterName: string
+  existingNodes: { failover_priority: number }[]
   onClose: () => void
 }
 
 type Step = 1 | 2 | 3
 
-export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props) {
+export default function AddNodeWizard({ clusterId, clusterName, existingNodes, onClose }: Props) {
   const [step, setStep] = useState<Step>(1)
   const [node, setNode] = useState<Node | null>(null)
   const [regToken, setRegToken] = useState<RegTokenResponse | null>(null)
@@ -24,11 +25,18 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
   const [error, setError] = useState('')
   const [arch, setArch] = useState<Arch>('amd64')
 
+  const defaultPriority = (): number | '' => {
+    if (existingNodes.length === 0) return 50
+    const lowest = Math.min(...existingNodes.map((n) => n.failover_priority))
+    const candidate = lowest - 5
+    return candidate >= 1 ? candidate : ''
+  }
+
   const [form, setForm] = useState<CreateNodeBody>({
     hostname: '',
     ip_address: '',
     role: 'hyperconverged',
-    failover_priority: 50,
+    failover_priority: defaultPriority() as number,
     ssh_port: 22,
   })
   const [resolving, setResolving] = useState(false)
@@ -137,6 +145,11 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
                   setError('')
                   return
                 }
+                const takenPriorities = new Set(existingNodes.map((n) => n.failover_priority))
+                if (form.failover_priority != null && takenPriorities.has(form.failover_priority)) {
+                  setError(`Priority ${form.failover_priority} is already used by another node in this cluster.`)
+                  return
+                }
                 createNode.mutate(form)
               }}
               className="space-y-4"
@@ -196,12 +209,13 @@ export default function AddNodeWizard({ clusterId, clusterName, onClose }: Props
                   <input
                     type="number"
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-                    value={form.failover_priority}
+                    value={form.failover_priority || ''}
                     onChange={(e) =>
-                      setForm({ ...form, failover_priority: Number(e.target.value) })
+                      setForm({ ...form, failover_priority: e.target.value === '' ? 0 : Number(e.target.value) })
                     }
                     min={1}
                     max={100}
+                    required
                   />
                   <p className="text-xs text-gray-600 mt-1">Higher = preferred primary (1–100)</p>
                 </div>
