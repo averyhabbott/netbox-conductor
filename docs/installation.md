@@ -121,6 +121,8 @@ sudo chown -R netbox-conductor:netbox-conductor /opt/netbox-conductor/venv
 
 ```bash
 sudo mkdir -p /var/lib/netbox-conductor/bin
+sudo mkdir -p /var/lib/netbox-conductor/raft
+sudo chown netbox-conductor:netbox-conductor /var/lib/netbox-conductor /var/lib/netbox-conductor/bin /var/lib/netbox-conductor/raft
 sudo cp bin/netbox-agent-linux-amd64 /var/lib/netbox-conductor/bin/
 sudo cp bin/netbox-agent-linux-arm64 /var/lib/netbox-conductor/bin/
 sudo chmod +x /var/lib/netbox-conductor/bin/netbox-agent-linux-*
