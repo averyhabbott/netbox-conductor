@@ -33,6 +33,11 @@ func WriteSentinelConfig(params protocol.SentinelConfigWriteParams) (string, err
 	if err := os.WriteFile(tmpPath, []byte(params.Content), 0660); err != nil {
 		return "", fmt.Errorf("writing temp config: %w", err)
 	}
+	// Chmod after WriteFile to force 0660 regardless of process umask.
+	if err := os.Chmod(tmpPath, 0660); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("setting sentinel config permissions: %w", err)
+	}
 	if err := os.Rename(tmpPath, configPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("atomic rename failed: %w", err)
@@ -41,7 +46,7 @@ func WriteSentinelConfig(params protocol.SentinelConfigWriteParams) (string, err
 	output := fmt.Sprintf("wrote %d bytes to %s", len(params.Content), configPath)
 
 	if params.RestartAfter {
-		cmd := exec.Command("systemctl", "restart", "redis-sentinel")
+		cmd := exec.Command("sudo", "systemctl", "restart", "redis-sentinel")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return output, fmt.Errorf("redis-sentinel restart failed: %w\n%s", err, out)
 		}
