@@ -101,11 +101,25 @@ func strPtr(s string) *string { return &s }
 
 // GenerateCredentials auto-generates secure random passwords for all
 // non-superuser credential kinds. Returns the plaintext values once.
-// POST /api/v1/clusters/:id/credentials/generate
+// POST /api/v1/clusters/:id/credentials/generate?missing_only=true
 func (h *CredentialHandler) GenerateCredentials(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+
+	missingOnly := c.QueryParam("missing_only") == "true"
+
+	var existing map[string]bool
+	if missingOnly {
+		existing = make(map[string]bool)
+		creds, err := h.creds.ListByCluster(c.Request().Context(), clusterID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to list credentials")
+		}
+		for _, cr := range creds {
+			existing[cr.Kind] = true
+		}
 	}
 
 	type generated struct {
@@ -117,6 +131,9 @@ func (h *CredentialHandler) GenerateCredentials(c echo.Context) error {
 	results := make([]generated, 0, len(autoGenDefaults))
 
 	for _, def := range autoGenDefaults {
+		if missingOnly && existing[def.Kind] {
+			continue
+		}
 		rawPassword, err := crypto.GenerateToken(32)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate password")
@@ -164,9 +181,6 @@ func (h *CredentialHandler) Upsert(c echo.Context) error {
 	var req upsertCredentialRequest
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
-	}
-	if req.Username == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "username is required")
 	}
 	if req.Password == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "password is required")

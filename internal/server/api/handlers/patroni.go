@@ -24,6 +24,7 @@ type PatroniHandler struct {
 	clusters       *queries.ClusterQuerier
 	nodes          *queries.NodeQuerier
 	creds          *queries.CredentialQuerier
+	configs        *queries.ConfigQuerier
 	taskResults    *queries.TaskResultQuerier
 	retention      *queries.RetentionQuerier
 	failoverEvents *queries.FailoverEventQuerier
@@ -36,6 +37,7 @@ func NewPatroniHandler(
 	clusters *queries.ClusterQuerier,
 	nodes *queries.NodeQuerier,
 	creds *queries.CredentialQuerier,
+	configs *queries.ConfigQuerier,
 	taskResults *queries.TaskResultQuerier,
 	retention *queries.RetentionQuerier,
 	failoverEvents *queries.FailoverEventQuerier,
@@ -47,6 +49,7 @@ func NewPatroniHandler(
 		clusters:       clusters,
 		nodes:          nodes,
 		creds:          creds,
+		configs:        configs,
 		taskResults:    taskResults,
 		retention:      retention,
 		failoverEvents: failoverEvents,
@@ -1225,27 +1228,6 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		return tid.String(), nil
 	}
 
-	// Optional database backup before any destructive operations.
-	// Fire-and-forget: the operator can track progress via the task list.
-	// Patroni config dispatch proceeds regardless so the operator isn't
-	// blocked if the backup takes a long time.
-	var backupTask *taskRef
-	if req.SaveBackup {
-		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
-		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf(
-				"backup dispatch failed (primary not connected?): %v — proceeding without backup", err))
-		} else {
-			backupTask = &taskRef{
-				NodeID:   primaryNode.ID.String(),
-				Hostname: primaryNode.Hostname,
-				TaskID:   tid,
-				Status:   "dispatched",
-			}
-		}
-	}
-
 	// Stop NetBox on all non-primary nodes before configuring Patroni.
 	// This prevents split-brain while Patroni is being reconfigured. The primary
 	// keeps running so operators don't see an outage during the config push.
@@ -1265,31 +1247,6 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				TaskID: tid, Status: "dispatched",
 			})
 		}
-	}
-
-	// Stage the replicator PostgreSQL role on the primary before Patroni takes over.
-	// Patroni's bootstrap.users only fires during initdb — it is skipped when taking
-	// over an existing cluster. Creating the role here ensures the replica can connect
-	// for streaming replication as soon as Patroni starts.
-	rp, _ := json.Marshal(protocol.CreatePgRoleParams{
-		RoleName: replicaUser,
-		Password: replicaPass,
-		Options:  []string{"LOGIN", "REPLICATION"},
-	})
-	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 30); err != nil {
-		warnings = append(warnings, "create replicator role dispatch failed: "+err.Error())
-	}
-
-	// Set the postgres superuser password to match what Patroni expects.
-	// bootstrap.users only fires during initdb — on an existing cluster this must be
-	// done explicitly. CreatePgRole is idempotent and uses peer auth.
-	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
-		RoleName: superUser,
-		Password: superPass,
-		Options:  []string{},
-	})
-	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 30); err != nil {
-		warnings = append(warnings, "set postgres superuser password dispatch failed: "+err.Error())
 	}
 
 	// Push patroni.yml to every node, then restart Patroni.
@@ -1373,6 +1330,48 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// Create/update PostgreSQL roles after Patroni restarts — these tasks queue
+	// behind the Patroni restart on the primary node's task queue, so PostgreSQL
+	// will be running when they execute. Patroni's bootstrap.users only fires
+	// during initdb and is skipped on existing clusters, so roles must be
+	// created explicitly here. Both tasks are idempotent.
+	rp, _ := json.Marshal(protocol.CreatePgRoleParams{
+		RoleName: replicaUser,
+		Password: replicaPass,
+		Options:  []string{"LOGIN", "REPLICATION"},
+	})
+	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 30); err != nil {
+		warnings = append(warnings, "create replicator role dispatch failed: "+err.Error())
+	}
+	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
+		RoleName: superUser,
+		Password: superPass,
+		Options:  []string{},
+	})
+	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 30); err != nil {
+		warnings = append(warnings, "set postgres superuser password dispatch failed: "+err.Error())
+	}
+
+	// Optional database backup — dispatched after role creation so PostgreSQL is
+	// running and the superuser password is set when pg_dump executes.
+	// Fire-and-forget: the operator can track progress via the task list.
+	var backupTask *taskRef
+	if req.SaveBackup {
+		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
+		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"backup dispatch failed (primary not connected?): %v — proceeding without backup", err))
+		} else {
+			backupTask = &taskRef{
+				NodeID:   primaryNode.ID.String(),
+				Hostname: primaryNode.Hostname,
+				TaskID:   tid,
+				Status:   "dispatched",
+			}
+		}
+	}
+
 	// Push Sentinel config when app tier is always available.
 	// Sentinel auth password (redis_tasks_password) is written into sentinel.conf
 	// so all nodes and the Redis client library use the same secret.
@@ -1416,9 +1415,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// For app_tier_always_available clusters, pre-set DATABASE.HOST on every
 	// node to the identified primary's IP. This ensures all NetBox instances
 	// connect to the correct primary before Patroni finishes electing a leader.
-	// RestartAfter=false here — the Patroni restart tasks already trigger a
-	// service restart cascade; NetBox will be started by the failover manager
-	// or the operator as appropriate.
+	// RestartAfter=false here — the config push below restarts netbox/netbox-rq
+	// on all nodes with the fully updated configuration.
 	if req.AppTierAlwaysAvailable {
 		primaryIP := stripCIDR(primaryNode.IPAddress)
 		dbParams, _ := json.Marshal(protocol.DBHostUpdateParams{
@@ -1439,18 +1437,50 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
-	// Restart NetBox on the primary after Patroni is configured so it picks up
-	// any updated configuration. For non-primary nodes on app_tier_always_available
-	// clusters, NetBox was stopped above; the db_host_update task already sets the
-	// correct primary, and the operator (or auto-failover) will bring them back up.
-	var netboxRestartTask *taskRef
-	restartNetboxParams, _ := json.Marshal(struct{}{})
-	if tid, err := dispatch(primaryNode.ID, protocol.TaskRestartNetbox, restartNetboxParams, 30); err != nil {
-		warnings = append(warnings, fmt.Sprintf("restart-netbox dispatch failed for primary %s: %v", primaryNode.Hostname, err))
+	// Push a full configuration.py to all nodes with the current credentials.
+	// This ensures the REDIS section (and any other credential-bearing sections)
+	// reflects the credentials that were just generated or already stored.
+	// restart_after=true so netbox-rq picks up the new Redis passwords immediately.
+	var configTasks []taskRef
+	if latestCfg, cfgErr := h.configs.GetLatest(ctx, clusterID); cfgErr != nil {
+		warnings = append(warnings, "no configuration template found — credentials saved but configuration.py not pushed; use Config Editor or Sync Config to apply")
 	} else {
-		netboxRestartTask = &taskRef{
-			NodeID: primaryNode.ID.String(), Hostname: primaryNode.Hostname,
-			TaskID: tid, Status: "dispatched",
+		configTasks = make([]taskRef, 0, len(nodes))
+		for _, node := range nodes {
+			input, err := renderInputFor(ctx, h.clusters, h.creds, h.nodes, h.enc, clusterID, node.ID)
+			if err != nil {
+				configTasks = append(configTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					Status: "error", Error: err.Error(),
+				})
+				continue
+			}
+			content, sha256hex, err := configgen.Render(latestCfg.ConfigTemplate, input)
+			if err != nil {
+				configTasks = append(configTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					Status: "error", Error: "render: " + err.Error(),
+				})
+				continue
+			}
+			cfgParams, _ := json.Marshal(protocol.ConfigWriteParams{
+				Content:        content,
+				Sha256:         sha256hex,
+				BackupExisting: true,
+				RestartAfter:   true,
+			})
+			tid, err := dispatch(node.ID, protocol.TaskWriteConfig, cfgParams, 60)
+			if err != nil {
+				configTasks = append(configTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					Status: "offline", Error: err.Error(),
+				})
+			} else {
+				configTasks = append(configTasks, taskRef{
+					NodeID: node.ID.String(), Hostname: node.Hostname,
+					TaskID: tid, Status: "dispatched",
+				})
+			}
 		}
 	}
 
@@ -1465,20 +1495,21 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		"witness_addr", witnessAddr,
 		"patroni_nodes", len(patroniTasks),
 		"sentinel_nodes", len(sentinelTasks),
+		"config_nodes", len(configTasks),
 		"warnings", len(warnings),
 	)
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id":           clusterID.String(),
-		"witness_addr":         witnessAddr,
-		"primary_node":         primaryNode.Hostname,
-		"started_at":           startedAt.UTC().Format(time.RFC3339),
-		"backup_task":          backupTask,
-		"stop_tasks":           stopTasks,
-		"patroni_tasks":        patroniTasks,
-		"sentinel_tasks":       sentinelTasks,
-		"netbox_restart_task":  netboxRestartTask,
-		"warnings":             warnings,
+		"cluster_id":          clusterID.String(),
+		"witness_addr":        witnessAddr,
+		"primary_node":        primaryNode.Hostname,
+		"started_at":          startedAt.UTC().Format(time.RFC3339),
+		"backup_task":         backupTask,
+		"stop_tasks":          stopTasks,
+		"patroni_tasks":       patroniTasks,
+		"sentinel_tasks":      sentinelTasks,
+		"config_tasks":        configTasks,
+		"warnings":            warnings,
 	})
 }
 

@@ -8,6 +8,7 @@ import (
 type ParsedConfig struct {
 	SecretKey            string
 	APITokenPepper       string
+	DBUser               string
 	DBPassword           string
 	RedisTasksPassword   string
 	RedisCachingPassword string
@@ -39,13 +40,11 @@ func ParseNetboxConfig(content string) ParsedConfig {
 	// Try conductor-generated format (DATABASE = {...}) first, then standard Django
 	// format (DATABASES = {'default': {...}}).
 	if dbBlock := extractTopLevelBlock(content, "DATABASE"); dbBlock != "" {
-		if pw := extractPasswordFromBlock(dbBlock); pw != "" {
-			p.DBPassword = pw
-		}
+		p.DBUser = extractUserFromBlock(dbBlock)
+		p.DBPassword = extractPasswordFromBlock(dbBlock)
 	} else if dbBlock := extractDefaultBlock(content); dbBlock != "" {
-		if pw := extractPasswordFromBlock(dbBlock); pw != "" {
-			p.DBPassword = pw
-		}
+		p.DBUser = extractUserFromBlock(dbBlock)
+		p.DBPassword = extractPasswordFromBlock(dbBlock)
 	}
 
 	if tasksBlock := extractRedisSubBlock(content, "tasks"); tasksBlock != "" {
@@ -63,9 +62,17 @@ func ParseNetboxConfig(content string) ParsedConfig {
 }
 
 var rePasswordValue = regexp.MustCompile(`'PASSWORD'\s*:\s*['"]([^'"]*)['"]\s*,?`)
+var reUserValue = regexp.MustCompile(`'USER'\s*:\s*['"]([^'"]*)['"]\s*,?`)
 
 func extractPasswordFromBlock(block string) string {
 	if m := rePasswordValue.FindStringSubmatch(block); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+func extractUserFromBlock(block string) string {
+	if m := reUserValue.FindStringSubmatch(block); len(m) > 1 {
 		return m[1]
 	}
 	return ""

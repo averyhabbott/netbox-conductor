@@ -193,7 +193,7 @@ func run(ctx context.Context) error {
 	credHandler := handlers.NewCredentialHandler(credQ, enc)
 	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker, h)
-	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, taskQ, retentionQ, failoverEventQ, enc, dispatcher, witnessManager)
+	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, failoverEventQ, enc, dispatcher, witnessManager)
 	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)
 
 	// Router

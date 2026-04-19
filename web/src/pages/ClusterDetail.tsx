@@ -532,8 +532,10 @@ function ImportFromExistingModal({
         if (!kind) continue
         const value = parsed[key as keyof typeof parsed]
         if (!value) continue
+        const username =
+          key === 'netbox_db_user_password' ? (parsed.netbox_db_user_username ?? '') : ''
         await credentialsApi.upsert(clusterId, kind, {
-          username: '',
+          username,
           password: value,
         })
       }
@@ -2414,7 +2416,7 @@ export default function ClusterDetail() {
 
   const [generatedCreds, setGeneratedCreds] = useState<GeneratedCredential[] | null>(null)
   const [showImportWizard, setShowImportWizard] = useState(false)
-  const [generateConfirmStep, setGenerateConfirmStep] = useState(0) // 0=off 1=first 2=second
+  const [generateConfirmStep, setGenerateConfirmStep] = useState(0) // 0=off 1=confirm
   const [showSyncModal, setShowSyncModal] = useState(false)
 
   const { data: cluster, isLoading: loadingCluster } = useQuery({
@@ -2453,7 +2455,7 @@ export default function ClusterDetail() {
   })
 
   const generateCreds = useMutation({
-    mutationFn: () => credentialsApi.generateCredentials(id!),
+    mutationFn: (missingOnly: boolean) => credentialsApi.generateCredentials(id!, missingOnly),
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['credentials', id] })
       setGeneratedCreds(data.generated)
@@ -2678,7 +2680,7 @@ export default function ClusterDetail() {
                         if (credentials && credentials.length > 0) {
                           setGenerateConfirmStep(1)
                         } else {
-                          generateCreds.mutate()
+                          generateCreds.mutate(false)
                         }
                       }}
                       disabled={generateCreds.isPending}
@@ -2686,37 +2688,22 @@ export default function ClusterDetail() {
                     >
                       {generateCreds.isPending ? 'Generating…' : 'Auto-generate'}
                     </button>
-                  ) : generateConfirmStep === 1 ? (
+                  ) : (
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-yellow-400">Overwrite existing credentials?</span>
                       <button
-                        onClick={() => setGenerateConfirmStep(2)}
-                        className="text-xs bg-yellow-700 hover:bg-yellow-600 px-2 py-1 rounded"
-                      >
-                        Yes
-                      </button>
-                      <button
-                        onClick={() => setGenerateConfirmStep(0)}
-                        className="text-xs text-gray-400 hover:text-gray-300"
-                      >
-                        No
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-red-400">Are you sure? Cannot be undone.</span>
-                      <button
-                        onClick={() => { generateCreds.mutate(); setGenerateConfirmStep(0) }}
+                        onClick={() => { generateCreds.mutate(false); setGenerateConfirmStep(0) }}
                         disabled={generateCreds.isPending}
-                        className="text-xs bg-red-700 hover:bg-red-600 disabled:opacity-40 px-2 py-1 rounded"
+                        className="text-xs text-gray-400 hover:text-gray-300 disabled:opacity-40"
                       >
-                        {generateCreds.isPending ? 'Generating…' : 'Confirm'}
+                        Yes, overwrite all
                       </button>
                       <button
-                        onClick={() => setGenerateConfirmStep(0)}
-                        className="text-xs text-gray-400 hover:text-gray-300"
+                        onClick={() => { generateCreds.mutate(true); setGenerateConfirmStep(0) }}
+                        disabled={generateCreds.isPending}
+                        className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 px-2 py-1 rounded"
                       >
-                        Cancel
+                        No, generate missing only
                       </button>
                     </div>
                   )}

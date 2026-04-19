@@ -45,9 +45,11 @@ export const credentialsApi = {
       .put<Credential>(`/clusters/${clusterId}/credentials/${kind}`, body)
       .then((r) => r.data),
 
-  generateCredentials: (clusterId: string) =>
+  generateCredentials: (clusterId: string, missingOnly = false) =>
     client
-      .post<GenerateCredentialsResponse>(`/clusters/${clusterId}/credentials/generate`)
+      .post<GenerateCredentialsResponse>(
+        `/clusters/${clusterId}/credentials/generate${missingOnly ? '?missing_only=true' : ''}`
+      )
       .then((r) => r.data),
 }
 

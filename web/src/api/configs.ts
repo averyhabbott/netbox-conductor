@@ -43,6 +43,7 @@ export interface ReadNodeConfigResult {
   parsed: {
     netbox_secret_key: string
     netbox_api_token_pepper: string
+    netbox_db_user_username: string
     netbox_db_user_password: string
     redis_tasks_password: string
     redis_caching_password: string

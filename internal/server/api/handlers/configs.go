@@ -405,11 +405,12 @@ func (h *ConfigHandler) ReadNodeConfig(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"raw_config": wr.result.Output,
 		"parsed": map[string]string{
-			"netbox_secret_key":      parsed.SecretKey,
-			"netbox_api_token_pepper": parsed.APITokenPepper,
-			"netbox_db_user_password": parsed.DBPassword,
-			"redis_tasks_password":   parsed.RedisTasksPassword,
-			"redis_caching_password": parsed.RedisCachingPassword,
+			"netbox_secret_key":        parsed.SecretKey,
+			"netbox_api_token_pepper":  parsed.APITokenPepper,
+			"netbox_db_user_username":  parsed.DBUser,
+			"netbox_db_user_password":  parsed.DBPassword,
+			"redis_tasks_password":     parsed.RedisTasksPassword,
+			"redis_caching_password":   parsed.RedisCachingPassword,
 		},
 	})
 }
@@ -537,47 +538,52 @@ func (h *ConfigHandler) SyncConfig(c echo.Context) error {
 
 // buildRenderInput gathers decrypted credentials and node network info.
 func (h *ConfigHandler) buildRenderInput(ctx context.Context, clusterID, nodeID uuid.UUID) (configgen.RenderInput, error) {
-	cluster, err := h.clusters.GetByID(ctx, clusterID)
+	return renderInputFor(ctx, h.clusters, h.creds, h.nodes, h.enc, clusterID, nodeID)
+}
+
+// renderInputFor is the package-level implementation shared by ConfigHandler and PatroniHandler.
+func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds *queries.CredentialQuerier, nodes *queries.NodeQuerier, enc *crypto.Encryptor, clusterID, nodeID uuid.UUID) (configgen.RenderInput, error) {
+	cluster, err := clusters.GetByID(ctx, clusterID)
 	if err != nil {
 		return configgen.RenderInput{}, fmt.Errorf("cluster not found")
 	}
 
 	secretKey, apiPepper := "", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "netbox_secret_key"); err == nil {
-		if v, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+	if cred, err := creds.GetByKind(ctx, clusterID, "netbox_secret_key"); err == nil {
+		if v, err := enc.Decrypt(cred.PasswordEnc); err == nil {
 			secretKey = string(v)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "netbox_api_token_pepper"); err == nil {
-		if v, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+	if cred, err := creds.GetByKind(ctx, clusterID, "netbox_api_token_pepper"); err == nil {
+		if v, err := enc.Decrypt(cred.PasswordEnc); err == nil {
 			apiPepper = string(v)
 		}
 	}
 
 	dbName, dbUser, dbPassword := "netbox", "netbox", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "netbox_db_user"); err == nil {
+	if cred, err := creds.GetByKind(ctx, clusterID, "netbox_db_user"); err == nil {
 		dbUser = cred.Username
 		if cred.DBName != nil {
 			dbName = *cred.DBName
 		}
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+		if pw, err := enc.Decrypt(cred.PasswordEnc); err == nil {
 			dbPassword = string(pw)
 		}
 	}
 
 	redisTasksPw, redisCachingPw := "", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+	if cred, err := creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
+		if pw, err := enc.Decrypt(cred.PasswordEnc); err == nil {
 			redisTasksPw = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_caching_password"); err == nil {
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
+	if cred, err := creds.GetByKind(ctx, clusterID, "redis_caching_password"); err == nil {
+		if pw, err := enc.Decrypt(cred.PasswordEnc); err == nil {
 			redisCachingPw = string(pw)
 		}
 	}
 
-	allNodes, _ := h.nodes.ListByCluster(ctx, clusterID)
+	allNodes, _ := nodes.ListByCluster(ctx, clusterID)
 
 	var sentinelAddrs []string
 	for _, n := range allNodes {
@@ -590,7 +596,7 @@ func (h *ConfigHandler) buildRenderInput(ctx context.Context, clusterID, nodeID 
 	var allowedHosts []string
 
 	if nodeID != uuid.Nil {
-		node, err := h.nodes.GetByID(ctx, nodeID)
+		node, err := nodes.GetByID(ctx, nodeID)
 		if err == nil {
 			dbHost = stripCIDR(node.IPAddress)
 			allowedHosts = []string{node.Hostname, stripCIDR(node.IPAddress)}
