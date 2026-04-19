@@ -88,7 +88,7 @@ systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${INSTALL_DIR}"
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${BIN_DIR}"
-install -d -m 750 -o root             -g "${SERVICE_NAME}" "${CONF_DIR}"
+install -d -m 750 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${CONF_DIR}"
 install -d -m 750 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "${LOG_DIR}"
 # /var/lib/netbox-conductor must be writable by the service user so the
 # witness manager can create per-cluster raft data subdirectories at runtime.
