@@ -38,6 +38,10 @@ type RenderInput struct {
 // Render generates configuration.py content from the stored template and input.
 // It returns the rendered content and its SHA-256 hex digest.
 func Render(tmplSrc string, in RenderInput) (content, sha256hex string, err error) {
+	// Migrate legacy pepper placeholder: old templates used {0: '{{.APITokenPepper}}'}
+	// but APITokenPepper now holds the full dict literal.
+	tmplSrc = strings.ReplaceAll(tmplSrc, `{0: '{{.APITokenPepper}}'}`, `{{.APITokenPepper}}`)
+
 	if in.DBPort == 0 {
 		in.DBPort = 5432
 	}
@@ -120,7 +124,7 @@ ALLOWED_HOSTS = {{.AllowedHostsPy}}
 
 SECRET_KEY = '{{.SecretKey}}'
 {{- if .IsFourX}}
-API_TOKEN_PEPPERS = {0: '{{.APITokenPepper}}'}
+API_TOKEN_PEPPERS = {{.APITokenPepper}}
 {{- end}}
 
 DEBUG = False

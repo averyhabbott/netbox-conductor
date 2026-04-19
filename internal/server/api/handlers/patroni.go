@@ -1384,43 +1384,41 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
-	// Push Sentinel config when app tier is always available.
-	// Sentinel auth password (redis_tasks_password) is written into sentinel.conf
-	// so all nodes and the Redis client library use the same secret.
-	sentinelTasks := make([]taskRef, 0)
-	if req.AppTierAlwaysAvailable {
-		masterHost := stripCIDR(primaryNode.IPAddress)
-		for _, node := range nodes {
-			nodeIP := stripCIDR(node.IPAddress)
-			content, sha256hex, err := configgen.RenderSentinel(configgen.SentinelInput{
-				Scope:      req.RedisSentinelMaster,
-				MasterHost: masterHost,
-				BindAddr:   nodeIP,
-				Password:   redisPassword,
+	// Push Sentinel config to all nodes. sentinel.conf must match configuration.py
+	// (which always uses PatroniScope as the service name), regardless of whether
+	// app_tier_always_available is set.
+	sentinelTasks := make([]taskRef, 0, len(nodes))
+	masterHost := stripCIDR(primaryNode.IPAddress)
+	for _, node := range nodes {
+		nodeIP := stripCIDR(node.IPAddress)
+		content, sha256hex, err := configgen.RenderSentinel(configgen.SentinelInput{
+			Scope:      cluster.PatroniScope,
+			MasterHost: masterHost,
+			BindAddr:   nodeIP,
+			Password:   redisPassword,
+		})
+		if err != nil {
+			sentinelTasks = append(sentinelTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				Status: "error", Error: "render: " + err.Error(),
 			})
-			if err != nil {
-				sentinelTasks = append(sentinelTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					Status: "error", Error: "render: " + err.Error(),
-				})
-				continue
-			}
-			sParams, _ := json.Marshal(protocol.SentinelConfigWriteParams{
-				Content:      content,
-				Sha256:       sha256hex,
-				RestartAfter: true,
+			continue
+		}
+		sParams, _ := json.Marshal(protocol.SentinelConfigWriteParams{
+			Content:      content,
+			Sha256:       sha256hex,
+			RestartAfter: true,
+		})
+		if tid, err := dispatch(node.ID, protocol.TaskWriteSentinelConf, sParams, 30); err != nil {
+			sentinelTasks = append(sentinelTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				Status: "offline", Error: err.Error(),
 			})
-			if tid, err := dispatch(node.ID, protocol.TaskWriteSentinelConf, sParams, 30); err != nil {
-				sentinelTasks = append(sentinelTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					Status: "offline", Error: err.Error(),
-				})
-			} else {
-				sentinelTasks = append(sentinelTasks, taskRef{
-					NodeID: node.ID.String(), Hostname: node.Hostname,
-					TaskID: tid, Status: "dispatched",
-				})
-			}
+		} else {
+			sentinelTasks = append(sentinelTasks, taskRef{
+				NodeID: node.ID.String(), Hostname: node.Hostname,
+				TaskID: tid, Status: "dispatched",
+			})
 		}
 	}
 

@@ -38,7 +38,7 @@ type SentinelInput struct {
 // Returns the rendered content and its SHA-256 hex digest.
 func RenderSentinel(in SentinelInput) (content, sha256hex string, err error) {
 	if in.MasterPort == 0 {
-		in.MasterPort = 5432
+		in.MasterPort = 6379
 	}
 	if in.Port == 0 {
 		in.Port = 26379

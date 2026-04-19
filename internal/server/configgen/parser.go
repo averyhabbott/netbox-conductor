@@ -17,8 +17,8 @@ type ParsedConfig struct {
 var (
 	reSecretKey = regexp.MustCompile(`(?m)^SECRET_KEY\s*=\s*['"]([^'"]+)['"]`)
 
-	// Matches both {0: 'val'} and {1: 'val'} style peppers — capture the first value.
-	reAPITokenPepper = regexp.MustCompile(`(?m)API_TOKEN_PEPPERS\s*=\s*\{[^}]*\d+\s*:\s*['"]([^'"]+)['"]`)
+	// Anchored to line start to avoid matching commented-out example blocks.
+	reAPITokenPeppersLine = regexp.MustCompile(`(?m)^API_TOKEN_PEPPERS\s*=\s*\{`)
 
 	reRedisBlockPassword = regexp.MustCompile(`(?s)'PASSWORD'\s*:\s*['"]([^'"]*)['"]\s*,`)
 )
@@ -33,11 +33,10 @@ func ParseNetboxConfig(content string) ParsedConfig {
 	if m := reSecretKey.FindStringSubmatch(content); len(m) > 1 {
 		p.SecretKey = m[1]
 	}
-	if m := reAPITokenPepper.FindStringSubmatch(content); len(m) > 1 {
-		// Ignore the NetBox default placeholder — treat it as unset so the
-		// credential is omitted from the import and auto-generate creates a real one.
-		if m[1] != "<random string>" {
-			p.APITokenPepper = m[1]
+	if loc := reAPITokenPeppersLine.FindStringIndex(content); loc != nil {
+		dict := extractBraces(content, loc[1]-1)
+		if dict != "{}" && dict != "" {
+			p.APITokenPepper = dict
 		}
 	}
 

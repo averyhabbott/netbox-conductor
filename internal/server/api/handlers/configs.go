@@ -563,7 +563,14 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 	if cred, err := creds.GetByKind(ctx, clusterID, "netbox_api_token_pepper"); err == nil {
 		if v, err := enc.Decrypt(cred.PasswordEnc); err == nil {
 			apiPepper = string(v)
+			// Backward-compat: pre-migration credentials stored a bare string value.
+			if apiPepper != "" && !strings.HasPrefix(apiPepper, "{") {
+				apiPepper = fmt.Sprintf("{0: '%s'}", apiPepper)
+			}
 		}
+	}
+	if apiPepper == "" {
+		apiPepper = "{}"
 	}
 
 	dbName, dbUser, dbPassword := "netbox", "netbox", ""

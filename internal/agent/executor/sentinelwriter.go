@@ -30,7 +30,7 @@ func WriteSentinelConfig(params protocol.SentinelConfigWriteParams) (string, err
 	}
 
 	tmpPath := filepath.Join(dir, fmt.Sprintf(".sentinel-config.tmp.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpPath, []byte(params.Content), 0640); err != nil {
+	if err := os.WriteFile(tmpPath, []byte(params.Content), 0660); err != nil {
 		return "", fmt.Errorf("writing temp config: %w", err)
 	}
 	if err := os.Rename(tmpPath, configPath); err != nil {
