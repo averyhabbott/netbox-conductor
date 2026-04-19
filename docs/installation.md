@@ -79,56 +79,25 @@ make build-all
 
 Run all commands from the repository root (the directory containing `deployments/` and `bin/`).
 
-**1. Create the system user and directories:**
+**1. Run the install script:**
+
+The install script creates the system user, all required directories, the conductor binary, the Patroni witness Python environment, and the systemd unit in one step. It auto-detects the host architecture (`amd64` or `arm64`) and picks the matching binary from `bin/`.
 
 ```bash
-sudo groupadd --system netbox-conductor
-sudo useradd --system --gid netbox-conductor --no-create-home --shell /usr/sbin/nologin netbox-conductor
-
-sudo mkdir -p /opt/netbox-conductor/bin
-sudo mkdir -p /etc/netbox-conductor
-sudo mkdir -p /var/log/netbox-conductor
-sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor
-sudo chown netbox-conductor:netbox-conductor /var/log/netbox-conductor
+sudo bash deployments/server/install.sh
 ```
 
-**2. Copy the binary:**
+Then copy the agent binaries so managed nodes can download them:
 
 ```bash
-sudo cp bin/netbox-conductor-linux-arm64 /opt/netbox-conductor/bin/netbox-conductor
-sudo chmod +x /opt/netbox-conductor/bin/netbox-conductor
-```
-
-**3. Set up the Patroni witness Python environment:**
-
-The Conductor includes a built-in Raft witness process that provides a third vote in 2-node clusters using `patroni_raft_controller` — a binary that ships with Patroni itself.
-
-```bash
-# Debian/Ubuntu: install the venv package first (version must match your system Python)
-sudo apt-get install -y python3-venv
-# If the above fails (e.g. Python 3.13), use the version-specific package:
-#   sudo apt-get install -y python3.13-venv
-
-# Create the venv and install Patroni, pysyncobj, and psycopg2-binary
-sudo python3 -m venv /opt/netbox-conductor/venv
-sudo /opt/netbox-conductor/venv/bin/pip install patroni pysyncobj psycopg2-binary
-sudo chown -R netbox-conductor:netbox-conductor /opt/netbox-conductor/venv
-```
-
-> The Conductor spawns `patroni_raft_controller` (installed at `/opt/netbox-conductor/venv/bin/patroni_raft_controller`) as a subprocess, one per active/standby cluster. This gives 2-node clusters a 3rd Raft voter on the conductor host, preserving quorum across a network partition without needing a dedicated witness VM. The process auto-restarts every 5 seconds on crash and is also recovered automatically when the conductor restarts.
-
-**4. Copy agent binaries** (served to managed nodes via download endpoint):
-
-```bash
-sudo mkdir -p /var/lib/netbox-conductor/bin
-sudo mkdir -p /var/lib/netbox-conductor/raft
-sudo chown netbox-conductor:netbox-conductor /var/lib/netbox-conductor /var/lib/netbox-conductor/bin /var/lib/netbox-conductor/raft
 sudo cp bin/netbox-agent-linux-amd64 /var/lib/netbox-conductor/bin/
 sudo cp bin/netbox-agent-linux-arm64 /var/lib/netbox-conductor/bin/
 sudo chmod +x /var/lib/netbox-conductor/bin/netbox-agent-linux-*
 ```
 
-**5. Create the database user and database:**
+> The Conductor includes a built-in Raft witness process (`patroni_raft_controller`) that provides a third vote in 2-node clusters. It is installed automatically by the script into `/opt/netbox-conductor/venv` and runs as a subprocess, one per active/standby cluster. The process auto-restarts on crash and is recovered automatically when the conductor restarts.
+
+**2. Create the database user and database:**
 
 Generate a strong password and save it — you will need it in the next step:
 
@@ -143,7 +112,7 @@ sudo -u postgres createdb -O netbox_conductor netbox_conductor
 
 Migrations run automatically on first startup — no manual migration step needed.
 
-**6. Generate the master key** (encrypts credentials at rest):
+**3. Generate the master key** (encrypts credentials at rest):
 
 ```bash
 openssl rand -hex 32 | sudo tee /etc/netbox-conductor/master.key
@@ -151,7 +120,7 @@ sudo chmod 400 /etc/netbox-conductor/master.key
 sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor/master.key
 ```
 
-**7. Configure the environment:**
+**4. Configure the environment:**
 
 ```bash
 sudo cp deployments/server/netbox-conductor.env.example /etc/netbox-conductor/netbox-conductor.env
@@ -171,7 +140,7 @@ Edit `/etc/netbox-conductor/netbox-conductor.env` and fill in the required value
 # PostgreSQL connection string — no password here; set it in DB_PASSWORD below
 DATABASE_URL=postgres://netbox_conductor@localhost:5432/netbox_conductor?sslmode=disable
 
-# Database password — injected into DATABASE_URL at startup (use the password generated in Step 5)
+# Database password — injected into DATABASE_URL at startup (use the password generated in Step 2)
 DB_PASSWORD=
 
 # Secret used to sign JWT tokens — paste the output of: openssl rand -hex 32
@@ -196,7 +165,7 @@ LOG_DIR=/var/log
 LOG_NAME=netbox-conductor
 LOG_LEVEL=info
 
-# Path to the AES-256-GCM master key file generated in Step 6
+# Path to the AES-256-GCM master key file generated in Step 3
 NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
 
 # TLS cert and key — auto-generated as self-signed on first startup if absent.
@@ -206,11 +175,9 @@ TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
 TLS_KEY_FILE=/etc/netbox-conductor/tls.key
 ```
 
-**8. Install and start the systemd service:**
+**5. Start the service:**
 
 ```bash
-sudo cp deployments/server/netbox-conductor.service /etc/systemd/system/
-sudo systemctl daemon-reload
 sudo systemctl enable --now netbox-conductor
 sudo journalctl -u netbox-conductor -f
 ```

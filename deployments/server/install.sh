@@ -5,10 +5,14 @@
 # Usage:
 #   sudo bash install.sh [--binary /path/to/netbox-conductor]
 #
+# Without --binary the script auto-detects the host architecture and looks for
+# the matching pre-built binary in the bin/ directory next to the repo root
+# (i.e. ../../bin/netbox-conductor-linux-<arch> relative to this script).
+#
 # What it does:
 #   1. Creates the netbox-conductor OS user and directory layout
-#   2. Installs/upgrades the conductor binary (optional; skip if no --binary flag)
-#   3. Creates a Python venv and installs Patroni + psycopg2-binary
+#   2. Installs/upgrades the conductor binary
+#   3. Creates a Python venv and installs Patroni + pysyncobj + psycopg
 #      (provides patroni_raft_controller, the built-in Raft witness binary)
 #   4. Installs/reloads the systemd unit
 
@@ -23,6 +27,7 @@ SERVICE_NAME=netbox-conductor
 SERVICE_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -33,6 +38,23 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+# ── Auto-detect binary ────────────────────────────────────────────────────────
+
+if [[ -z "${BINARY_SRC}" ]]; then
+  case "$(uname -m)" in
+    x86_64)  ARCH=amd64 ;;
+    aarch64) ARCH=arm64 ;;
+    *) echo "Error: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+  esac
+  BINARY_SRC="${REPO_ROOT}/bin/netbox-conductor-linux-${ARCH}"
+  if [[ ! -f "${BINARY_SRC}" ]]; then
+    echo "Error: binary not found at ${BINARY_SRC}" >&2
+    echo "       Run 'make build-all' from the repo root first, or pass --binary <path>" >&2
+    exit 1
+  fi
+  echo "==> Auto-detected architecture: ${ARCH} → ${BINARY_SRC}"
+fi
 
 # ── Check prerequisites ───────────────────────────────────────────────────────
 
@@ -74,12 +96,10 @@ install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" /var/lib/netbox-cond
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" /var/lib/netbox-conductor/bin
 install -d -m 755 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" /var/lib/netbox-conductor/raft
 
-# ── Conductor binary (optional) ───────────────────────────────────────────────
+# ── Conductor binary ──────────────────────────────────────────────────────────
 
-if [[ -n "${BINARY_SRC}" ]]; then
-  echo "==> Installing conductor binary from ${BINARY_SRC}..."
-  install -m 755 -o root -g "${SERVICE_NAME}" "${BINARY_SRC}" "${BIN_DIR}/netbox-conductor"
-fi
+echo "==> Installing conductor binary from ${BINARY_SRC}..."
+install -m 755 -o root -g "${SERVICE_NAME}" "${BINARY_SRC}" "${BIN_DIR}/netbox-conductor"
 
 # ── Python venv + Patroni (provides patroni_raft_controller witness) ─────────
 
@@ -139,5 +159,5 @@ echo "  2. sudo systemctl start ${SERVICE_NAME}"
 echo "  3. sudo journalctl -u ${SERVICE_NAME} -f"
 echo ""
 echo "To upgrade an already-running conductor:"
-echo "  sudo bash install.sh --binary ./netbox-conductor"
+echo "  make build-all && sudo bash deployments/server/install.sh"
 echo "  sudo systemctl restart ${SERVICE_NAME}"
