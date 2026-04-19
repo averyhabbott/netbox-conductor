@@ -34,7 +34,11 @@ func ParseNetboxConfig(content string) ParsedConfig {
 		p.SecretKey = m[1]
 	}
 	if m := reAPITokenPepper.FindStringSubmatch(content); len(m) > 1 {
-		p.APITokenPepper = m[1]
+		// Ignore the NetBox default placeholder — treat it as unset so the
+		// credential is omitted from the import and auto-generate creates a real one.
+		if m[1] != "<random string>" {
+			p.APITokenPepper = m[1]
+		}
 	}
 
 	// Try conductor-generated format (DATABASE = {...}) first, then standard Django
