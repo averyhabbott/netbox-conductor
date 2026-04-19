@@ -122,11 +122,7 @@ sudo chown netbox-conductor:netbox-conductor /etc/netbox-conductor/master.key
 
 **4. Configure the environment:**
 
-```bash
-sudo cp deployments/server/netbox-conductor.env.example /etc/netbox-conductor/netbox-conductor.env
-sudo chown root:netbox-conductor /etc/netbox-conductor/netbox-conductor.env
-sudo chmod 640 /etc/netbox-conductor/netbox-conductor.env
-```
+The install script created `/etc/netbox-conductor/netbox-conductor.env` — edit it and fill in the required values:
 
 Generate a JWT signing secret:
 
@@ -178,7 +174,7 @@ TLS_KEY_FILE=/etc/netbox-conductor/tls.key
 **5. Start the service:**
 
 ```bash
-sudo systemctl enable --now netbox-conductor
+sudo systemctl start netbox-conductor
 sudo journalctl -u netbox-conductor -f
 ```
 
@@ -188,6 +184,12 @@ The UI is available at `https://<conductor>:8443`. On first start against an emp
 - **Password:** `changeme123!`
 
 Change this password immediately after first login.
+
+**To upgrade an already-running conductor:**
+
+```bash
+make build-all && sudo bash deployments/server/install.sh && sudo systemctl restart netbox-conductor
+```
 
 ---
 
