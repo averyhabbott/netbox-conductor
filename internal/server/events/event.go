@@ -39,17 +39,21 @@ var SeverityOrder = map[string]int{
 
 // Event is the canonical event type used throughout the server.
 // It maps 1:1 with a row in the events table.
+// ClusterName and NodeName are not persisted; they are populated by the
+// emitter's NameResolver before events reach transport sinks.
 type Event struct {
-	ID         uuid.UUID              `json:"id"`
-	ClusterID  *uuid.UUID             `json:"cluster_id,omitempty"`
-	NodeID     *uuid.UUID             `json:"node_id,omitempty"`
-	Category   string                 `json:"category"`
-	Severity   string                 `json:"severity"`
-	Code       string                 `json:"code"`
-	Message    string                 `json:"message"`
-	Actor      string                 `json:"actor"`
-	Metadata   map[string]interface{} `json:"metadata,omitempty"`
-	OccurredAt time.Time              `json:"occurred_at"`
+	ID          uuid.UUID              `json:"id"`
+	ClusterID   *uuid.UUID             `json:"cluster_id,omitempty"`
+	NodeID      *uuid.UUID             `json:"node_id,omitempty"`
+	ClusterName *string                `json:"cluster_name,omitempty"`
+	NodeName    *string                `json:"node_name,omitempty"`
+	Category    string                 `json:"category"`
+	Severity    string                 `json:"severity"`
+	Code        string                 `json:"code"`
+	Message     string                 `json:"message"`
+	Actor       string                 `json:"actor"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	OccurredAt  time.Time              `json:"occurred_at"`
 }
 
 // Emitter is implemented by any type that can receive and persist events.
@@ -77,8 +81,10 @@ func New(category, severity, code, message, actor string) *Builder {
 	}}
 }
 
-func (b *Builder) Cluster(id uuid.UUID) *Builder  { b.e.ClusterID = &id; return b }
-func (b *Builder) Node(id uuid.UUID) *Builder      { b.e.NodeID = &id; return b }
+func (b *Builder) Cluster(id uuid.UUID) *Builder     { b.e.ClusterID = &id; return b }
+func (b *Builder) Node(id uuid.UUID) *Builder        { b.e.NodeID = &id; return b }
+func (b *Builder) ClusterName(n string) *Builder     { b.e.ClusterName = &n; return b }
+func (b *Builder) NodeName(n string) *Builder        { b.e.NodeName = &n; return b }
 func (b *Builder) Meta(k string, v interface{}) *Builder {
 	if b.e.Metadata == nil {
 		b.e.Metadata = make(map[string]interface{})

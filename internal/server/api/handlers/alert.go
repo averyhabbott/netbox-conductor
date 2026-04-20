@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -61,6 +62,7 @@ func (h *AlertHandler) CreateRule(c echo.Context) error {
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
 	}
+	p.Name = strings.TrimSpace(p.Name)
 	if p.Name == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
 	}
@@ -98,6 +100,7 @@ func (h *AlertHandler) UpdateRule(c echo.Context) error {
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
 	}
+	p.Name = strings.TrimSpace(p.Name)
 	r, err := h.ruleQ.Update(c.Request().Context(), id, p)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to update rule")

@@ -68,23 +68,27 @@ func SendSlackBot(cfg map[string]interface{}, rule queries.AlertRule, ev events.
 
 func slackBody(rule queries.AlertRule, ev events.Event, isResolve bool) map[string]interface{} {
 	emoji := severityEmoji(ev.Severity)
+	var label string
 	if isResolve {
 		emoji = ":white_check_mark:"
-	}
-	prefix := "ALERT"
-	if isResolve {
-		prefix = "RESOLVED"
+		label = "RESOLVED"
+	} else {
+		label = strings.ToUpper(ev.Severity)
 	}
 
-	text := fmt.Sprintf("%s *[%s] %s — %s*\n*Code:* `%s`\n*Message:* %s\n*Time:* %s",
-		emoji, prefix, strings.ToUpper(ev.Severity), rule.Name,
+	text := fmt.Sprintf("%s *[%s] — %s*\n*Code:* `%s`\n*Message:* %s\n*Time:* %s",
+		emoji, label, strings.TrimSpace(rule.Name),
 		ev.Code, ev.Message,
 		ev.OccurredAt.UTC().Format(time.RFC3339),
 	)
-	if ev.ClusterID != nil {
+	if ev.ClusterName != nil {
+		text += fmt.Sprintf("\n*Cluster:* `%s`", *ev.ClusterName)
+	} else if ev.ClusterID != nil {
 		text += fmt.Sprintf("\n*Cluster:* `%s`", ev.ClusterID)
 	}
-	if ev.NodeID != nil {
+	if ev.NodeName != nil {
+		text += fmt.Sprintf("\n*Node:* `%s`", *ev.NodeName)
+	} else if ev.NodeID != nil {
 		text += fmt.Sprintf("\n*Node:* `%s`", ev.NodeID)
 	}
 

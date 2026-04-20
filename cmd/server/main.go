@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/averyhabbott/netbox-conductor/internal/server/alerting"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/handlers"
@@ -183,7 +185,7 @@ func run(ctx context.Context) error {
 	go recoverWitnesses(ctx, witnessManager, clusterQ, nodeQ)
 
 	// Event emitter — central event bus; alert engine + syslog forwarder subscribe as sinks
-	emitter := events.NewEmitter(eventQ)
+	emitter := events.NewEmitter(eventQ).WithResolver(newNameResolver(clusterQ, nodeQ))
 
 	// Alert engine
 	alertEngine := alerting.NewEngine(alertRuleQ, alertStateQ, alertTransQ, alertSchedQ, hbQ)
@@ -373,6 +375,32 @@ func recoverWitnesses(ctx context.Context, wm *patroni.WitnessManager, clusterQ 
 		log.Printf("witness recovery: recovering %d witness(es)", len(infos))
 		wm.RecoverAll(infos)
 	}
+}
+
+// nameResolver implements events.NameResolver using the cluster and node queriers.
+type nameResolver struct {
+	clusterQ *queries.ClusterQuerier
+	nodeQ    *queries.NodeQuerier
+}
+
+func newNameResolver(clusterQ *queries.ClusterQuerier, nodeQ *queries.NodeQuerier) *nameResolver {
+	return &nameResolver{clusterQ: clusterQ, nodeQ: nodeQ}
+}
+
+func (r *nameResolver) ResolveClusterName(ctx context.Context, id uuid.UUID) string {
+	c, err := r.clusterQ.GetByID(ctx, id)
+	if err != nil || c == nil {
+		return ""
+	}
+	return c.Name
+}
+
+func (r *nameResolver) ResolveNodeName(ctx context.Context, id uuid.UUID) string {
+	n, err := r.nodeQ.GetByID(ctx, id)
+	if err != nil || n == nil {
+		return ""
+	}
+	return n.Hostname
 }
 
 func requireEnv(key string) string {
