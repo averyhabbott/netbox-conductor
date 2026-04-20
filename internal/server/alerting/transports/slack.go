@@ -50,7 +50,19 @@ func SendSlackBot(cfg map[string]interface{}, rule queries.AlertRule, ev events.
 		slog.Warn("alerting: slack bot delivery failed", "rule", rule.Name, "error", err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		slog.Warn("alerting: slack bot unreadable response", "rule", rule.Name, "status", resp.StatusCode)
+		return
+	}
+	if !result.OK {
+		slog.Warn("alerting: slack bot API error", "rule", rule.Name, "slack_error", result.Error)
+		return
+	}
 	slog.Info("alerting: slack bot message sent", "channel", channel, "rule", rule.Name)
 }
 
@@ -132,8 +144,11 @@ func TestSlackWebhook(cfg map[string]interface{}) error {
 func TestSlackBot(cfg map[string]interface{}) error {
 	token, _ := cfg["token_enc"].(string)
 	channel, _ := cfg["channel"].(string)
-	if token == "" || channel == "" {
-		return fmt.Errorf("token and channel are required")
+	if token == "" {
+		return fmt.Errorf("slack_bot config is missing 'token_enc' (stored config keys: %v)", cfgKeys(cfg))
+	}
+	if channel == "" {
+		return fmt.Errorf("slack_bot config is missing 'channel'")
 	}
 	body, _ := json.Marshal(map[string]string{
 		"channel": channel,
@@ -145,10 +160,41 @@ func TestSlackBot(cfg map[string]interface{}) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+
+	slog.Info("alerting: slack bot test request", "channel", channel, "token_len", len(token), "token_prefix", tokenPrefix(token))
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("slack API request failed: %w", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("slack API returned unreadable response (status %d)", resp.StatusCode)
+	}
+	if !result.OK {
+		return fmt.Errorf("slack API error: %s", result.Error)
+	}
 	return nil
+}
+
+// cfgKeys returns the keys present in a config map for diagnostic messages.
+func cfgKeys(cfg map[string]interface{}) []string {
+	keys := make([]string, 0, len(cfg))
+	for k := range cfg {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// tokenPrefix returns the first 8 chars of a token for safe diagnostic logging.
+func tokenPrefix(token string) string {
+	if len(token) <= 8 {
+		return token
+	}
+	return token[:8] + "..."
 }

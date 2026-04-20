@@ -192,14 +192,23 @@ function TransportForm({
           to: emailTo.split(',').map((s) => s.trim()).filter(Boolean),
         }
         if (smtpUser) c.smtp_user = smtpUser
-        if (smtpPass) c.smtp_pass_enc = smtpPass
+        if (smtpPass) {
+          c.smtp_pass_enc = smtpPass
+        } else if (isEdit && cfg.smtp_pass_enc) {
+          c.smtp_pass_enc = cfg.smtp_pass_enc
+        }
         return c
       }
       case 'slack_webhook':
         return { url: slackWhUrl }
       case 'slack_bot': {
         const c: Record<string, unknown> = { channel: slackChannel }
-        if (slackToken) c.token_enc = slackToken
+        if (slackToken) {
+          c.token_enc = slackToken
+        } else if (isEdit && cfg.token_enc) {
+          // preserve the stored token when editing without re-entering it
+          c.token_enc = cfg.token_enc
+        }
         return c
       }
     }

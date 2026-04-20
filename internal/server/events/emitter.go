@@ -40,6 +40,8 @@ func (e *DefaultEmitter) Emit(ev Event) {
 	if err := e.store.Insert(context.Background(), ev); err != nil {
 		slog.Warn("events: failed to persist event",
 			"code", ev.Code, "message", ev.Message, "error", err)
+	} else {
+		slog.Debug("events: persisted", "code", ev.Code, "category", ev.Category, "message", ev.Message)
 	}
 	for _, s := range e.sinks {
 		s.OnEvent(ev)
