@@ -170,13 +170,18 @@ func TestSlackBot(cfg map[string]interface{}) error {
 	defer resp.Body.Close()
 
 	var result struct {
-		OK    bool   `json:"ok"`
-		Error string `json:"error"`
+		OK       bool   `json:"ok"`
+		Error    string `json:"error"`
+		Needed   string `json:"needed"`
+		Provided string `json:"provided"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("slack API returned unreadable response (status %d)", resp.StatusCode)
 	}
 	if !result.OK {
+		if result.Needed != "" {
+			return fmt.Errorf("slack API error: %s (needed scope: %s, token has: %s)", result.Error, result.Needed, result.Provided)
+		}
 		return fmt.Errorf("slack API error: %s", result.Error)
 	}
 	return nil
