@@ -147,6 +147,29 @@ func main() {
 					Payload: json.RawMessage(ack),
 				})
 			}()
+		case protocol.TypeBackupChunk:
+			// Conductor is relaying a pgBackRest repo file chunk to us (backup sync write side).
+			go func() {
+				var chunk protocol.BackupChunkPayload
+				if err := json.Unmarshal(env.Payload, &chunk); err != nil {
+					slog.Warn("malformed backup.chunk", "error", err)
+					return
+				}
+				if err := executor.WriteBackupChunk(chunk, ""); err != nil {
+					slog.Warn("writing backup chunk", "path", chunk.RelativePath, "error", err)
+					return
+				}
+				ack, _ := json.Marshal(protocol.BackupChunkAckPayload{
+					TransferID: chunk.TransferID,
+					ChunkIndex: chunk.ChunkIndex,
+				})
+				wsClient.Send(protocol.Envelope{
+					ID:      uuid.New().String(),
+					Type:    protocol.TypeBackupChunkAck,
+					Payload: json.RawMessage(ack),
+				})
+			}()
+
 		default:
 			slog.Warn("unhandled server message type", "type", env.Type)
 		}
@@ -558,6 +581,98 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			output = string(content)
 			success = true
 		}
+
+	case protocol.TaskPGBackRestConfigure:
+		var params protocol.PGBackRestConfigParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.WritePGBackRestConfig(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskPGBackRestStanzaCreate:
+		var params protocol.PGBackRestStanzaCreateParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunPGBackRestStanzaCreate(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskPGBackRestBackup:
+		var params protocol.PGBackRestBackupParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunPGBackRestBackup(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskPGBackRestCatalog:
+		var params protocol.PGBackRestCatalogParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunPGBackRestCatalog(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskPGBackRestRestore:
+		var params protocol.PGBackRestRestoreParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunPGBackRestRestore(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
+	case protocol.TaskBackupSyncRead:
+		var params protocol.BackupSyncReadParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			err := executor.PushBackupRepo(params, func(env protocol.Envelope) {
+				client.Send(env)
+			})
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				output = "backup repo sync push complete"
+				success = true
+			}
+		}
+
+	case protocol.TaskBackupSyncWrite:
+		// Chunks arrive via TypeBackupChunk messages in the message handler.
+		// This task just signals readiness to receive.
+		output = "ready to receive backup chunks"
+		success = true
 
 	default:
 		errMsg = "unknown task type: " + string(task.TaskType)

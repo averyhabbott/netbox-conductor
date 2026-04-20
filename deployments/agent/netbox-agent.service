@@ -20,7 +20,7 @@ SyslogIdentifier=netbox-agent
 # sudo to manage systemd services (netbox, patroni, redis, etc.).
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/netbox/netbox/netbox /opt/netbox/netbox/media /etc/patroni /etc/redis /var/log/netbox-agent
+ReadWritePaths=/opt/netbox/netbox/netbox /opt/netbox/netbox/media /etc/patroni /etc/redis /etc/pgbackrest /var/log/netbox-agent
 PrivateTmp=yes
 
 [Install]

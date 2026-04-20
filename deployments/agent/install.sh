@@ -104,15 +104,15 @@ chmod 750 /etc/patroni
 # system package manager. Patroni is installed via the apt package for its
 # systemd unit, then also installed into the venv below so the venv binary is
 # what actually runs (giving us a self-contained patronictl as well).
-echo "→ Installing HA packages (patroni, redis-sentinel, python3-venv)"
+echo "→ Installing HA packages (patroni, redis-sentinel, python3-venv, pgbackrest)"
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get install -y patroni redis-sentinel python3-venv
+  apt-get install -y patroni redis-sentinel python3-venv pgbackrest
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y patroni redis-sentinel python3-virtualenv
+  dnf install -y patroni redis-sentinel python3-virtualenv pgbackrest
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y patroni redis-sentinel python3-virtualenv
+  yum install -y patroni redis-sentinel python3-virtualenv pgbackrest
 else
-  echo "  WARNING: no supported package manager found — install patroni and redis-sentinel manually"
+  echo "  WARNING: no supported package manager found — install patroni, redis-sentinel, and pgbackrest manually"
 fi
 
 # Disable the stock postgresql service so it does not restart on reboot.
@@ -126,6 +126,29 @@ systemctl disable postgresql 2>/dev/null || true
 mkdir -p /var/lib/patroni
 chown postgres:postgres /var/lib/patroni
 chmod 750 /var/lib/patroni
+
+# pgBackRest directories — agent writes /etc/pgbackrest/pgbackrest.conf (group-owned
+# netbox-agent:postgres so both can read); postgres owns the repo and log dirs.
+mkdir -p /var/lib/pgbackrest
+chown postgres:postgres /var/lib/pgbackrest
+chmod 750 /var/lib/pgbackrest
+
+mkdir -p /var/log/pgbackrest
+chown postgres:postgres /var/log/pgbackrest
+chmod 770 /var/log/pgbackrest
+
+mkdir -p /etc/pgbackrest
+chown netbox-agent:postgres /etc/pgbackrest
+chmod 755 /etc/pgbackrest
+
+# pg_ctl symlink — on Ubuntu/Debian the versioned binary is not in sudo's secure_path.
+PG_CTL=$(find /usr/lib/postgresql -name pg_ctl -type f 2>/dev/null | sort -V | tail -1)
+if [[ -n "$PG_CTL" ]]; then
+  ln -sf "$PG_CTL" /usr/local/bin/pg_ctl
+  echo "  pg_ctl symlinked: $PG_CTL → /usr/local/bin/pg_ctl"
+else
+  echo "  WARNING: pg_ctl not found under /usr/lib/postgresql — symlink not created"
+fi
 
 # ── Patroni venv ──────────────────────────────────────────────────────────────
 # Create a Python venv at $VENV_DIR containing patroni + pysyncobj (Raft DCS).

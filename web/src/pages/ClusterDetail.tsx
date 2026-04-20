@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
-import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent } from '../api/clusters'
+import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent, BackupTarget, BackupTargetType, CreateBackupTargetBody } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import type { Node, EditNodeBody } from '../api/nodes'
 import { credentialsApi, credentialLabels, secretOnlyKinds } from '../api/credentials'
@@ -2411,9 +2411,821 @@ function ClusterActionsDropdown({ clusterId, onAddNode }: { clusterId: string; o
   )
 }
 
+// ── Backups tab ───────────────────────────────────────────────────────────────
+
+const TARGET_TYPE_LABELS: Record<BackupTargetType, string> = {
+  posix: 'Local Disk',
+  s3: 'Amazon S3',
+  gcs: 'Google Cloud',
+  azure: 'Azure Blob',
+  sftp: 'SFTP Server',
+}
+
+const STORAGE_TYPE_HINTS: Record<BackupTargetType, string> = {
+  posix: 'Use a network-mounted path (NFS/SMB) to share backups across nodes',
+  s3: 'Supports AWS S3 and S3-compatible services (MinIO, Wasabi, Backblaze B2)',
+  gcs: 'Google Cloud Storage bucket',
+  azure: 'Azure Blob Storage container',
+  sftp: 'SFTP server remote path',
+}
+
+function AddStorageModal({
+  clusterId,
+  onClose,
+  existing,
+}: {
+  clusterId: string
+  onClose: () => void
+  existing?: BackupTarget
+}) {
+  const qc = useQueryClient()
+  const [type, setType] = useState<BackupTargetType>(existing?.target_type ?? 'posix')
+  const [label, setLabel] = useState(existing?.label ?? '')
+  const [posixPath, setPosixPath] = useState(existing?.posix_path ?? '')
+  const [s3Bucket, setS3Bucket] = useState(existing?.s3_bucket ?? '')
+  const [s3Region, setS3Region] = useState(existing?.s3_region ?? '')
+  const [s3Endpoint, setS3Endpoint] = useState(existing?.s3_endpoint ?? '')
+  const [s3KeyId, setS3KeyId] = useState('')
+  const [s3Secret, setS3Secret] = useState('')
+  const [gcsBucket, setGcsBucket] = useState(existing?.gcs_bucket ?? '')
+  const [gcsKey, setGcsKey] = useState('')
+  const [azureAccount, setAzureAccount] = useState(existing?.azure_account ?? '')
+  const [azureContainer, setAzureContainer] = useState(existing?.azure_container ?? '')
+  const [azureKey, setAzureKey] = useState('')
+  const [sftpHost, setSftpHost] = useState(existing?.sftp_host ?? '')
+  const [sftpPort, setSftpPort] = useState(existing?.sftp_port ?? 22)
+  const [sftpUser, setSftpUser] = useState(existing?.sftp_user ?? '')
+  const [sftpKey, setSftpKey] = useState('')
+  const [sftpPath, setSftpPath] = useState(existing?.sftp_path ?? '')
+  const [fullRet, setFullRet] = useState(existing?.full_retention ?? 2)
+  const [diffRet, setDiffRet] = useState(existing?.diff_retention ?? 7)
+  const [walRet, setWalRet] = useState(existing?.wal_retention_days ?? 14)
+  const [error, setError] = useState('')
+
+  const [testStatus, setTestStatus] = useState<'idle' | 'running' | 'ok' | 'fail'>('idle')
+  const [provisionStatus, setProvisionStatus] = useState<'idle' | 'running' | 'ok' | 'fail'>('idle')
+  const [showScriptModal, setShowScriptModal] = useState(false)
+  const [errorPopup, setErrorPopup] = useState<string | null>(null)
+  const pollAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => { pollAbortRef.current?.abort() }, [])
+
+  const pollTask = async (taskId: string): Promise<{ ok: boolean; message: string }> => {
+    const ac = new AbortController()
+    pollAbortRef.current?.abort()
+    pollAbortRef.current = ac
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+      if (ac.signal.aborted) return { ok: false, message: 'cancelled' }
+      await new Promise<void>((r) => setTimeout(r, 1500))
+      if (ac.signal.aborted) return { ok: false, message: 'cancelled' }
+      try {
+        const t = await clustersApi.getTask(taskId)
+        if (t.Status === 'success') return { ok: true, message: '' }
+        if (t.Status === 'failure' || t.Status === 'timeout') {
+          const p = t.ResponsePayload as any
+          const msg = p?.output?.trim() || p?.error || 'Command failed'
+          return { ok: false, message: typeof msg === 'string' ? msg.trim() : JSON.stringify(msg) }
+        }
+      } catch { /* keep polling */ }
+    }
+    return { ok: false, message: 'timed out waiting for result' }
+  }
+
+  const handleTestPath = async () => {
+    if (!posixPath) return
+    setTestStatus('running')
+    try {
+      const { task_id } = await clustersApi.testBackupPath(clusterId, posixPath)
+      const result = await pollTask(task_id)
+      setTestStatus(result.ok ? 'ok' : 'fail')
+      if (!result.ok) setErrorPopup(result.message)
+    } catch (e: any) {
+      setTestStatus('fail')
+      const rawMsg: string = e?.response?.data?.message ?? e?.message ?? 'Request failed'
+      setErrorPopup(e?.response?.status === 409 ? 'Node unreachable — the agent may be temporarily disconnected.' : rawMsg)
+    }
+  }
+
+  const handleProvisionPath = async () => {
+    if (!posixPath) return
+    setProvisionStatus('running')
+    try {
+      const { task_id } = await clustersApi.provisionBackupPath(clusterId, posixPath)
+      const result = await pollTask(task_id)
+      setProvisionStatus(result.ok ? 'ok' : 'fail')
+      if (!result.ok) setErrorPopup(result.message)
+    } catch (e: any) {
+      setProvisionStatus('fail')
+      const rawMsg: string = e?.response?.data?.message ?? e?.message ?? 'Request failed'
+      setErrorPopup(e?.response?.status === 409 ? 'Node unreachable — the agent may be temporarily disconnected.' : rawMsg)
+    }
+  }
+
+  const save = useMutation({
+    mutationFn: () => {
+      const body: CreateBackupTargetBody = {
+        label,
+        target_type: type,
+        full_retention: fullRet,
+        diff_retention: diffRet,
+        wal_retention_days: walRet,
+        posix_path: type === 'posix' ? posixPath : undefined,
+        s3_bucket: type === 's3' ? s3Bucket : undefined,
+        s3_region: type === 's3' ? s3Region : undefined,
+        s3_endpoint: type === 's3' && s3Endpoint ? s3Endpoint : undefined,
+        s3_key_id: type === 's3' && s3KeyId ? s3KeyId : undefined,
+        s3_secret: type === 's3' && s3Secret ? s3Secret : undefined,
+        gcs_bucket: type === 'gcs' ? gcsBucket : undefined,
+        gcs_key: type === 'gcs' && gcsKey ? gcsKey : undefined,
+        azure_account: type === 'azure' ? azureAccount : undefined,
+        azure_container: type === 'azure' ? azureContainer : undefined,
+        azure_key: type === 'azure' && azureKey ? azureKey : undefined,
+        sftp_host: type === 'sftp' ? sftpHost : undefined,
+        sftp_port: type === 'sftp' ? sftpPort : undefined,
+        sftp_user: type === 'sftp' ? sftpUser : undefined,
+        sftp_private_key: type === 'sftp' && sftpKey ? sftpKey : undefined,
+        sftp_path: type === 'sftp' ? sftpPath : undefined,
+      }
+      if (existing) {
+        return clustersApi.updateBackupTarget(clusterId, existing.id, body)
+      }
+      return clustersApi.createBackupTarget(clusterId, body)
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+      onClose()
+    },
+    onError: (e: any) => setError(e?.response?.data?.message ?? 'Save failed'),
+  })
+
+  const field = (label: string, el: React.ReactNode) => (
+    <div key={label}>
+      <label className="block text-xs text-gray-400 mb-1">{label}</label>
+      {el}
+    </div>
+  )
+  const inp = (val: string, set: (v: string) => void, placeholder?: string, type?: string) => (
+    <input
+      className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+      value={val}
+      onChange={(e) => set(e.target.value)}
+      placeholder={placeholder}
+      type={type}
+    />
+  )
+
+  return (
+    <>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+          <h2 className="font-semibold">{existing ? 'Edit Storage Location' : 'Add Storage Location'}</h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-white">✕</button>
+        </div>
+        <div className="px-6 py-4 space-y-4">
+          {field('Display name', inp(label, setLabel, 'e.g. Primary backup storage'))}
+
+          {field('Storage type',
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+              value={type}
+              onChange={(e) => setType(e.target.value as BackupTargetType)}
+              disabled={!!existing}
+            >
+              {(Object.keys(TARGET_TYPE_LABELS) as BackupTargetType[]).map((t) => (
+                <option key={t} value={t}>{TARGET_TYPE_LABELS[t]}</option>
+              ))}
+            </select>
+          )}
+          <p className="text-xs text-gray-500 -mt-2">{STORAGE_TYPE_HINTS[type]}</p>
+
+          {type === 'posix' && (
+            <div className="space-y-2">
+              {field('Path', inp(posixPath, setPosixPath, '/var/lib/postgresql/backups'))}
+              {posixPath && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={handleTestPath}
+                      disabled={testStatus === 'running' || provisionStatus === 'running'}
+                      className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white disabled:opacity-50"
+                    >
+                      {testStatus === 'running' ? 'Testing…' : 'Test path'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleProvisionPath}
+                      disabled={testStatus === 'running' || provisionStatus === 'running'}
+                      className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white disabled:opacity-50"
+                    >
+                      {provisionStatus === 'running' ? 'Provisioning…' : 'Provision directory'}
+                    </button>
+                    {(testStatus === 'fail' || provisionStatus === 'fail') && (
+                      <button
+                        type="button"
+                        onClick={() => setShowScriptModal(true)}
+                        className="text-xs px-2.5 py-1 border border-amber-800/60 rounded text-amber-400 hover:text-amber-300"
+                      >
+                        Show setup script
+                      </button>
+                    )}
+                  </div>
+                  {testStatus === 'ok' && <p className="text-xs text-emerald-400">✓ Path is writable</p>}
+                  {testStatus === 'fail' && <p className="text-xs text-red-400">✗ Path test failed</p>}
+                  {provisionStatus === 'ok' && <p className="text-xs text-emerald-400">✓ Directory created and ready</p>}
+                  {provisionStatus === 'fail' && <p className="text-xs text-red-400">✗ Provisioning failed</p>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {type === 's3' && <>
+            {field('Bucket', inp(s3Bucket, setS3Bucket, 'my-backup-bucket'))}
+            {field('Region', inp(s3Region, setS3Region, 'us-east-1'))}
+            {field('Custom endpoint (leave blank for AWS)', inp(s3Endpoint, setS3Endpoint, 'https://s3.example.com'))}
+            {field(`Access key ID${existing?.s3_key_id_set ? ' (leave blank to keep existing)' : ''}`, inp(s3KeyId, setS3KeyId, 'AKIAIOSFODNN7EXAMPLE'))}
+            {field(`Secret key${existing?.s3_secret_set ? ' (leave blank to keep existing)' : ''}`, inp(s3Secret, setS3Secret, '', 'password'))}
+          </>}
+
+          {type === 'gcs' && <>
+            {field('Bucket', inp(gcsBucket, setGcsBucket, 'my-backup-bucket'))}
+            {field(`Service account JSON key${existing?.gcs_key_set ? ' (leave blank to keep existing)' : ''}`,
+              <textarea
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500 font-mono h-24 resize-none"
+                value={gcsKey}
+                onChange={(e) => setGcsKey(e.target.value)}
+                placeholder='{"type":"service_account",...}'
+              />
+            )}
+          </>}
+
+          {type === 'azure' && <>
+            {field('Storage account', inp(azureAccount, setAzureAccount, 'mystorageaccount'))}
+            {field('Container', inp(azureContainer, setAzureContainer, 'backups'))}
+            {field(`Access key${existing?.azure_key_set ? ' (leave blank to keep existing)' : ''}`, inp(azureKey, setAzureKey, '', 'password'))}
+          </>}
+
+          {type === 'sftp' && <>
+            {field('Host', inp(sftpHost, setSftpHost, 'backup.example.com'))}
+            {field('Port', <input
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+              type="number"
+              value={sftpPort}
+              onChange={(e) => setSftpPort(Number(e.target.value))}
+            />)}
+            {field('Username', inp(sftpUser, setSftpUser, 'backup'))}
+            {field('Remote path', inp(sftpPath, setSftpPath, '/backups/netbox'))}
+            {field(`Private key${existing?.sftp_private_key_set ? ' (leave blank to keep existing)' : ''}`,
+              <textarea
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500 font-mono h-24 resize-none"
+                value={sftpKey}
+                onChange={(e) => setSftpKey(e.target.value)}
+                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+              />
+            )}
+          </>}
+
+          <div className="border-t border-gray-800 pt-4">
+            <p className="text-xs font-medium text-gray-400 mb-3">Retention settings</p>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Full backups to keep</label>
+                <input type="number" min={1} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                  value={fullRet} onChange={(e) => setFullRet(Number(e.target.value))} />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Daily snapshots (days)</label>
+                <input type="number" min={1} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                  value={diffRet} onChange={(e) => setDiffRet(Number(e.target.value))} />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Backup history (days)</label>
+                <input type="number" min={1} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                  value={walRet} onChange={(e) => setWalRet(Number(e.target.value))} />
+              </div>
+            </div>
+          </div>
+
+          {error && <p className="text-sm text-red-400">{error}</p>}
+        </div>
+        <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-800">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-400 hover:text-white">Cancel</button>
+          <button
+            onClick={() => save.mutate()}
+            disabled={save.isPending || !label}
+            className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg"
+          >
+            {save.isPending ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+    {showScriptModal && (
+      <ProvisionScriptModal path={posixPath} onClose={() => setShowScriptModal(false)} />
+    )}
+    {errorPopup && (
+      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[70] p-4">
+        <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-sm p-6 space-y-4">
+          <p className="text-sm text-red-400 whitespace-pre-wrap">{errorPopup}</p>
+          <div className="flex justify-end">
+            <button
+              onClick={() => setErrorPopup(null)}
+              className="px-4 py-2 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg"
+            >
+              OK
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
+  )
+}
+
+function ProvisionScriptModal({ path, onClose }: { path: string; onClose: () => void }) {
+  const script = `BACKUP_DIR="${path}"
+
+sudo mkdir -p "$BACKUP_DIR"
+sudo chown postgres:postgres "$BACKUP_DIR"
+sudo chmod 750 "$BACKUP_DIR"
+echo "Backup directory ready: $BACKUP_DIR"`
+
+  const [copied, setCopied] = useState(false)
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60] p-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-lg">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+          <h2 className="font-semibold text-sm">Manual Setup Script</h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-white">✕</button>
+        </div>
+        <div className="px-6 py-4 space-y-3">
+          <p className="text-sm text-gray-400">
+            SSH into each node and run these commands:
+          </p>
+          <div className="relative">
+            <pre className="bg-gray-950 border border-gray-700 rounded-lg p-4 text-xs text-gray-200 font-mono overflow-x-auto whitespace-pre">{script}</pre>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(script)
+                setCopied(true)
+                setTimeout(() => setCopied(false), 2000)
+              }}
+              className="absolute top-2 right-2 px-2 py-0.5 text-xs bg-gray-700 hover:bg-gray-600 rounded"
+            >
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+        </div>
+        <div className="flex justify-end px-6 py-4 border-t border-gray-800">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-400 hover:text-white">Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function RestoreModal({
+  clusterId,
+  oldest,
+  newest,
+  onClose,
+}: {
+  clusterId: string
+  oldest: string
+  newest: string
+  onClose: () => void
+}) {
+  const qc = useQueryClient()
+  const oldestMs = new Date(oldest).getTime()
+  const newestMs = new Date(newest).getTime()
+  const rangeMs = newestMs - oldestMs
+
+  const [sliderVal, setSliderVal] = useState(newestMs)
+  const [confirmed, setConfirmed] = useState(false)
+  const [result, setResult] = useState<string | null>(null)
+
+  const targetDate = new Date(sliderVal)
+  const targetRFC3339 = targetDate.toISOString()
+
+  const restore = useMutation({
+    mutationFn: () => clustersApi.clusterRestore(clusterId, { target_time: targetRFC3339 }),
+    onSuccess: () => {
+      setResult('Restore initiated. Track progress in the Database tab → DB Events.')
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+    },
+    onError: (e: any) => setResult('Failed: ' + (e?.response?.data?.message ?? e.message)),
+  })
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-lg">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+          <h2 className="font-semibold">Restore Database</h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-white">✕</button>
+        </div>
+        <div className="px-6 py-5 space-y-5">
+          {result ? (
+            <p className="text-sm text-gray-300">{result}</p>
+          ) : (
+            <>
+              <div className="bg-amber-900/30 border border-amber-800/50 rounded-lg p-3 text-sm text-amber-300">
+                This will take your database offline briefly and replace it with a version from the date
+                and time you select. Any data created after that point will be permanently lost.
+              </div>
+
+              <div>
+                <div className="flex justify-between text-xs text-gray-500 mb-1">
+                  <span>{new Date(oldest).toLocaleString()}</span>
+                  <span>{new Date(newest).toLocaleString()}</span>
+                </div>
+                <input
+                  type="range"
+                  className="w-full accent-blue-500"
+                  min={oldestMs}
+                  max={newestMs}
+                  step={Math.max(60_000, Math.floor(rangeMs / 1000))}
+                  value={sliderVal}
+                  onChange={(e) => setSliderVal(Number(e.target.value))}
+                />
+                <p className="text-center text-sm text-white mt-1">
+                  {targetDate.toLocaleString()}
+                  <span className="text-gray-500 text-xs ml-2">({targetRFC3339})</span>
+                </p>
+              </div>
+
+              <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={confirmed}
+                  onChange={(e) => setConfirmed(e.target.checked)}
+                />
+                I understand this will permanently replace the current database.
+              </label>
+            </>
+          )}
+        </div>
+        <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-800">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-400 hover:text-white">
+            {result ? 'Close' : 'Cancel'}
+          </button>
+          {!result && (
+            <button
+              onClick={() => restore.mutate()}
+              disabled={!confirmed || restore.isPending}
+              className="px-4 py-2 text-sm bg-red-700 hover:bg-red-600 disabled:opacity-50 rounded-lg"
+            >
+              {restore.isPending ? 'Restoring…' : 'Restore Database'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function BackupsTab({ clusterId }: { clusterId: string }) {
+  const qc = useQueryClient()
+  const [showAddStorage, setShowAddStorage] = useState(false)
+  const [editingTarget, setEditingTarget] = useState<BackupTarget | null>(null)
+  const [showRestoreModal, setShowRestoreModal] = useState(false)
+
+  const { data: config, isLoading } = useQuery({
+    queryKey: ['backup-config', clusterId],
+    queryFn: () => clustersApi.getBackupConfig(clusterId),
+    refetchInterval: 30_000,
+  })
+
+  const { data: runsData } = useQuery({
+    queryKey: ['backup-runs', clusterId],
+    queryFn: () => clustersApi.getBackupRuns(clusterId),
+    refetchInterval: 30_000,
+  })
+
+  const deleteTarget = useMutation({
+    mutationFn: (tid: string) => clustersApi.deleteBackupTarget(clusterId, tid),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+  })
+
+  const enableBackups = useMutation({
+    mutationFn: () => clustersApi.enableBackups(clusterId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+  })
+
+  const pushConfig = useMutation({
+    mutationFn: () => clustersApi.pushBackupConfig(clusterId),
+  })
+
+  const [scheduleEnabled, setScheduleEnabled] = useState(config?.schedule?.enabled ?? false)
+  const [fullCron, setFullCron] = useState(config?.schedule?.full_backup_cron ?? '0 1 * * 0')
+  const [diffCron, setDiffCron] = useState(config?.schedule?.diff_backup_cron ?? '0 1 * * 1-6')
+  const [incrHrs, setIncrHrs] = useState(config?.schedule?.incr_backup_interval_hrs ?? 1)
+
+  const saveSchedule = useMutation({
+    mutationFn: () =>
+      clustersApi.putBackupSchedule(clusterId, {
+        enabled: scheduleEnabled,
+        full_backup_cron: fullCron,
+        diff_backup_cron: diffCron,
+        incr_backup_interval_hrs: incrHrs,
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+  })
+
+  const runBackup = useMutation({
+    mutationFn: () => clustersApi.runBackup(clusterId, 'full'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-runs', clusterId] }),
+  })
+
+  const refreshCatalog = useMutation({
+    mutationFn: () => clustersApi.getBackupCatalog(clusterId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+  })
+
+  useEffect(() => {
+    if (config?.schedule) {
+      setScheduleEnabled(config.schedule.enabled)
+      setFullCron(config.schedule.full_backup_cron)
+      setDiffCron(config.schedule.diff_backup_cron)
+      setIncrHrs(config.schedule.incr_backup_interval_hrs)
+    }
+  }, [config?.schedule?.cluster_id])
+
+  const schedule = config?.schedule
+  const targets = config?.targets ?? []
+  const stanzaReady = schedule?.stanza_initialized ?? false
+
+  if (isLoading) return <p className="text-gray-500 text-sm">Loading…</p>
+
+  const runs = runsData?.runs ?? []
+  // Derive oldest/newest from the last run's completed_at as a fallback.
+  // A real catalog fetch would populate these from pgbackrest info JSON.
+  const oldest = undefined as string | undefined
+  const newest = undefined as string | undefined
+
+  return (
+    <div className="space-y-6">
+      {/* Storage locations card */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+          <div>
+            <h3 className="font-medium text-sm">Storage Locations</h3>
+            <p className="text-xs text-gray-500 mt-0.5">Where backups are stored. Up to 4 locations.</p>
+          </div>
+          <div className="flex gap-2">
+            {targets.length > 0 && (
+              <button
+                onClick={() => pushConfig.mutate()}
+                disabled={pushConfig.isPending}
+                className="text-xs px-3 py-1.5 border border-gray-700 hover:border-gray-500 rounded-lg text-gray-400 hover:text-white disabled:opacity-50"
+              >
+                {pushConfig.isPending ? 'Applying…' : 'Apply to nodes'}
+              </button>
+            )}
+            {targets.length < 4 && (
+              <button
+                onClick={() => setShowAddStorage(true)}
+                className="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg"
+              >
+                Add location
+              </button>
+            )}
+          </div>
+        </div>
+
+        {targets.length === 0 ? (
+          <div className="px-5 py-8 text-center text-gray-500 text-sm">
+            No storage locations configured. Add one to enable backups.
+          </div>
+        ) : (
+          <div className="divide-y divide-gray-800">
+            {targets.map((t) => (
+              <div key={t.id} className="flex items-center justify-between px-5 py-3">
+                <div>
+                  <span className="text-sm text-white">{t.label}</span>
+                  <span className="ml-2 text-xs px-2 py-0.5 bg-gray-800 border border-gray-700 rounded text-gray-400">
+                    {TARGET_TYPE_LABELS[t.target_type]}
+                  </span>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Keep {t.full_retention} full · {t.diff_retention} daily snapshots · {t.wal_retention_days} days history
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setEditingTarget(t)}
+                    className="text-xs text-gray-500 hover:text-white"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => { if (confirm(`Remove "${t.label}"?`)) deleteTarget.mutate(t.id) }}
+                    className="text-xs text-red-500 hover:text-red-400"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {targets.length > 0 && !stanzaReady && (
+          <div className="px-5 py-3 border-t border-gray-800 flex items-center justify-between">
+            <p className="text-xs text-amber-400">Backups not yet activated on nodes.</p>
+            <button
+              onClick={() => enableBackups.mutate()}
+              disabled={enableBackups.isPending}
+              className="text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg"
+            >
+              {enableBackups.isPending ? 'Activating…' : 'Activate backups'}
+            </button>
+          </div>
+        )}
+
+        {stanzaReady && (
+          <div className="px-5 py-2 border-t border-gray-800">
+            <span className="text-xs text-emerald-400">Backups active</span>
+          </div>
+        )}
+      </div>
+
+      {/* Schedule card */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium text-sm">Automatic Backups</h3>
+            <a
+              href="https://crontab.guru"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-gray-500 hover:text-gray-300"
+            >
+              cron help ↗
+            </a>
+          </div>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <span className="text-xs text-gray-400">Enabled</span>
+            <input
+              type="checkbox"
+              checked={scheduleEnabled}
+              onChange={(e) => setScheduleEnabled(e.target.checked)}
+              className="accent-blue-500"
+            />
+          </label>
+        </div>
+        <div className="px-5 py-4 space-y-4">
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Full backup schedule</label>
+              <input
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm font-mono text-white focus:outline-none focus:border-blue-500"
+                value={fullCron}
+                onChange={(e) => setFullCron(e.target.value)}
+                placeholder="0 1 * * 0"
+              />
+              <p className="text-xs text-gray-600 mt-0.5">cron — default: weekly Sunday 1am</p>
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Daily snapshot schedule</label>
+              <input
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm font-mono text-white focus:outline-none focus:border-blue-500"
+                value={diffCron}
+                onChange={(e) => setDiffCron(e.target.value)}
+                placeholder="0 1 * * 1-6"
+              />
+              <p className="text-xs text-gray-600 mt-0.5">cron — default: Mon–Sat 1am</p>
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Log snapshots — every N hours</label>
+              <input
+                type="number"
+                min={1}
+                max={24}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                value={incrHrs}
+                onChange={(e) => setIncrHrs(Number(e.target.value))}
+              />
+              <p className="text-xs text-gray-600 mt-0.5">captures incremental changes</p>
+            </div>
+          </div>
+          <div className="flex justify-end">
+            <button
+              onClick={() => saveSchedule.mutate()}
+              disabled={saveSchedule.isPending}
+              className="text-sm px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg"
+            >
+              {saveSchedule.isPending ? 'Saving…' : 'Save schedule'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Backup history / catalog card */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between">
+          <h3 className="font-medium text-sm">Backup History</h3>
+          <div className="flex gap-2">
+            <button
+              onClick={() => refreshCatalog.mutate()}
+              disabled={!stanzaReady || refreshCatalog.isPending}
+              className="text-xs text-gray-500 hover:text-white disabled:opacity-40"
+            >
+              {refreshCatalog.isPending ? 'Refreshing…' : 'Refresh'}
+            </button>
+            <button
+              onClick={() => runBackup.mutate()}
+              disabled={!stanzaReady || runBackup.isPending}
+              className="text-xs px-3 py-1.5 border border-gray-700 hover:border-gray-500 rounded-lg text-gray-400 hover:text-white disabled:opacity-40"
+            >
+              {runBackup.isPending ? 'Starting…' : 'Run full backup now'}
+            </button>
+            <button
+              onClick={() => setShowRestoreModal(true)}
+              disabled={!oldest || !newest}
+              className="text-xs px-3 py-1.5 bg-red-900/60 hover:bg-red-900 border border-red-800 rounded-lg text-red-300 disabled:opacity-40"
+            >
+              Restore to a previous point
+            </button>
+          </div>
+        </div>
+
+        {!stanzaReady ? (
+          <div className="px-5 py-6 text-center text-gray-500 text-sm">
+            No backup history found. Activate backups and run your first full backup to enable point-in-time restore.
+          </div>
+        ) : (
+          <div className="px-5 py-4 space-y-3">
+            {oldest && newest ? (
+              <div className="flex gap-8 text-sm">
+                <div>
+                  <p className="text-xs text-gray-500">Oldest available restore point</p>
+                  <p className="text-white">{new Date(oldest).toLocaleString()}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500">Most recent restore point</p>
+                  <p className="text-white">{new Date(newest).toLocaleString()}</p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">Click Refresh to load available restore points from nodes.</p>
+            )}
+
+            {runs.length > 0 && (
+              <div className="border-t border-gray-800 pt-3">
+                <p className="text-xs text-gray-500 mb-2">Recent backup runs</p>
+                <div className="space-y-1">
+                  {runs.slice(0, 8).map((r) => (
+                    <div key={r.id} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                          r.status === 'success' ? 'bg-emerald-400' :
+                          r.status === 'failed' || r.status === 'abandoned' ? 'bg-red-400' :
+                          r.status === 'running' ? 'bg-blue-400' : 'bg-gray-500'
+                        }`} />
+                        <span className="text-gray-400 capitalize">{r.backup_type === 'full' ? 'Full backup' : r.backup_type === 'diff' ? 'Daily snapshot' : 'Log snapshot'}</span>
+                        {r.attempt > 1 && <span className="text-amber-500">attempt {r.attempt}</span>}
+                      </div>
+                      <div className="flex items-center gap-3 text-gray-500">
+                        <span className={r.status === 'success' ? 'text-emerald-400' : r.status === 'failed' || r.status === 'abandoned' ? 'text-red-400' : ''}>
+                          {r.status}
+                        </span>
+                        <span>{new Date(r.scheduled_at).toLocaleString()}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {(showAddStorage || editingTarget) && (
+        <AddStorageModal
+          clusterId={clusterId}
+          existing={editingTarget ?? undefined}
+          onClose={() => { setShowAddStorage(false); setEditingTarget(null) }}
+        />
+      )}
+
+      {showRestoreModal && oldest && newest && (
+        <RestoreModal
+          clusterId={clusterId}
+          oldest={oldest}
+          newest={newest}
+          onClose={() => setShowRestoreModal(false)}
+        />
+      )}
+    </div>
+  )
+}
+
 // ── Tab / sub-tab type definitions ────────────────────────────────────────────
 
-type Tab = 'overview' | 'settings' | 'history'
+type Tab = 'overview' | 'settings' | 'history' | 'backups'
 
 const SETTINGS_TABS = [
   { id: 'general', label: 'General' },
@@ -2592,17 +3404,22 @@ export default function ClusterDetail() {
 
       {/* Top-level tabs */}
       <div className="border-b border-gray-800 mb-6">
-        {(['overview', 'settings', 'history'] as Tab[]).map((t) => (
+        {([
+          { id: 'overview', label: 'Overview' },
+          { id: 'settings', label: 'Settings' },
+          { id: 'backups', label: 'Backups' },
+          { id: 'history', label: 'History' },
+        ] as { id: Tab; label: string }[]).map((t) => (
           <button
-            key={t}
-            onClick={() => goToTab(t)}
-            className={`px-4 py-2 text-sm capitalize border-b-2 -mb-px transition-colors ${
-              tab === t
+            key={t.id}
+            onClick={() => goToTab(t.id)}
+            className={`px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+              tab === t.id
                 ? 'border-blue-500 text-white'
                 : 'border-transparent text-gray-400 hover:text-white'
             }`}
           >
-            {t}
+            {t.label}
           </button>
         ))}
       </div>
@@ -2770,6 +3587,11 @@ export default function ClusterDetail() {
             <FailoverCard cluster={cluster} nodes={nodes} onOpenSyncModal={() => setShowSyncModal(true)} />
           )}
         </div>
+      )}
+
+      {/* ── Backups tab ── */}
+      {tab === 'backups' && id && (
+        <BackupsTab clusterId={id} />
       )}
 
       {/* ── History tab ── */}

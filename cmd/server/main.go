@@ -145,6 +145,10 @@ func run(ctx context.Context) error {
 	stagingTokQ := queries.NewStagingTokenQuerier(store.Pool())
 	stagingAgentQ := queries.NewStagingAgentQuerier(store.Pool())
 	retentionQ := queries.NewRetentionQuerier(store.Pool())
+	backupTargetQ := queries.NewBackupTargetQuerier(store.Pool())
+	backupScheduleQ := queries.NewBackupScheduleQuerier(store.Pool())
+	backupRunQ := queries.NewBackupRunQuerier(store.Pool())
+	backupCatalogQ := queries.NewBackupCatalogQuerier(store.Pool())
 	clusterQ := queries.NewClusterQuerier(store.Pool())
 	credQ := queries.NewCredentialQuerier(store.Pool())
 	auditQ := queries.NewAuditQuerier(store.Pool())
@@ -231,6 +235,11 @@ func run(ctx context.Context) error {
 	configHandler.SetEmitter(emitter)
 	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, enc, dispatcher, witnessManager)
 	patroniHandler.SetEmitter(emitter)
+	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, enc, dispatcher)
+	backupHandler.SetEmitter(emitter)
+	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, dispatcher)
+	backupScheduler.SetEmitter(emitter)
+	go backupScheduler.Run(ctx)
 	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)
 
 	// Router
@@ -243,6 +252,7 @@ func run(ctx context.Context) error {
 		DownloadHandler:   downloadHandler,
 		ConfigHandler:     configHandler,
 		PatroniHandler:    patroniHandler,
+		BackupHandler:     backupHandler,
 		StagingHandler:    stagingHandler,
 		MetricsHandler:    metricsHandler,
 		AlertHandler:      alertHandler,

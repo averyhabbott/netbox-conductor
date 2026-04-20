@@ -15,6 +15,8 @@ const (
 	TypeTaskResult          MessageType = "task.result"
 	TypeMediaChunk          MessageType = "media.chunk"
 	TypeMediaChunkAck       MessageType = "media.chunk.ack"
+	TypeBackupChunk         MessageType = "backup.chunk"
+	TypeBackupChunkAck      MessageType = "backup.chunk.ack"
 	TypeNetboxLog           MessageType = "netbox.log"
 
 	// Server → Agent
@@ -47,6 +49,15 @@ const (
 	TaskEnforceRetention  TaskType = "backup.expire"   // run pgbackrest expire / retention enforcement
 	TaskAgentUpgrade      TaskType = "agent.upgrade"   // self-upgrade the agent binary
 	TaskReadNetboxConfig  TaskType = "config.read"     // read /opt/netbox/.../configuration.py from agent
+
+	// pgBackRest backup management
+	TaskPGBackRestConfigure    TaskType = "pgbackrest.configure"    // write /etc/pgbackrest/pgbackrest.conf
+	TaskPGBackRestStanzaCreate TaskType = "pgbackrest.stanza-create" // stanza-create + stanza-check (one-time bootstrap)
+	TaskPGBackRestBackup       TaskType = "pgbackrest.backup"       // run pgbackrest backup (full|diff|incr)
+	TaskPGBackRestCatalog      TaskType = "pgbackrest.catalog"      // pgbackrest info --output=json
+	TaskPGBackRestRestore      TaskType = "pgbackrest.restore"      // full cluster restore (stops Patroni, runs pgBackRest restore)
+	TaskBackupSyncRead         TaskType = "backup.sync.read"        // read local pgBackRest repo for conductor-relayed sync
+	TaskBackupSyncWrite        TaskType = "backup.sync.write"       // write conductor-relayed backup repo chunks to disk
 )
 
 // Envelope wraps every WebSocket message.
@@ -138,6 +149,23 @@ type MediaChunkPayload struct {
 
 // MediaChunkAckPayload acknowledges receipt of a chunk (backpressure).
 type MediaChunkAckPayload struct {
+	TransferID string `json:"transfer_id"`
+	ChunkIndex int    `json:"chunk_index"`
+}
+
+// BackupChunkPayload carries a chunk of a pgBackRest repo file relayed through the server.
+// Mirrors MediaChunkPayload. Files are skipped on the write side if they already exist
+// (pgBackRest repo files are immutable once written — same relative path = same content).
+type BackupChunkPayload struct {
+	TransferID   string `json:"transfer_id"`
+	RelativePath string `json:"relative_path"` // path relative to the repo root
+	ChunkIndex   int    `json:"chunk_index"`
+	Data         []byte `json:"data"`
+	EOF          bool   `json:"eof"`
+}
+
+// BackupChunkAckPayload acknowledges receipt of a backup chunk (backpressure).
+type BackupChunkAckPayload struct {
 	TransferID string `json:"transfer_id"`
 	ChunkIndex int    `json:"chunk_index"`
 }
@@ -281,4 +309,63 @@ type EnforceRetentionParams struct {
 type AgentUpgradeParams struct {
 	DownloadURL string `json:"download_url"` // full URL of the tarball (e.g. https://conductor:8443/api/v1/downloads/agent-linux-amd64)
 	Arch        string `json:"arch"`         // "amd64" | "arm64"
+}
+
+// ────────────────────────────────────────────────────────────────
+// pgBackRest backup params
+// ────────────────────────────────────────────────────────────────
+
+// PGBackRestConfigParams are the params for TaskPGBackRestConfigure.
+// The conductor renders pgbackrest.conf from the cluster's backup targets and
+// pushes it to each node; the agent writes the file atomically.
+type PGBackRestConfigParams struct {
+	Config string `json:"config"` // rendered pgbackrest.conf content
+	Sha256 string `json:"sha256"` // hex SHA-256 of Config for integrity check
+}
+
+// PGBackRestStanzaCreateParams are the params for TaskPGBackRestStanzaCreate.
+// Run once after the first config push. Runs stanza-create then stanza-check.
+type PGBackRestStanzaCreateParams struct {
+	Stanza string `json:"stanza"` // pgBackRest stanza name (= Patroni scope)
+}
+
+// PGBackRestBackupParams are the params for TaskPGBackRestBackup.
+type PGBackRestBackupParams struct {
+	Stanza string `json:"stanza"`
+	Type   string `json:"type"` // "full" | "diff" | "incr"
+}
+
+// PGBackRestCatalogParams are the params for TaskPGBackRestCatalog.
+// The agent runs `pgbackrest info --output=json` and returns the raw JSON output.
+type PGBackRestCatalogParams struct {
+	Stanza string `json:"stanza"`
+}
+
+// PGBackRestRestoreParams are the params for TaskPGBackRestRestore.
+// The conductor stops all cluster nodes before dispatching this task.
+// The agent orchestrates the full PostgreSQL recovery lifecycle.
+type PGBackRestRestoreParams struct {
+	Stanza     string `json:"stanza"`
+	TargetTime string `json:"target_time"` // RFC3339 UTC
+	DataDir    string `json:"data_dir"`    // PostgreSQL data directory (from Patroni config)
+	RestoreCmd string `json:"restore_cmd"` // optional: override the default pgbackrest restore command
+}
+
+// BackupSyncReadParams are the params for TaskBackupSyncRead.
+// The agent walks the local pgBackRest repo, hashes each file, and streams
+// new/changed files as chunks through the conductor relay to target nodes.
+// This mirrors the MediaSyncParams chunked-transfer pattern.
+type BackupSyncReadParams struct {
+	RepoPath    string   `json:"repo_path"`    // local pgBackRest repo dir; default /var/lib/pgbackrest
+	TransferID  string   `json:"transfer_id"`  // correlates read and write sides
+	ChunkSizeB  int      `json:"chunk_size"`   // bytes per chunk; default 65536
+	TargetNodes []string `json:"target_nodes"` // node IDs to relay chunks to
+}
+
+// BackupSyncWriteParams are the params for TaskBackupSyncWrite.
+// The agent receives chunks relayed by the conductor and writes them into
+// its local pgBackRest repo directory.
+type BackupSyncWriteParams struct {
+	RepoPath   string `json:"repo_path"`   // destination pgBackRest repo dir
+	TransferID string `json:"transfer_id"` // matches BackupSyncReadParams.TransferID
 }

@@ -14,9 +14,11 @@ netbox-agent ALL=(ALL) NOPASSWD: \
   /usr/bin/systemctl restart redis-sentinel, \
   /usr/bin/systemctl restart netbox-agent
 
-# Database backup: run pg_dump and create backup directory as the postgres OS user
+# Database backup: run pg_dump, psql, pgbackrest, and pg_ctl as the postgres OS user
 # so that peer authentication works without a password.
 netbox-agent ALL=(postgres) NOPASSWD: \
   /usr/bin/pg_dump, \
   /usr/bin/psql, \
-  /bin/mkdir
+  /bin/mkdir, \
+  /usr/bin/pgbackrest, \
+  /usr/local/bin/pg_ctl

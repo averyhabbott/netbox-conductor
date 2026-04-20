@@ -26,6 +26,7 @@ type RouterConfig struct {
 	CredentialHandler *handlers.CredentialHandler
 	ConfigHandler     *handlers.ConfigHandler
 	PatroniHandler    *handlers.PatroniHandler
+	BackupHandler     *handlers.BackupHandler
 	DownloadHandler   *handlers.DownloadHandler
 	StagingHandler    *handlers.StagingHandler
 	MetricsHandler    *handlers.MetricsHandler
@@ -154,6 +155,23 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.GET("/clusters/:id/retention-policy", cfg.PatroniHandler.GetRetentionPolicy)
 	protected.PUT("/clusters/:id/retention-policy", cfg.PatroniHandler.SetRetentionPolicy, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/retention-policy/enforce", cfg.PatroniHandler.EnforceRetention, mw.RequireRole("operator"))
+
+	// ── Backups ──────────────────────────────────────────────────────────────
+	if cfg.BackupHandler != nil {
+		protected.GET("/clusters/:id/backup-config", cfg.BackupHandler.GetBackupConfig)
+		protected.PUT("/clusters/:id/backup-config", cfg.BackupHandler.PutBackupSchedule, mw.RequireRole("operator"))
+		protected.POST("/clusters/:id/backup-config/enable", cfg.BackupHandler.EnableBackups, mw.RequireRole("admin"))
+		protected.POST("/clusters/:id/backup-config/push", cfg.BackupHandler.PushBackupConfig, mw.RequireRole("operator"))
+		protected.POST("/clusters/:id/backup-targets", cfg.BackupHandler.CreateBackupTarget, mw.RequireRole("operator"))
+		protected.PUT("/clusters/:id/backup-targets/:tid", cfg.BackupHandler.UpdateBackupTarget, mw.RequireRole("operator"))
+		protected.DELETE("/clusters/:id/backup-targets/:tid", cfg.BackupHandler.DeleteBackupTarget, mw.RequireRole("operator"))
+		protected.GET("/clusters/:id/backup-catalog", cfg.BackupHandler.GetBackupCatalog)
+		protected.POST("/clusters/:id/backup/run", cfg.BackupHandler.RunBackup, mw.RequireRole("operator"))
+		protected.POST("/clusters/:id/backup-restore", cfg.BackupHandler.ClusterRestore, mw.RequireRole("admin"))
+		protected.GET("/clusters/:id/backup-runs", cfg.BackupHandler.GetBackupRuns)
+		protected.POST("/clusters/:id/backup-path/test", cfg.BackupHandler.TestBackupPath, mw.RequireRole("operator"))
+		protected.POST("/clusters/:id/backup-path/provision", cfg.BackupHandler.ProvisionBackupPath, mw.RequireRole("operator"))
+	}
 
 	// ── Sentinel ────────────────────────────────────────────────────────────────
 	protected.POST("/clusters/:id/sentinel/push-config", cfg.PatroniHandler.PushSentinelConfig, mw.RequireRole("operator"))
