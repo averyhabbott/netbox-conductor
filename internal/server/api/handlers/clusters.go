@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/api/middleware"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
@@ -24,6 +27,7 @@ type ClusterHandler struct {
 	regToks   *queries.RegistrationTokenQuerier
 	hub       *hub.Hub
 	witnesses WitnessManager
+	emitter   events.Emitter
 }
 
 func NewClusterHandler(
@@ -40,6 +44,16 @@ func NewClusterHandler(
 		hub:       h,
 		witnesses: witnesses,
 	}
+}
+
+func (h *ClusterHandler) SetEmitter(e events.Emitter) { h.emitter = e }
+
+// actorFromCtx returns the requesting user's ID, or "system" as a fallback.
+func actorFromCtx(c echo.Context) string {
+	if id, _ := c.Get(middleware.ContextKeyUserID).(string); id != "" {
+		return id
+	}
+	return events.ActorSystem
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -156,6 +170,12 @@ func (h *ClusterHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "cluster name already exists")
 	}
 
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityInfo, events.CodeClusterCreated,
+			fmt.Sprintf("Cluster %q created", cluster.Name), actorFromCtx(c)).
+			Cluster(cluster.ID).Build())
+	}
+
 	return c.JSON(http.StatusCreated, toClusterResponse(cluster))
 }
 
@@ -230,6 +250,12 @@ func (h *ClusterHandler) UpdateFailoverSettings(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch updated cluster")
 	}
 
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityInfo, events.CodeClusterFailoverUpdated,
+			fmt.Sprintf("Failover settings updated for cluster %q", cluster.Name), actorFromCtx(c)).
+			Cluster(id).Build())
+	}
+
 	return c.JSON(http.StatusOK, toClusterResponse(cluster))
 }
 
@@ -244,7 +270,8 @@ func (h *ClusterHandler) Delete(c echo.Context) error {
 	}
 
 	// Verify cluster exists before doing anything destructive
-	if _, err := h.clusters.GetByID(c.Request().Context(), id); err != nil {
+	cluster, err := h.clusters.GetByID(c.Request().Context(), id)
+	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
 	}
 
@@ -257,6 +284,11 @@ func (h *ClusterHandler) Delete(c echo.Context) error {
 	// Delete from DB — CASCADE handles nodes, credentials, configs, tokens, tasks, audit logs
 	if err := h.clusters.Delete(c.Request().Context(), id); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete cluster")
+	}
+
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityWarn, events.CodeClusterDeleted,
+			fmt.Sprintf("Cluster %q deleted", cluster.Name), actorFromCtx(c)).Build())
 	}
 
 	return c.NoContent(http.StatusNoContent)

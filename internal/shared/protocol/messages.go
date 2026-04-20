@@ -7,14 +7,15 @@ type MessageType string
 
 const (
 	// Agent → Server
-	TypeAgentHello     MessageType = "agent.hello"
-	TypeAgentHeartbeat MessageType = "agent.heartbeat"
-	TypePatroniState   MessageType = "patroni.state"
-	TypeTaskAck        MessageType = "task.ack"
-	TypeTaskResult     MessageType = "task.result"
-	TypeMediaChunk     MessageType = "media.chunk"
-	TypeMediaChunkAck  MessageType = "media.chunk.ack"
-	TypeNetboxLog      MessageType = "netbox.log"
+	TypeAgentHello          MessageType = "agent.hello"
+	TypeAgentHeartbeat      MessageType = "agent.heartbeat"
+	TypePatroniState        MessageType = "patroni.state"
+	TypeServiceStateChange  MessageType = "agent.service_state_change"
+	TypeTaskAck             MessageType = "task.ack"
+	TypeTaskResult          MessageType = "task.result"
+	TypeMediaChunk          MessageType = "media.chunk"
+	TypeMediaChunkAck       MessageType = "media.chunk.ack"
+	TypeNetboxLog           MessageType = "netbox.log"
 
 	// Server → Agent
 	TypeServerHello  MessageType = "server.hello"
@@ -95,10 +96,18 @@ type HeartbeatPayload struct {
 
 // PatroniStatePayload is sent proactively when the agent detects a role change.
 type PatroniStatePayload struct {
-	NodeID      string          `json:"node_id"`
-	Role        string          `json:"role"`
-	PrevRole    string          `json:"prev_role"`
-	StateJSON   json.RawMessage `json:"state"`
+	NodeID    string          `json:"node_id"`
+	Role      string          `json:"role"`
+	PrevRole  string          `json:"prev_role"`
+	StateJSON json.RawMessage `json:"state"`
+}
+
+// ServiceStateChangePayload is sent immediately when the agent detects a service
+// start or stop, providing faster alerting than the 15-second heartbeat cycle.
+type ServiceStateChangePayload struct {
+	NodeID  string `json:"node_id"`
+	Service string `json:"service"` // "netbox"|"rq"|"patroni"|"postgres"|"redis"|"sentinel"
+	Running bool   `json:"running"`
 }
 
 // TaskAckPayload confirms that the agent received a task dispatch.

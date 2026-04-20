@@ -1,24 +1,29 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 )
 
 // CredentialHandler handles credential CRUD for clusters.
 type CredentialHandler struct {
-	creds *queries.CredentialQuerier
-	enc   *crypto.Encryptor
+	creds   *queries.CredentialQuerier
+	enc     *crypto.Encryptor
+	emitter events.Emitter
 }
 
 func NewCredentialHandler(creds *queries.CredentialQuerier, enc *crypto.Encryptor) *CredentialHandler {
 	return &CredentialHandler{creds: creds, enc: enc}
 }
+
+func (h *CredentialHandler) SetEmitter(e events.Emitter) { h.emitter = e }
 
 type credentialResponse struct {
 	ID        string  `json:"id"`
@@ -159,6 +164,12 @@ func (h *CredentialHandler) GenerateCredentials(c echo.Context) error {
 		})
 	}
 
+	if h.emitter != nil && len(results) > 0 {
+		cid, _ := uuid.Parse(c.Param("id"))
+		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityWarn, events.CodeCredentialRotated,
+			fmt.Sprintf("Credentials generated for cluster (%d kinds)", len(results)), actorFromCtx(c)).
+			Cluster(cid).Build())
+	}
 	return c.JSON(http.StatusOK, map[string]any{
 		"generated": results,
 		"warning":   "These passwords will not be shown again. Copy them now.",

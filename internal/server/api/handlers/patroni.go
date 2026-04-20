@@ -13,6 +13,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
@@ -28,11 +29,14 @@ type PatroniHandler struct {
 	configs        *queries.ConfigQuerier
 	taskResults    *queries.TaskResultQuerier
 	retention      *queries.RetentionQuerier
-	failoverEvents *queries.FailoverEventQuerier
+	eventQ         *queries.EventQuerier
 	enc            *crypto.Encryptor
 	dispatcher     *hub.Dispatcher
 	witness        *patroni.WitnessManager
+	emitter        events.Emitter
 }
+
+func (h *PatroniHandler) SetEmitter(e events.Emitter) { h.emitter = e }
 
 func NewPatroniHandler(
 	clusters *queries.ClusterQuerier,
@@ -41,7 +45,7 @@ func NewPatroniHandler(
 	configs *queries.ConfigQuerier,
 	taskResults *queries.TaskResultQuerier,
 	retention *queries.RetentionQuerier,
-	failoverEvents *queries.FailoverEventQuerier,
+	eventQ *queries.EventQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	witness *patroni.WitnessManager,
@@ -53,7 +57,7 @@ func NewPatroniHandler(
 		configs:        configs,
 		taskResults:    taskResults,
 		retention:      retention,
-		failoverEvents: failoverEvents,
+		eventQ:         eventQ,
 		enc:            enc,
 		dispatcher:     dispatcher,
 		witness:        witness,
@@ -244,6 +248,11 @@ func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
 			NodeID: node.ID.String(), Hostname: node.Hostname,
 			TaskID: taskID.String(), Status: "dispatched",
 		})
+	}
+
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodePatroniConfigured,
+			fmt.Sprintf("Patroni config pushed to cluster"), actorFromCtx(c)).Cluster(clusterID).Build())
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
@@ -1495,6 +1504,12 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		"warnings", len(warnings),
 	)
 
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodeFailoverConfigured,
+			fmt.Sprintf("Failover configured for cluster (primary: %s)", primaryNode.Hostname),
+			actorFromCtx(c)).Cluster(clusterID).Build())
+	}
+
 	return c.JSON(http.StatusOK, map[string]any{
 		"cluster_id":                  clusterID.String(),
 		"witness_addr":                witnessAddr,
@@ -1510,20 +1525,23 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	})
 }
 
-// ListFailoverEvents returns the most recent failover/failback events for a cluster.
+// ListFailoverEvents returns the most recent HA events (category=ha) for a cluster.
 // GET /api/v1/clusters/:id/failover-events
 func (h *PatroniHandler) ListFailoverEvents(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
 	}
-
-	events, err := h.failoverEvents.ListByCluster(c.Request().Context(), clusterID, 50)
+	evs, err := h.eventQ.List(c.Request().Context(), queries.EventFilter{
+		Category:  "ha",
+		ClusterID: &clusterID,
+		Limit:     50,
+	})
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list failover events")
 	}
-	if events == nil {
-		events = []queries.FailoverEvent{}
+	if len(evs) == 0 {
+		return c.JSON(http.StatusOK, []struct{}{})
 	}
-	return c.JSON(http.StatusOK, events)
+	return c.JSON(http.StatusOK, evs)
 }

@@ -12,7 +12,8 @@ import type { ReadNodeConfigResult } from '../api/configs'
 import { patroniApi } from '../api/patroni'
 import type { PushResult } from '../api/patroni'
 import { alertsApi } from '../api/alerts'
-import type { ClusterLogEntry } from '../api/alerts'
+import { eventsApi } from '../api/events'
+import EventsTable from '../components/EventsTable'
 import client from '../api/client'
 import Layout from '../components/Layout'
 import AddNodeWizard from './AddNodeWizard'
@@ -1833,76 +1834,64 @@ function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
 
 // ── Cluster logs tab ──────────────────────────────────────────────────────────
 
-const LOG_LEVEL_COLOR: Record<string, string> = {
-  debug: 'text-gray-500',
-  info: 'text-gray-300',
-  warn: 'text-amber-400',
-  error: 'text-red-400',
+function ClusterLogsTab() {
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['system-logs'],
+    queryFn: () => alertsApi.systemLogs(300),
+    refetchInterval: 15_000,
+  })
+
+  const lines = data?.lines ?? []
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-medium">Conductor Logs</h3>
+        <button onClick={() => refetch()} className="text-xs text-gray-500 hover:text-gray-300">Refresh</button>
+      </div>
+      {isLoading ? (
+        <p className="text-gray-500 text-sm">Loading…</p>
+      ) : (
+        <div className="bg-gray-950 border border-gray-800 rounded-xl overflow-hidden">
+          <div className="max-h-[32rem] overflow-y-auto p-4 font-mono text-xs text-gray-400 space-y-0.5">
+            {lines.length === 0 ? (
+              <p className="text-gray-600">No log lines available.</p>
+            ) : (
+              lines.map((line, i) => <div key={i} className="break-all">{line}</div>)
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }
 
-const LOG_SOURCE_BADGE: Record<string, string> = {
-  conductor: 'bg-blue-900/40 text-blue-300',
-  agent: 'bg-purple-900/40 text-purple-300',
-  netbox: 'bg-emerald-900/40 text-emerald-300',
-}
-
-function ClusterLogsTab({ clusterId }: { clusterId: string }) {
-  const [minLevel, setMinLevel] = useState('')
-  const { data: entries = [], isLoading, refetch } = useQuery({
-    queryKey: ['cluster-logs', clusterId, minLevel],
-    queryFn: () => alertsApi.clusterLogs(clusterId, { level: minLevel || undefined, limit: 300 }),
+function ClusterEventsTab({ clusterId }: { clusterId: string }) {
+  const [category, setCategory] = useState('')
+  const { data: events = [], isLoading, refetch } = useQuery({
+    queryKey: ['cluster-events', clusterId, category],
+    queryFn: () => eventsApi.listForCluster(clusterId, { category: category || undefined, limit: 200 }),
     refetchInterval: 15_000,
   })
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h3 className="font-medium">Cluster Logs</h3>
         <div className="flex items-center gap-3">
-          <select
-            value={minLevel}
-            onChange={(e) => setMinLevel(e.target.value)}
-            className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 focus:outline-none"
-          >
-            <option value="">All levels</option>
-            <option value="debug">Debug+</option>
-            <option value="info">Info+</option>
-            <option value="warn">Warn+</option>
-            <option value="error">Error only</option>
-          </select>
-          <button onClick={() => refetch()} className="text-xs text-gray-500 hover:text-gray-300">
-            Refresh
-          </button>
-        </div>
-      </div>
-
-      {isLoading ? (
-        <p className="text-gray-500 text-sm">Loading…</p>
-      ) : entries.length === 0 ? (
-        <p className="text-gray-500 text-sm">No log entries yet.</p>
-      ) : (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-          <div className="max-h-[32rem] overflow-y-auto divide-y divide-gray-800/60">
-            {entries.map((e: ClusterLogEntry) => (
-              <div key={e.id} className="px-4 py-2 flex items-start gap-3 text-xs">
-                <span className="text-gray-600 flex-shrink-0 w-36 font-mono">
-                  {new Date(e.occurred_at).toLocaleTimeString()}
-                </span>
-                <span className={`font-bold w-10 flex-shrink-0 ${LOG_LEVEL_COLOR[e.level] ?? 'text-gray-400'}`}>
-                  {e.level.toUpperCase()}
-                </span>
-                <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${LOG_SOURCE_BADGE[e.source] ?? 'bg-gray-800 text-gray-400'}`}>
-                  {e.source}
-                </span>
-                {e.hostname && (
-                  <span className="text-gray-500 flex-shrink-0">{e.hostname}</span>
-                )}
-                <span className="text-gray-200 break-all">{e.message}</span>
-              </div>
+          <h3 className="font-medium">Cluster Events</h3>
+          <select value={category} onChange={(e) => setCategory(e.target.value)}
+            className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 focus:outline-none">
+            <option value="">All categories</option>
+            {['cluster','service','ha','config','agent'].map((c) => (
+              <option key={c} value={c}>{c}</option>
             ))}
-          </div>
+          </select>
         </div>
-      )}
+        <button onClick={() => refetch()} className="text-xs text-gray-500 hover:text-gray-300">Refresh</button>
+      </div>
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <EventsTable events={events} loading={isLoading} />
+      </div>
     </div>
   )
 }
@@ -2434,8 +2423,9 @@ const SETTINGS_TABS = [
 
 const HISTORY_TABS = [
   { id: 'events', label: 'Events' },
+  { id: 'ha-events', label: 'HA Events' },
   { id: 'api-history', label: 'API History' },
-  { id: 'cluster-logs', label: 'Cluster Logs' },
+  { id: 'cluster-logs', label: 'Conductor Logs' },
   { id: 'node-logs', label: 'Node Logs' },
   { id: 'db-events', label: 'Database Events' },
 ]
@@ -2788,6 +2778,10 @@ export default function ClusterDetail() {
           <SubTabBar tabs={HISTORY_TABS} active={historySub} onChange={goToSub} />
 
           {historySub === 'events' && (
+            <ClusterEventsTab clusterId={id} />
+          )}
+
+          {historySub === 'ha-events' && (
             <FailoverHistoryTab events={failoverEvents ?? []} />
           )}
 
@@ -2796,7 +2790,7 @@ export default function ClusterDetail() {
           )}
 
           {historySub === 'cluster-logs' && (
-            <ClusterLogsTab clusterId={id} />
+            <ClusterLogsTab />
           )}
 
           {historySub === 'node-logs' && (

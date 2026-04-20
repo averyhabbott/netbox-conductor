@@ -30,6 +30,8 @@ type RouterConfig struct {
 	StagingHandler    *handlers.StagingHandler
 	MetricsHandler    *handlers.MetricsHandler
 	AlertHandler      *handlers.AlertHandler
+	EventsHandler     *handlers.EventsHandler
+	SyslogHandler     *handlers.SyslogHandler
 	TaskResultQuerier *queries.TaskResultQuerier
 	SSEBroker         *sse.Broker
 	AuditQuerier      *queries.AuditQuerier
@@ -94,7 +96,7 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/settings/tls/regenerate", cfg.AuthHandler.RegenerateCert, mw.RequireRole("admin"))
 
 	// SSE live event stream
-	protected.GET("/events", echo.WrapHandler(cfg.SSEBroker))
+	protected.GET("/events/stream", echo.WrapHandler(cfg.SSEBroker))
 
 	// ── Clusters ────────────────────────────────────────────────────────────
 	protected.GET("/clusters", cfg.ClusterHandler.List)
@@ -161,16 +163,53 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.PUT("/clusters/:id/credentials/:kind", cfg.CredentialHandler.Upsert, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/credentials/generate", cfg.CredentialHandler.GenerateCredentials, mw.RequireRole("operator"))
 
-	// ── Alerts ──────────────────────────────────────────────────────────────────
+	// ── Events log ──────────────────────────────────────────────────────────────
+	if cfg.EventsHandler != nil {
+		protected.GET("/events", cfg.EventsHandler.ListEvents)
+		protected.GET("/heartbeats", cfg.EventsHandler.ListHeartbeats)
+		protected.GET("/clusters/:id/events", cfg.EventsHandler.ListClusterEvents)
+		protected.GET("/clusters/:id/nodes/:nid/events", cfg.EventsHandler.ListNodeEvents)
+	}
+
+	// ── Alert Rules ──────────────────────────────────────────────────────────────
 	if cfg.AlertHandler != nil {
-		protected.GET("/alerts", cfg.AlertHandler.ListActiveAlerts)
-		protected.POST("/alerts/:id/acknowledge", cfg.AlertHandler.AcknowledgeAlert, mw.RequireRole("operator"))
-		protected.GET("/alert-configs", cfg.AlertHandler.ListAlertConfigs)
-		protected.POST("/alert-configs", cfg.AlertHandler.CreateAlertConfig, mw.RequireRole("operator"))
-		protected.PUT("/alert-configs/:id", cfg.AlertHandler.UpdateAlertConfig, mw.RequireRole("operator"))
-		protected.DELETE("/alert-configs/:id", cfg.AlertHandler.DeleteAlertConfig, mw.RequireRole("operator"))
-		protected.GET("/clusters/:id/logs", cfg.AlertHandler.ClusterLogs)
+		protected.GET("/alerts/rules", cfg.AlertHandler.ListRules)
+		protected.POST("/alerts/rules", cfg.AlertHandler.CreateRule, mw.RequireRole("operator"))
+		protected.GET("/alerts/rules/:id", cfg.AlertHandler.GetRule)
+		protected.PUT("/alerts/rules/:id", cfg.AlertHandler.UpdateRule, mw.RequireRole("operator"))
+		protected.DELETE("/alerts/rules/:id", cfg.AlertHandler.DeleteRule, mw.RequireRole("operator"))
+
+		protected.GET("/alerts/transports", cfg.AlertHandler.ListTransports)
+		protected.POST("/alerts/transports", cfg.AlertHandler.CreateTransport, mw.RequireRole("operator"))
+		protected.GET("/alerts/transports/:id", cfg.AlertHandler.GetTransport)
+		protected.PUT("/alerts/transports/:id", cfg.AlertHandler.UpdateTransport, mw.RequireRole("operator"))
+		protected.DELETE("/alerts/transports/:id", cfg.AlertHandler.DeleteTransport, mw.RequireRole("operator"))
+		protected.POST("/alerts/transports/:id/test", cfg.AlertHandler.TestTransport, mw.RequireRole("operator"))
+
+		protected.GET("/alerts/schedules", cfg.AlertHandler.ListSchedules)
+		protected.POST("/alerts/schedules", cfg.AlertHandler.CreateSchedule, mw.RequireRole("operator"))
+		protected.GET("/alerts/schedules/:id", cfg.AlertHandler.GetSchedule)
+		protected.PUT("/alerts/schedules/:id", cfg.AlertHandler.UpdateSchedule, mw.RequireRole("operator"))
+		protected.DELETE("/alerts/schedules/:id", cfg.AlertHandler.DeleteSchedule, mw.RequireRole("operator"))
+
+		protected.GET("/alerts/active", cfg.AlertHandler.ListActiveAlerts)
+		protected.POST("/alerts/active/:id/acknowledge", cfg.AlertHandler.AcknowledgeAlert, mw.RequireRole("operator"))
+		protected.POST("/alerts/active/:id/resolve", cfg.AlertHandler.ResolveAlert, mw.RequireRole("operator"))
+
+		protected.GET("/settings/retention", cfg.AlertHandler.GetRetention)
+		protected.PUT("/settings/retention", cfg.AlertHandler.UpdateRetention, mw.RequireRole("operator"))
+
 		protected.GET("/system/logs", cfg.AlertHandler.SystemLogs, mw.RequireRole("operator"))
+	}
+
+	// ── Syslog ──────────────────────────────────────────────────────────────────
+	if cfg.SyslogHandler != nil {
+		protected.GET("/syslog/destinations", cfg.SyslogHandler.List)
+		protected.POST("/syslog/destinations", cfg.SyslogHandler.Create, mw.RequireRole("operator"))
+		protected.GET("/syslog/destinations/:id", cfg.SyslogHandler.Get)
+		protected.PUT("/syslog/destinations/:id", cfg.SyslogHandler.Update, mw.RequireRole("operator"))
+		protected.DELETE("/syslog/destinations/:id", cfg.SyslogHandler.Delete, mw.RequireRole("operator"))
+		protected.POST("/syslog/destinations/:id/test", cfg.SyslogHandler.TestDest, mw.RequireRole("operator"))
 	}
 
 	// ── Cluster-scoped audit log ─────────────────────────────────────────────────

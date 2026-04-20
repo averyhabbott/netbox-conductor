@@ -72,7 +72,9 @@ When a higher-priority node reconnects and its heartbeat shows it is healthy, th
 
 ### Event history
 
-Every failover, failback, and maintenance-triggered move is recorded in the cluster's **History** tab with: timestamp, event type, trigger reason, from/to node, and outcome.
+Every failover, failback, and maintenance-triggered move is recorded as a structured `NBC-HA-*` event. View them in the cluster's **History → HA Events** sub-tab or in the global **Events** page (`/events`). Each entry includes: timestamp, event type, trigger reason, from/to node, and outcome.
+
+Alert rules can be configured to fire on specific HA event codes (e.g. `NBC-HA-003` for failed failovers) via the **Monitoring** page.
 
 ---
 

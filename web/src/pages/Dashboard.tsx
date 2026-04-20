@@ -343,7 +343,7 @@ export default function Dashboard() {
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
         <div className="flex items-center justify-between mb-1">
           <p className="text-sm text-gray-400">Active Alerts</p>
-          <Link to="/settings?tab=alerting" className="text-xs text-blue-400 hover:text-blue-300 transition-colors">
+          <Link to="/alerting" className="text-xs text-blue-400 hover:text-blue-300 transition-colors">
             Configure →
           </Link>
         </div>
@@ -354,8 +354,8 @@ export default function Dashboard() {
           <ul className="mt-3 space-y-1">
             {activeAlerts.slice(0, 5).map((a) => (
               <li key={a.id} className="text-xs flex items-center gap-2">
-                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${a.severity === 'error' ? 'bg-red-400' : 'bg-amber-400'}`} />
-                <span className="text-gray-300">{a.message}</span>
+                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${a.escalated ? 'bg-red-400' : 'bg-amber-400'}`} />
+                <span className="text-gray-300">{a.rule_name ?? a.rule_id}</span>
               </li>
             ))}
             {activeAlerts.length > 5 && (

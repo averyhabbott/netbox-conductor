@@ -59,6 +59,8 @@ export default function Layout({ children }: LayoutProps) {
     { to: '/', label: 'Dashboard' },
     { to: '/clusters', label: 'Clusters' },
     { to: '/nodes', label: 'Nodes' },
+    { to: '/events', label: 'Events' },
+    { to: '/alerting', label: 'Alerting' },
     { to: '/available-agents', label: 'Available Agents' },
   ]
 

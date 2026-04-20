@@ -64,7 +64,7 @@ netbox-conductor/
 │   │   ├── statusserver/ # Local HTTP health endpoint (Patroni-aware in active/standby mode)
 │   │   └── ws/           # WebSocket client (connect, reconnect, heartbeat, OnServerHello callback)
 │   ├── server/
-│   │   ├── alerting/     # Alert delivery (webhook, SMTP email)
+│   │   ├── alerting/     # Alert rule engine, state machine, dispatcher, and transport implementations (webhook, SMTP email, Slack)
 │   │   ├── api/
 │   │   │   ├── handlers/ # HTTP endpoint implementations
 │   │   │   ├── middleware/ # Auth, audit, rate limiting
@@ -73,13 +73,16 @@ netbox-conductor/
 │   │   ├── crypto/       # AES-256-GCM encryption helpers
 │   │   ├── db/
 │   │   │   ├── migrations/ # SQL migration files (golang-migrate)
-│   │   │   └── queries/    # DB query implementations (clusters, nodes, alerts, logs, …)
+│   │   │   └── queries/    # DB query implementations (clusters, nodes, events, heartbeats, alert rules/transports/schedules/states, syslog destinations, retention, …)
+│   │   ├── events/       # NBC-{CAT}-{NNN} event code constants, Event type, Emitter, HeartbeatProcessor (derives service state-change events from consecutive heartbeats)
 │   │   ├── failover/     # Automatic failover/failback manager
 │   │   ├── hub/          # WebSocket session registry and dispatcher
-│   │   ├── logging/      # Structured JSON logging, per-agent log files
+│   │   ├── logging/      # Structured JSON logging with lumberjack rotation, per-agent log files
+│   │   ├── partitions/   # PostgreSQL partition lifecycle manager (creates monthly/weekly partitions, drops expired ones)
 │   │   ├── patroni/      # Witness subprocess management
 │   │   ├── scheduler/    # Background jobs (health checks, task timeouts)
 │   │   ├── sse/          # Server-Sent Events broker
+│   │   ├── syslog/       # RFC 5424 syslog forwarding (TCP/UDP/TLS) with per-destination category and severity filtering
 │   │   └── tlscert/      # TLS cert auto-generation
 │   └── shared/
 │       └── protocol/     # WebSocket message types shared by server and agent

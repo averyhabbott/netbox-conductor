@@ -21,12 +21,15 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db"
 	dbmigrations "github.com/averyhabbott/netbox-conductor/internal/server/db/migrations"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
+	"github.com/averyhabbott/netbox-conductor/internal/server/partitions"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/server/scheduler"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
+	syslogfwd "github.com/averyhabbott/netbox-conductor/internal/server/syslog"
 	"github.com/averyhabbott/netbox-conductor/internal/server/tlscert"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -145,9 +148,14 @@ func run(ctx context.Context) error {
 	auditQ := queries.NewAuditQuerier(store.Pool())
 	configQ := queries.NewConfigQuerier(store.Pool())
 	taskQ := queries.NewTaskResultQuerier(store.Pool())
-	failoverEventQ := queries.NewFailoverEventQuerier(store.Pool())
-	nodeLogQ := queries.NewNodeLogQuerier(store.Pool())
-	alertQ := queries.NewAlertQuerier(store.Pool())
+	eventQ := queries.NewEventQuerier(store.Pool())
+	hbQ := queries.NewHeartbeatQuerier(store.Pool())
+	alertRuleQ := queries.NewAlertRuleQuerier(store.Pool())
+	alertTransQ := queries.NewAlertTransportQuerier(store.Pool())
+	alertSchedQ := queries.NewAlertScheduleQuerier(store.Pool())
+	alertStateQ := queries.NewAlertStateQuerier(store.Pool())
+	syslogDestQ := queries.NewSyslogDestinationQuerier(store.Pool())
+	eventRetentionQ := queries.NewEventRetentionQuerier(store.Pool())
 
 	// Seed default admin
 	if err := seedAdminIfEmpty(ctx, userQ); err != nil {
@@ -174,26 +182,47 @@ func run(ctx context.Context) error {
 	// restart until configure_failover is manually triggered again.
 	go recoverWitnesses(ctx, witnessManager, clusterQ, nodeQ)
 
-	// Failover manager — orchestrates automatic NetBox failover/failback
-	failoverManager := failover.New(nodeQ, clusterQ, taskQ, failoverEventQ, h, dispatcher, broker, credQ, enc)
+	// Event emitter — central event bus; alert engine + syslog forwarder subscribe as sinks
+	emitter := events.NewEmitter(eventQ)
 
-	// Alerting
-	alertSender := alerting.New(alertQ)
-	alertHandler := handlers.NewAlertHandler(alertQ, nodeLogQ, logDir, logName)
+	// Alert engine
+	alertEngine := alerting.NewEngine(alertRuleQ, alertStateQ, alertTransQ, alertSchedQ, hbQ)
+	emitter.RegisterSink(alertEngine)
+	alertEngine.Start(ctx)
+
+	// Syslog forwarder
+	syslogForwarder := syslogfwd.NewForwarder(syslogDestQ)
+	emitter.RegisterSink(syslogForwarder)
+	syslogForwarder.Start(ctx)
+
+	// Partition manager — creates future partitions and drops expired ones daily
+	partMgr := partitions.New(store.Pool())
+	go partMgr.Run(ctx)
+
+	// Failover manager — orchestrates automatic NetBox failover/failback
+	failoverManager := failover.New(nodeQ, clusterQ, taskQ, emitter, h, dispatcher, broker, credQ, enc)
 
 	// Handlers
+	alertHandler := handlers.NewAlertHandler(alertRuleQ, alertTransQ, alertSchedQ, alertStateQ, eventRetentionQ, logDir, logName)
+	eventsHandler := handlers.NewEventsHandler(eventQ, hbQ)
+	syslogHandler := handlers.NewSyslogHandler(syslogDestQ)
 	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, tlsKeyFile, serverURL, enc)
 	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, failoverManager, logDir, logName)
-	agentHandler.SetNodeLogQuerier(nodeLogQ)
-	agentHandler.SetAlertSender(alertSender)
+	agentHandler.SetEmitter(emitter)
+	agentHandler.SetHeartbeatQuerier(hbQ)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
 	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, witnessManager)
+	clusterHandler.SetEmitter(emitter)
 	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, dispatcher, broker, serverURL, logDir, logName)
 	nodeHandler.SetFailoverManager(failoverManager)
+	nodeHandler.SetEmitter(emitter)
 	credHandler := handlers.NewCredentialHandler(credQ, enc)
+	credHandler.SetEmitter(emitter)
 	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker, h)
-	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, failoverEventQ, enc, dispatcher, witnessManager)
+	configHandler.SetEmitter(emitter)
+	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, enc, dispatcher, witnessManager)
+	patroniHandler.SetEmitter(emitter)
 	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)
 
 	// Router
@@ -209,6 +238,8 @@ func run(ctx context.Context) error {
 		StagingHandler:    stagingHandler,
 		MetricsHandler:    metricsHandler,
 		AlertHandler:      alertHandler,
+		EventsHandler:     eventsHandler,
+		SyslogHandler:     syslogHandler,
 		TaskResultQuerier: taskQ,
 		SSEBroker:         broker,
 		AuditQuerier:      auditQ,

@@ -12,6 +12,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
@@ -30,7 +31,10 @@ type ConfigHandler struct {
 	dispatcher  *hub.Dispatcher
 	broker      *sse.Broker
 	hub         *hub.Hub
+	emitter     events.Emitter
 }
+
+func (h *ConfigHandler) SetEmitter(e events.Emitter) { h.emitter = e }
 
 func NewConfigHandler(
 	configs *queries.ConfigQuerier,
@@ -317,6 +321,12 @@ func (h *ConfigHandler) Push(c echo.Context) error {
 		overallStatus = "partial"
 	}
 	_ = h.configs.UpdatePushStatus(ctx, cfg.ID, overallStatus, "")
+
+	if h.emitter != nil && dispatchCount > 0 {
+		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodeConfigPushed,
+			fmt.Sprintf("Config v%d pushed to %d node(s) (%s)", cfg.Version, dispatchCount, overallStatus),
+			actorFromCtx(c)).Cluster(clusterID).Build())
+	}
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"config_id": cfg.ID.String(),

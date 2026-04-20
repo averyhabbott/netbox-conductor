@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // AgentLog wraps a per-agent slog.Logger with its underlying file handle.
@@ -28,22 +31,28 @@ func (a *AgentLog) Close() error {
 
 // Setup initialises the server-wide structured logger.
 // Logs are written to both stdout (captured by journald) and
-// <logDir>/<logName>/conductor.log.
+// <logDir>/<logName>/conductor.log with lumberjack rotation.
+// Rotation is controlled by env vars LOG_MAX_SIZE_MB (default 100),
+// LOG_MAX_BACKUPS (default 10), LOG_MAX_AGE_DAYS (default 30).
 // If the log directory cannot be written (e.g. in dev without root), Setup
 // falls back to stdout-only logging rather than refusing to start.
 func Setup(logDir, logName, levelStr string) *slog.Logger {
 	level := ParseLevel(levelStr)
 	dir := filepath.Join(logDir, logName)
 
+	maxSizeMB := envInt("LOG_MAX_SIZE_MB", 100)
+	maxBackups := envInt("LOG_MAX_BACKUPS", 10)
+	maxAgeDays := envInt("LOG_MAX_AGE_DAYS", 30)
+
 	writers := []io.Writer{os.Stdout}
 	if err := os.MkdirAll(dir, 0755); err == nil {
-		f, err := os.OpenFile(
-			filepath.Join(dir, "conductor.log"),
-			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644,
-		)
-		if err == nil {
-			writers = append(writers, f)
-		}
+		writers = append(writers, &lumberjack.Logger{
+			Filename:   filepath.Join(dir, "conductor.log"),
+			MaxSize:    maxSizeMB,
+			MaxBackups: maxBackups,
+			MaxAge:     maxAgeDays,
+			Compress:   true,
+		})
 	}
 
 	h := slog.NewTextHandler(
@@ -51,6 +60,15 @@ func Setup(logDir, logName, levelStr string) *slog.Logger {
 		&slog.HandlerOptions{Level: level},
 	)
 	return slog.New(h)
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }
 
 // OpenAgentLog opens (or creates) the per-agent log file at

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,9 +14,9 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 
-	"github.com/averyhabbott/netbox-conductor/internal/server/alerting"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
@@ -41,8 +42,9 @@ type AgentHandler struct {
 	enc           *crypto.Encryptor
 	media         *media.Manager
 	failover      *failover.Manager
-	nodeLogQ      *queries.NodeLogQuerier
-	alertSender   *alerting.Sender
+	emitter       events.Emitter
+	hbQ           *queries.HeartbeatQuerier
+	hbStates      sync.Map // nodeID (uuid.UUID) → *events.HeartbeatState
 	logDir        string
 	logName       string
 }
@@ -81,11 +83,11 @@ func NewAgentHandler(
 	}
 }
 
-// SetNodeLogQuerier wires up the node log querier (called from main after construction).
-func (h *AgentHandler) SetNodeLogQuerier(q *queries.NodeLogQuerier) { h.nodeLogQ = q }
+// SetEmitter wires up the event emitter (called from main after construction).
+func (h *AgentHandler) SetEmitter(e events.Emitter) { h.emitter = e }
 
-// SetAlertSender wires up the alert sender (called from main after construction).
-func (h *AgentHandler) SetAlertSender(s *alerting.Sender) { h.alertSender = s }
+// SetHeartbeatQuerier wires up the heartbeat querier (called from main after construction).
+func (h *AgentHandler) SetHeartbeatQuerier(q *queries.HeartbeatQuerier) { h.hbQ = q }
 
 // ─── Registration ──────────────────────────────────────────────────────────────
 
@@ -303,22 +305,15 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 		}
 		slog.Info("agent disconnected", "node", nodeID, "hostname", node.Hostname)
 
-		// Persist a structured log entry so operators can see disconnect history.
-		if h.nodeLogQ != nil {
+		if h.emitter != nil {
 			nid := nodeID
-			_ = h.nodeLogQ.Insert(context.Background(), queries.InsertNodeLogParams{
-				ClusterID: clusterID,
-				NodeID:    &nid,
-				Hostname:  node.Hostname,
-				Level:     "warn",
-				Source:    "conductor",
-				Message:   "Agent disconnected",
-			})
-		}
-
-		// Fire alert unless the node is in maintenance mode (suppress expected downtime).
-		if h.alertSender != nil && !node.MaintenanceMode {
-			go h.alertSender.FireAgentDisconnect(nodeID, clusterID, node.Hostname)
+			cid := clusterID
+			h.emitter.Emit(events.New(
+				events.CategoryAgent, events.SeverityWarn,
+				events.CodeAgentDisconnected,
+				"Agent disconnected: "+node.Hostname,
+				events.ActorSystem,
+			).Cluster(cid).Node(nid).Build())
 		}
 	}()
 
@@ -328,20 +323,16 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 		h.failover.OnNodeConnect(nodeID, clusterID)
 	}
 
-	// Log the connect event and resolve any open disconnect alert.
-	if h.nodeLogQ != nil {
+	// Emit agent-connected event.
+	if h.emitter != nil {
 		nid := nodeID
-		_ = h.nodeLogQ.Insert(ctx, queries.InsertNodeLogParams{
-			ClusterID: clusterID,
-			NodeID:    &nid,
-			Hostname:  node.Hostname,
-			Level:     "info",
-			Source:    "conductor",
-			Message:   "Agent connected (v" + hello.AgentVersion + ")",
-		})
-	}
-	if h.alertSender != nil {
-		go h.alertSender.ResolveAgentDisconnect(nodeID, clusterID)
+		cid := clusterID
+		h.emitter.Emit(events.New(
+			events.CategoryAgent, events.SeverityInfo,
+			events.CodeAgentConnected,
+			"Agent connected: "+node.Hostname+" (v"+hello.AgentVersion+")",
+			events.ActorSystem,
+		).Cluster(cid).Node(nid).Build())
 	}
 
 	helloPayload := protocol.ServerHelloPayload{
@@ -535,6 +526,8 @@ func (h *AgentHandler) handleInbound(ctx context.Context, sess *hub.Session, env
 		h.handleHeartbeat(ctx, sess, env, logger)
 	case protocol.TypePatroniState:
 		h.handlePatroniState(ctx, sess, env, logger)
+	case protocol.TypeServiceStateChange:
+		h.handleServiceStateChange(ctx, sess, env, logger)
 	case protocol.TypeTaskAck:
 		h.handleTaskAck(ctx, sess, env, logger)
 	case protocol.TypeTaskResult:
@@ -567,6 +560,42 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 		hb.SentinelRunning, hb.PatroniRunning, hb.PostgresRunning,
 	); err != nil {
 		logger.Warn("heartbeat DB update failed", "error", err)
+	}
+
+	// Persist heartbeat time-series row.
+	if h.hbQ != nil {
+		nb, rq, pa, pg, rd, sn := hb.NetboxRunning, hb.RQRunning, hb.PatroniRunning, hb.PostgresRunning, hb.RedisRunning, hb.SentinelRunning
+		role := hb.PatroniRole
+		var loadAvg1, loadAvg5, memPct, diskPct *float64
+		if hb.LoadAvg1 != 0 { loadAvg1 = &hb.LoadAvg1 }
+		if hb.LoadAvg5 != 0 { loadAvg5 = &hb.LoadAvg5 }
+		if hb.MemUsedPct != 0 { memPct = &hb.MemUsedPct }
+		if hb.DiskUsedPct != 0 { diskPct = &hb.DiskUsedPct }
+		_ = h.hbQ.Insert(ctx, queries.InsertHeartbeatParams{
+			NodeID: sess.NodeID, ClusterID: sess.ClusterID,
+			LoadAvg1: loadAvg1, LoadAvg5: loadAvg5, MemUsedPct: memPct, DiskUsedPct: diskPct,
+			NetboxRunning: &nb, RQRunning: &rq, RedisRunning: &rd, SentinelRunning: &sn,
+			PatroniRunning: &pa, PostgresRunning: &pg,
+			PatroniRole: &role,
+		})
+	}
+
+	// Detect service state transitions and emit events.
+	if h.emitter != nil {
+		hbInput := events.HeartbeatInput{
+			NodeID: sess.NodeID, ClusterID: sess.ClusterID,
+			NetboxRunning: hb.NetboxRunning, RQRunning: hb.RQRunning,
+			PatroniRunning: hb.PatroniRunning, PostgresRunning: hb.PostgresRunning,
+			RedisRunning: hb.RedisRunning, SentinelRunning: hb.SentinelRunning,
+			PatroniRole: hb.PatroniRole,
+		}
+		// Load or create per-node state.
+		stateAny, _ := h.hbStates.LoadOrStore(sess.NodeID, &events.HeartbeatState{})
+		state := stateAny.(*events.HeartbeatState)
+		for _, ev := range events.Process(state, hbInput) {
+			h.emitter.Emit(ev)
+		}
+		state.Update(hbInput)
 	}
 
 	// Detect netbox_running transitions and notify the failover manager.
@@ -644,6 +673,82 @@ func (h *AgentHandler) handlePatroniState(ctx context.Context, sess *hub.Session
 	// so every NetBox instance reconnects to the writable database immediately.
 	if ps.Role == "primary" {
 		go h.dispatchDBHostUpdate(context.Background(), sess.NodeID, sess.ClusterID)
+	}
+}
+
+func (h *AgentHandler) handleServiceStateChange(ctx context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+	var p protocol.ServiceStateChangePayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		return
+	}
+	if h.emitter == nil {
+		return
+	}
+
+	var code, msg string
+	sev := events.SeverityInfo
+	switch p.Service {
+	case "netbox":
+		if p.Running {
+			code, msg = events.CodeNetboxStarted, "NetBox started"
+		} else {
+			code, msg, sev = events.CodeNetboxStopped, "NetBox stopped", events.SeverityError
+		}
+	case "rq":
+		if p.Running {
+			code, msg = events.CodeRQStarted, "RQ worker started"
+		} else {
+			code, msg, sev = events.CodeRQStopped, "RQ worker stopped", events.SeverityError
+		}
+	case "patroni":
+		if p.Running {
+			code, msg = events.CodePatroniStarted, "Patroni started"
+		} else {
+			code, msg, sev = events.CodePatroniStopped, "Patroni stopped", events.SeverityError
+		}
+	case "postgres":
+		if p.Running {
+			code, msg = events.CodePostgresReady, "PostgreSQL became ready"
+		} else {
+			code, msg, sev = events.CodePostgresDown, "PostgreSQL became unavailable", events.SeverityError
+		}
+	case "redis":
+		if p.Running {
+			code, msg = events.CodeRedisStarted, "Redis started"
+		} else {
+			code, msg, sev = events.CodeRedisStopped, "Redis stopped", events.SeverityError
+		}
+	case "sentinel":
+		if p.Running {
+			code, msg = events.CodeSentinelStarted, "Sentinel started"
+		} else {
+			code, msg, sev = events.CodeSentinelStopped, "Sentinel stopped", events.SeverityError
+		}
+	default:
+		logger.Warn("handleServiceStateChange: unknown service", "service", p.Service)
+		return
+	}
+
+	h.emitter.Emit(events.New(events.CategoryService, sev, code, msg, events.ActorSystem).
+		Cluster(sess.ClusterID).Node(sess.NodeID).Build())
+
+	// Update hbStates so the next heartbeat doesn't double-emit the same transition.
+	stateAny, _ := h.hbStates.LoadOrStore(sess.NodeID, &events.HeartbeatState{})
+	state := stateAny.(*events.HeartbeatState)
+	running := p.Running
+	switch p.Service {
+	case "netbox":
+		state.NetboxRunning = &running
+	case "rq":
+		state.RQRunning = &running
+	case "patroni":
+		state.PatroniRunning = &running
+	case "postgres":
+		state.PostgresRunning = &running
+	case "redis":
+		state.RedisRunning = &running
+	case "sentinel":
+		state.SentinelRunning = &running
 	}
 }
 

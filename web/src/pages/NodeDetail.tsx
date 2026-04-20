@@ -6,6 +6,8 @@ import { nodesApi } from '../api/nodes'
 import client from '../api/client'
 import Layout from '../components/Layout'
 import { useAuthStore } from '../store/auth'
+import { eventsApi } from '../api/events'
+import EventsTable from '../components/EventsTable'
 
 interface LogsData {
   lines: string[]
@@ -522,6 +524,34 @@ function RemoveNodeDialog({
   )
 }
 
+function NodeEventsCard({ clusterId, nodeId }: { clusterId: string; nodeId: string }) {
+  const [category, setCategory] = useState('')
+  const { data: events = [], isLoading } = useQuery({
+    queryKey: ['node-events', clusterId, nodeId, category],
+    queryFn: () => eventsApi.listForNode(clusterId, nodeId, { category: category || undefined, limit: 50 }),
+    refetchInterval: 15000,
+  })
+
+  const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-semibold text-white">Events</h2>
+        <select
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none focus:border-blue-500"
+        >
+          <option value="">All categories</option>
+          {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+      <EventsTable events={events} loading={isLoading} />
+    </div>
+  )
+}
+
 export default function NodeDetail() {
   const { id, nid } = useParams<{ id: string; nid: string }>()
   const navigate = useNavigate()
@@ -966,6 +996,9 @@ export default function NodeDetail() {
             </pre>
           )}
         </div>
+
+        {/* Node Events */}
+        {id && nid && <NodeEventsCard clusterId={id} nodeId={nid} />}
       </div>
 
       {showDBRestore && id && nid && node && (

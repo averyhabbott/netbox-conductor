@@ -24,6 +24,8 @@ import (
 
 	"github.com/google/uuid"
 
+	ev "github.com/averyhabbott/netbox-conductor/internal/server/events"
+
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
@@ -52,7 +54,7 @@ type Manager struct {
 	nodes      *queries.NodeQuerier
 	clusters   *queries.ClusterQuerier
 	tasks      *queries.TaskResultQuerier
-	events     *queries.FailoverEventQuerier
+	emitter    ev.Emitter
 	h          *hub.Hub
 	dispatcher *hub.Dispatcher
 	broker     *sse.Broker
@@ -71,7 +73,7 @@ func New(
 	nodes *queries.NodeQuerier,
 	clusters *queries.ClusterQuerier,
 	tasks *queries.TaskResultQuerier,
-	events *queries.FailoverEventQuerier,
+	emitter ev.Emitter,
 	h *hub.Hub,
 	dispatcher *hub.Dispatcher,
 	broker *sse.Broker,
@@ -82,7 +84,7 @@ func New(
 		nodes:          nodes,
 		clusters:       clusters,
 		tasks:          tasks,
-		events:         events,
+		emitter:        emitter,
 		h:              h,
 		dispatcher:     dispatcher,
 		broker:         broker,
@@ -93,6 +95,70 @@ func New(
 		failTimers:     make(map[uuid.UUID]*time.Timer),
 		failbackTimers: make(map[uuid.UUID]*time.Timer),
 	}
+}
+
+// haEventParams carries the fields needed to emit an NBC-HA-* event.
+type haEventParams struct {
+	ClusterID      uuid.UUID
+	EventType      string // "failover" | "failback" | "maintenance_failover"
+	Trigger        string // "disconnect" | "heartbeat" | "reconnect" | "maintenance"
+	FailedNodeID   *uuid.UUID
+	FailedNodeName string
+	TargetNodeID   *uuid.UUID
+	TargetNodeName string
+	Success        bool
+	Reason         string
+}
+
+// emitHAEvent converts a haEventParams into the appropriate NBC-HA-* event and emits it.
+func (m *Manager) emitHAEvent(_ context.Context, p haEventParams) {
+	code := ev.CodeFailoverInitiated
+	severity := ev.SeverityWarn
+	switch {
+	case p.EventType == "failover_initiated":
+		// code/severity stay as CodeFailoverInitiated/SeverityWarn
+	case p.EventType == "failover" && p.Success:
+		code, severity = ev.CodeFailoverCompleted, ev.SeverityInfo
+	case p.EventType == "failover" && !p.Success:
+		code, severity = ev.CodeFailoverFailed, ev.SeverityError
+	case p.EventType == "failback_initiated":
+		code, severity = ev.CodeFailbackInitiated, ev.SeverityInfo
+	case p.EventType == "failback" && p.Success:
+		code, severity = ev.CodeFailbackCompleted, ev.SeverityInfo
+	case p.EventType == "failback" && !p.Success:
+		code, severity = ev.CodeFailoverFailed, ev.SeverityError
+	case p.EventType == "maintenance_failover":
+		code = ev.CodeMaintenanceFailover
+	}
+
+	var parts []string
+	if p.FailedNodeName != "" {
+		parts = append(parts, "from="+p.FailedNodeName)
+	}
+	if p.TargetNodeName != "" {
+		parts = append(parts, "to="+p.TargetNodeName)
+	}
+	if p.Trigger != "" {
+		parts = append(parts, "trigger="+p.Trigger)
+	}
+	if p.Reason != "" {
+		parts = append(parts, "reason="+p.Reason)
+	}
+	msg := strings.Join(parts, " ")
+	if msg == "" {
+		msg = p.EventType
+	}
+
+	nodeID := p.FailedNodeID
+	if nodeID == nil {
+		nodeID = p.TargetNodeID
+	}
+
+	b := ev.New(ev.CategoryHA, severity, code, msg, ev.ActorSystem).Cluster(p.ClusterID)
+	if nodeID != nil {
+		b = b.Node(*nodeID)
+	}
+	m.emitter.Emit(b.Build())
 }
 
 // OnNodeDisconnect must be called whenever an agent WebSocket session closes.
@@ -267,7 +333,7 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 	if candidate == nil {
 		slog.Warn("failover: no suitable candidate available",
 			"cluster", clusterID, "failed_node", failedNodeID)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      clusterID,
 			EventType:      "failover",
 			Trigger:        trigger,
@@ -290,6 +356,16 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 		"priority", candidate.FailoverPriority,
 	)
 
+	m.emitHAEvent(ctx, haEventParams{
+		ClusterID:      clusterID,
+		EventType:      "failover_initiated",
+		Trigger:        trigger,
+		FailedNodeID:   &failedNode.ID,
+		FailedNodeName: failedNode.Hostname,
+		TargetNodeID:   &candidate.ID,
+		TargetNodeName: candidate.Hostname,
+	})
+
 	// Trigger a Patroni switchover so the DB primary follows the new active node.
 	// Fetch all nodes for the switchover decision (bestCandidate already fetched them
 	// internally; this second call is acceptable on this rare, critical path).
@@ -308,7 +384,7 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 
 	if err := m.dispatchServiceTask(ctx, candidate, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failover: dispatch failed", "candidate", candidate.ID, "error", err)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      clusterID,
 			EventType:      "failover",
 			Trigger:        trigger,
@@ -335,7 +411,7 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 			"node", failedNode.ID, "error", err)
 	}
 
-	m.recordEvent(ctx, queries.CreateFailoverEventParams{
+	m.emitHAEvent(ctx, haEventParams{
 		ClusterID:      clusterID,
 		EventType:      "failover",
 		Trigger:        trigger,
@@ -392,6 +468,14 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 		slog.Warn("failback: could not list cluster nodes", "cluster", clusterID, "error", err)
 		return
 	}
+
+	m.emitHAEvent(ctx, haEventParams{
+		ClusterID:      clusterID,
+		EventType:      "failback_initiated",
+		Trigger:        "reconnect",
+		TargetNodeID:   &reconnected.ID,
+		TargetNodeName: reconnected.Hostname,
+	})
 
 	if cluster.AppTierAlwaysAvailable {
 		m.attemptFailbackAlwaysAvailable(ctx, cluster, reconnected, nodes)
@@ -451,7 +535,7 @@ func (m *Manager) attemptFailbackAlwaysAvailable(
 			m.dispatchDBHostUpdate(ctx, nodes, reconnectedIP)
 			m.dispatchSentinelUpdate(ctx, cluster, nodes, reconnectedIP)
 		}
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      cluster.ID,
 			EventType:      "failback",
 			Trigger:        "reconnect",
@@ -541,7 +625,7 @@ func (m *Manager) attemptFailbackActiveStandby(
 
 	if err := m.dispatchServiceTask(ctx, currentActive, protocol.TaskStopNetbox); err != nil {
 		slog.Error("failback: stop dispatch failed", "node", currentActive.ID, "error", err)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      cluster.ID,
 			EventType:      "failback",
 			Trigger:        "reconnect",
@@ -556,7 +640,7 @@ func (m *Manager) attemptFailbackActiveStandby(
 	}
 	if err := m.dispatchServiceTask(ctx, reconnected, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failback: start dispatch failed", "node", reconnected.ID, "error", err)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      cluster.ID,
 			EventType:      "failback",
 			Trigger:        "reconnect",
@@ -570,7 +654,7 @@ func (m *Manager) attemptFailbackActiveStandby(
 		return
 	}
 
-	m.recordEvent(ctx, queries.CreateFailoverEventParams{
+	m.emitHAEvent(ctx, haEventParams{
 		ClusterID:      cluster.ID,
 		EventType:      "failback",
 		Trigger:        "reconnect",
@@ -655,7 +739,7 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 	if err != nil || candidate == nil {
 		slog.Warn("failover (maintenance): no connected candidate available",
 			"node", nodeID, "cluster", clusterID)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      clusterID,
 			EventType:      "maintenance_failover",
 			Trigger:        "maintenance",
@@ -687,7 +771,7 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 
 	if err := m.dispatchServiceTask(ctx, node, protocol.TaskStopNetbox); err != nil {
 		slog.Error("failover (maintenance): stop dispatch failed", "node", node.ID, "error", err)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      clusterID,
 			EventType:      "maintenance_failover",
 			Trigger:        "maintenance",
@@ -702,7 +786,7 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 	}
 	if err := m.dispatchServiceTask(ctx, candidate, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failover (maintenance): start dispatch failed", "node", candidate.ID, "error", err)
-		m.recordEvent(ctx, queries.CreateFailoverEventParams{
+		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      clusterID,
 			EventType:      "maintenance_failover",
 			Trigger:        "maintenance",
@@ -716,7 +800,7 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 		return
 	}
 
-	m.recordEvent(ctx, queries.CreateFailoverEventParams{
+	m.emitHAEvent(ctx, haEventParams{
 		ClusterID:      clusterID,
 		EventType:      "maintenance_failover",
 		Trigger:        "maintenance",
@@ -1000,16 +1084,6 @@ func (m *Manager) enqueueForReconnect(ctx context.Context, node *queries.Node, t
 	// Task stays "queued" — picked up and advanced to "sent" on next reconnect.
 }
 
-// recordEvent persists a failover event to the database. Errors are logged but
-// never returned — a failed write must not block the failover path itself.
-func (m *Manager) recordEvent(ctx context.Context, p queries.CreateFailoverEventParams) {
-	if m.events == nil {
-		return
-	}
-	if err := m.events.Create(ctx, p); err != nil {
-		slog.Warn("failover: failed to record event", "cluster", p.ClusterID, "error", err)
-	}
-}
 
 func (m *Manager) publish(clusterID, nodeID uuid.UUID, eventType sse.EventType, payload map[string]any) {
 	payload["cluster_id"] = clusterID.String()

@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/api/middleware"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
@@ -40,12 +42,23 @@ type NodeHandler struct {
 	logDir      string
 	logName     string
 	failover    NodeFailoverManager // optional; wired in after construction
+	emitter     events.Emitter      // optional; wired in after construction
 }
 
 // SetFailoverManager attaches the failover manager so that putting a node into
 // maintenance mode can trigger automatic failover when configured.
 func (h *NodeHandler) SetFailoverManager(fm NodeFailoverManager) {
 	h.failover = fm
+}
+
+func (h *NodeHandler) SetEmitter(e events.Emitter) { h.emitter = e }
+
+// nodeActorFromCtx returns the requesting user's ID from the JWT, or "system".
+func nodeActorFromCtx(c echo.Context) string {
+	if id, _ := c.Get(middleware.ContextKeyUserID).(string); id != "" {
+		return id
+	}
+	return events.ActorSystem
 }
 
 func NewNodeHandler(
@@ -241,6 +254,12 @@ func (h *NodeHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "hostname already exists in this cluster")
 	}
 
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityInfo, events.CodeNodeAdded,
+			fmt.Sprintf("Node %q added to cluster", node.Hostname), nodeActorFromCtx(c)).
+			Cluster(clusterID).Node(node.ID).Build())
+	}
+
 	return c.JSON(http.StatusCreated, toNodeResponse(node))
 }
 
@@ -325,6 +344,12 @@ func (h *NodeHandler) Update(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "node not found")
 	}
 
+	if h.emitter != nil {
+		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodeNodeConfigUpdated,
+			fmt.Sprintf("Node %q configuration updated", node.Hostname), nodeActorFromCtx(c)).
+			Cluster(node.ClusterID).Node(nid).Build())
+	}
+
 	return c.JSON(http.StatusOK, toNodeResponse(node))
 }
 
@@ -336,6 +361,9 @@ func (h *NodeHandler) Delete(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid node id")
 	}
 
+	// Fetch node info before deletion for event metadata.
+	node, nodeErr := h.nodes.GetByID(c.Request().Context(), nid)
+
 	// Revoke any active agent tokens so reconnect attempts fail auth.
 	_ = h.agentToks.Revoke(c.Request().Context(), nid)
 
@@ -344,6 +372,12 @@ func (h *NodeHandler) Delete(c echo.Context) error {
 
 	if err := h.nodes.Delete(c.Request().Context(), nid); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "node not found")
+	}
+
+	if h.emitter != nil && nodeErr == nil {
+		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityWarn, events.CodeNodeRemoved,
+			fmt.Sprintf("Node %q removed from cluster", node.Hostname), nodeActorFromCtx(c)).
+			Cluster(node.ClusterID).Node(nid).Build())
 	}
 
 	// Notify UI clients so the cluster page updates immediately.

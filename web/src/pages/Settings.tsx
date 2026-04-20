@@ -4,10 +4,9 @@ import Layout from '../components/Layout'
 import { useAuthStore } from '../store/auth'
 import { usersApi, type UserItem } from '../api/users'
 import { authApi } from '../api/auth'
-import { alertsApi, ALERT_CONDITIONS } from '../api/alerts'
-import type { AlertConfig, AlertConfigBody } from '../api/alerts'
+import { syslogApi, retentionApi, type SyslogDestination, type SyslogDestinationBody } from '../api/syslog'
 
-type Tab = 'users' | 'system' | 'password' | 'totp' | 'alerting'
+type Tab = 'users' | 'system' | 'password' | 'totp' | 'syslog' | 'retention'
 
 export default function Settings() {
   const [tab, setTab] = useState<Tab>('users')
@@ -35,8 +34,11 @@ export default function Settings() {
         <TabBtn active={tab === 'totp'} onClick={() => setTab('totp')}>
           Two-Factor Auth
         </TabBtn>
-        <TabBtn active={tab === 'alerting'} onClick={() => setTab('alerting')}>
-          Alerting
+        <TabBtn active={tab === 'syslog'} onClick={() => setTab('syslog')}>
+          Syslog
+        </TabBtn>
+        <TabBtn active={tab === 'retention'} onClick={() => setTab('retention')}>
+          Retention
         </TabBtn>
       </div>
 
@@ -44,7 +46,8 @@ export default function Settings() {
       {tab === 'system' && <SystemTab />}
       {tab === 'password' && <ChangePasswordTab />}
       {tab === 'totp' && <TOTPTab />}
-      {tab === 'alerting' && <AlertingTab />}
+      {tab === 'syslog' && <SyslogTab />}
+      {tab === 'retention' && <RetentionTab />}
     </Layout>
   )
 }
@@ -818,133 +821,84 @@ function TOTPTab() {
   )
 }
 
-// ── Alerting Tab ─────────────────────────────────────────────────────────────
+// ── Syslog Tab ────────────────────────────────────────────────────────────────
 
-const emptyConfig = (): AlertConfigBody => ({
-  name: '',
-  type: 'webhook',
-  enabled: true,
-  conditions: [],
-  webhook_url: '',
-  email_to: '',
+const SEVERITIES = ['debug', 'info', 'warn', 'error', 'critical']
+const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
+
+const emptySyslog = (): SyslogDestinationBody => ({
+  name: '', protocol: 'udp', host: '', port: 514, min_severity: 'info', categories: [], enabled: true,
 })
 
-function AlertConfigForm({
-  initial,
-  onSave,
-  onCancel,
-  isPending,
-  error,
+function SyslogForm({
+  initial, onSave, onCancel, isPending, error,
 }: {
-  initial: AlertConfigBody
-  onSave: (body: AlertConfigBody) => void
+  initial: SyslogDestinationBody
+  onSave: (b: SyslogDestinationBody) => void
   onCancel: () => void
   isPending: boolean
   error?: string
 }) {
-  const [form, setForm] = useState<AlertConfigBody>(initial)
-
-  function toggleCondition(val: string) {
-    setForm((f) => ({
-      ...f,
-      conditions: f.conditions.includes(val)
-        ? f.conditions.filter((c) => c !== val)
-        : [...f.conditions, val],
-    }))
-  }
+  const [f, setF] = useState<SyslogDestinationBody>(initial)
+  const toggleCat = (c: string) =>
+    setF((p) => ({ ...p, categories: p.categories?.includes(c) ? p.categories.filter((x) => x !== c) : [...(p.categories ?? []), c] }))
 
   return (
-    <div className="space-y-4 bg-gray-800/50 border border-gray-700 rounded-xl p-5">
-      <div>
-        <label className="block text-xs text-gray-400 mb-1">Name</label>
-        <input
-          type="text"
-          value={form.name}
-          onChange={(e) => setForm({ ...form, name: e.target.value })}
-          placeholder="e.g. PagerDuty webhook"
-          className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-        />
-      </div>
-
-      <div className="flex gap-4">
-        {(['webhook', 'email'] as const).map((t) => (
-          <label key={t} className="flex items-center gap-2 text-sm cursor-pointer">
-            <input
-              type="radio"
-              checked={form.type === t}
-              onChange={() => setForm({ ...form, type: t })}
-              className="accent-blue-500"
-            />
-            {t === 'webhook' ? 'Webhook (HTTP POST)' : 'Email (SMTP)'}
-          </label>
-        ))}
-      </div>
-
-      {form.type === 'webhook' ? (
+    <div className="space-y-4 bg-gray-800/50 border border-gray-700 rounded-lg p-4">
+      <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className="block text-xs text-gray-400 mb-1">Webhook URL</label>
-          <input
-            type="url"
-            value={form.webhook_url ?? ''}
-            onChange={(e) => setForm({ ...form, webhook_url: e.target.value })}
-            placeholder="https://hooks.example.com/…"
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
-          />
+          <label className="block text-xs text-gray-400 mb-1">Name</label>
+          <input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. rsyslog-prod" className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500" />
         </div>
-      ) : (
         <div>
-          <label className="block text-xs text-gray-400 mb-1">Email recipients (comma-separated)</label>
-          <input
-            type="text"
-            value={form.email_to ?? ''}
-            onChange={(e) => setForm({ ...form, email_to: e.target.value })}
-            placeholder="ops@example.com, alerts@example.com"
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-          />
-          <p className="text-xs text-gray-500 mt-1">
-            SMTP settings are configured via server environment variables (SMTP_HOST, SMTP_PORT, SMTP_FROM, SMTP_USER, SMTP_PASS).
-          </p>
+          <label className="block text-xs text-gray-400 mb-1">Protocol</label>
+          <select value={f.protocol} onChange={(e) => setF({ ...f, protocol: e.target.value as SyslogDestinationBody['protocol'] })} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500">
+            <option value="udp">UDP</option>
+            <option value="tcp">TCP</option>
+            <option value="tcp+tls">TCP+TLS</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Host</label>
+          <input value={f.host} onChange={(e) => setF({ ...f, host: e.target.value })} placeholder="192.168.1.100" className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-blue-500" />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Port</label>
+          <input type="number" value={f.port ?? 514} onChange={(e) => setF({ ...f, port: parseInt(e.target.value) || 514 })} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500" />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Min severity</label>
+          <select value={f.min_severity ?? 'info'} onChange={(e) => setF({ ...f, min_severity: e.target.value })} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500">
+            {SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {f.protocol === 'tcp+tls' && (
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">CA cert (PEM, optional)</label>
+          <textarea value={f.tls_ca_cert ?? ''} onChange={(e) => setF({ ...f, tls_ca_cert: e.target.value })} rows={4} placeholder="-----BEGIN CERTIFICATE-----" className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-xs font-mono focus:outline-none focus:border-blue-500" />
         </div>
       )}
 
       <div>
-        <label className="block text-xs text-gray-400 mb-2">Trigger conditions</label>
-        <div className="space-y-1.5">
-          {ALERT_CONDITIONS.map(({ value, label }) => (
-            <label key={value} className="flex items-center gap-2 text-sm cursor-pointer">
-              <input
-                type="checkbox"
-                checked={form.conditions.includes(value)}
-                onChange={() => toggleCondition(value)}
-                className="accent-blue-500"
-              />
-              {label}
-            </label>
+        <label className="block text-xs text-gray-400 mb-1">Categories (empty = all)</label>
+        <div className="flex flex-wrap gap-1">
+          {CATEGORIES.map((c) => (
+            <button key={c} onClick={() => toggleCat(c)} className={`px-2 py-0.5 rounded text-xs border transition-colors ${f.categories?.includes(c) ? 'bg-blue-600 border-blue-500 text-white' : 'bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500'}`}>{c}</button>
           ))}
         </div>
       </div>
 
       <label className="flex items-center gap-2 text-sm cursor-pointer">
-        <input
-          type="checkbox"
-          checked={form.enabled}
-          onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
-          className="accent-blue-500"
-        />
+        <input type="checkbox" checked={f.enabled ?? true} onChange={(e) => setF({ ...f, enabled: e.target.checked })} className="accent-blue-500" />
         Enabled
       </label>
 
       {error && <p className="text-xs text-red-400">{error}</p>}
-
       <div className="flex justify-end gap-3">
-        <button onClick={onCancel} className="text-sm text-gray-400 hover:text-white px-3 py-1.5 transition-colors">
-          Cancel
-        </button>
-        <button
-          onClick={() => onSave(form)}
-          disabled={isPending || !form.name || form.conditions.length === 0}
-          className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-4 py-1.5 rounded-lg transition-colors"
-        >
+        <button onClick={onCancel} className="text-sm text-gray-400 hover:text-white px-3 py-1.5 transition-colors">Cancel</button>
+        <button onClick={() => onSave(f)} disabled={isPending || !f.name || !f.host} className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-4 py-1.5 rounded transition-colors">
           {isPending ? 'Saving…' : 'Save'}
         </button>
       </div>
@@ -952,123 +906,149 @@ function AlertConfigForm({
   )
 }
 
-function AlertingTab() {
+function SyslogTab() {
   const qc = useQueryClient()
   const [showCreate, setShowCreate] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
 
-  const { data: configs = [], isLoading } = useQuery({
-    queryKey: ['alert-configs'],
-    queryFn: alertsApi.listConfigs,
-  })
+  const { data: dests = [], isLoading } = useQuery({ queryKey: ['syslog-dests'], queryFn: syslogApi.list })
 
   const create = useMutation({
-    mutationFn: (body: AlertConfigBody) => alertsApi.createConfig(body),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['alert-configs'] }); setShowCreate(false) },
+    mutationFn: (b: SyslogDestinationBody) => syslogApi.create(b),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['syslog-dests'] }); setShowCreate(false) },
   })
-
   const update = useMutation({
-    mutationFn: ({ id, body }: { id: string; body: AlertConfigBody }) =>
-      alertsApi.updateConfig(id, body),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['alert-configs'] }); setEditId(null) },
+    mutationFn: ({ id, body }: { id: string; body: SyslogDestinationBody }) => syslogApi.update(id, body),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['syslog-dests'] }); setEditId(null) },
   })
-
   const del = useMutation({
-    mutationFn: (id: string) => alertsApi.deleteConfig(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['alert-configs'] }),
+    mutationFn: (id: string) => syslogApi.delete(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['syslog-dests'] }),
   })
 
   return (
-    <div className="max-w-2xl space-y-6">
-      <div>
-        <h2 className="text-lg font-semibold mb-1">Alert Destinations</h2>
-        <p className="text-sm text-gray-400">
-          Conductor fires alerts when agents disconnect or services go down (outside maintenance mode).
-          Add webhook or email destinations below.
-        </p>
+    <div className="max-w-2xl space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">Syslog Destinations</h2>
+          <p className="text-sm text-gray-400 mt-0.5">Forward events to syslog receivers via RFC 5424.</p>
+        </div>
+        {!showCreate && <button onClick={() => setShowCreate(true)} className="text-sm bg-blue-600 hover:bg-blue-500 px-3 py-1.5 rounded transition-colors">+ Add</button>}
       </div>
+
+      {showCreate && (
+        <SyslogForm initial={emptySyslog()} onSave={(b) => create.mutate(b)} onCancel={() => setShowCreate(false)} isPending={create.isPending} error={(create.error as any)?.response?.data?.message} />
+      )}
 
       {isLoading ? (
         <p className="text-gray-500 text-sm">Loading…</p>
-      ) : configs.length === 0 && !showCreate ? (
-        <p className="text-gray-500 text-sm">No alert destinations configured.</p>
+      ) : dests.length === 0 && !showCreate ? (
+        <p className="text-gray-500 text-sm">No syslog destinations configured.</p>
       ) : (
-        <div className="space-y-3">
-          {configs.map((cfg: AlertConfig) =>
-            editId === cfg.id ? (
-              <AlertConfigForm
-                key={cfg.id}
-                initial={{
-                  name: cfg.name,
-                  type: cfg.type,
-                  enabled: cfg.enabled,
-                  conditions: cfg.conditions,
-                  webhook_url: cfg.webhook_url ?? '',
-                  email_to: cfg.email_to ?? '',
-                }}
-                onSave={(body) => update.mutate({ id: cfg.id, body })}
+        <div className="space-y-2">
+          {dests.map((d: SyslogDestination) =>
+            editId === d.id ? (
+              <SyslogForm
+                key={d.id}
+                initial={{ name: d.name, protocol: d.protocol, host: d.host, port: d.port, tls_ca_cert: d.tls_ca_cert, categories: d.categories, min_severity: d.min_severity, enabled: d.enabled }}
+                onSave={(b) => update.mutate({ id: d.id, body: b })}
                 onCancel={() => setEditId(null)}
                 isPending={update.isPending}
                 error={(update.error as any)?.response?.data?.message}
               />
             ) : (
-              <div key={cfg.id} className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-xl px-5 py-4">
+              <div key={d.id} className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="font-medium text-sm">{cfg.name}</span>
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono">
-                      {cfg.type}
-                    </span>
-                    {!cfg.enabled && (
-                      <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">disabled</span>
-                    )}
+                    <span className="font-medium text-sm">{d.name}</span>
+                    <span className="font-mono text-xs text-gray-400">{d.protocol}://{d.host}:{d.port}</span>
+                    {!d.enabled && <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">disabled</span>}
                   </div>
-                  <p className="text-xs text-gray-500 mt-0.5">
-                    {cfg.conditions.join(', ') || 'no conditions'}
-                    {cfg.type === 'webhook' && cfg.webhook_url && (
-                      <> · <span className="font-mono">{cfg.webhook_url}</span></>
-                    )}
-                    {cfg.type === 'email' && cfg.email_to && (
-                      <> · {cfg.email_to}</>
-                    )}
-                  </p>
+                  <p className="text-xs text-gray-500 mt-0.5">min: {d.min_severity} · {d.categories.length ? d.categories.join(', ') : 'all categories'}</p>
                 </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setEditId(cfg.id)}
-                    className="text-xs text-gray-400 hover:text-white transition-colors"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    onClick={() => del.mutate(cfg.id)}
-                    disabled={del.isPending}
-                    className="text-xs text-red-500 hover:text-red-400 disabled:opacity-40 transition-colors"
-                  >
-                    Delete
-                  </button>
+                <div className="flex gap-2">
+                  <button onClick={() => setEditId(d.id)} className="text-xs text-gray-400 hover:text-white transition-colors">Edit</button>
+                  <button onClick={() => del.mutate(d.id)} disabled={del.isPending} className="text-xs text-red-500 hover:text-red-400 disabled:opacity-40 transition-colors">Delete</button>
                 </div>
               </div>
             )
           )}
         </div>
       )}
+    </div>
+  )
+}
 
-      {showCreate ? (
-        <AlertConfigForm
-          initial={emptyConfig()}
-          onSave={(body) => create.mutate(body)}
-          onCancel={() => setShowCreate(false)}
-          isPending={create.isPending}
-          error={(create.error as any)?.response?.data?.message}
-        />
+// ── Retention Tab ─────────────────────────────────────────────────────────────
+
+function RetentionTab() {
+  const qc = useQueryClient()
+  const { data: items = [], isLoading } = useQuery({ queryKey: ['event-retention'], queryFn: retentionApi.list })
+  const [editing, setEditing] = useState<Record<string, number>>({})
+  const [saved, setSaved] = useState<Record<string, boolean>>({})
+
+  const update = useMutation({
+    mutationFn: ({ category, retain_days }: { category: string; retain_days: number }) =>
+      retentionApi.update(category, retain_days),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['event-retention'] })
+      setSaved((p) => ({ ...p, [vars.category]: true }))
+      setTimeout(() => setSaved((p) => ({ ...p, [vars.category]: false })), 2000)
+    },
+  })
+
+  return (
+    <div className="max-w-lg space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold">Event Retention</h2>
+        <p className="text-sm text-gray-400 mt-0.5">How long events of each category are kept before deletion.</p>
+      </div>
+      {isLoading ? (
+        <p className="text-gray-500 text-sm">Loading…</p>
       ) : (
-        <button
-          onClick={() => setShowCreate(true)}
-          className="text-sm bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg transition-colors"
-        >
-          + Add destination
-        </button>
+        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-800 text-xs text-gray-500">
+                <th className="text-left px-4 py-3 font-medium">Category</th>
+                <th className="text-left px-4 py-3 font-medium">Retain (days)</th>
+                <th className="px-4 py-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => {
+                const cur = editing[item.category] ?? item.retain_days
+                return (
+                  <tr key={item.category} className="border-b border-gray-800 last:border-0">
+                    <td className="px-4 py-3 font-mono text-xs text-gray-300">{item.category}</td>
+                    <td className="px-4 py-3">
+                      <input
+                        type="number"
+                        min={1}
+                        value={cur}
+                        onChange={(e) => setEditing((p) => ({ ...p, [item.category]: parseInt(e.target.value) || 1 }))}
+                        className="w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-500"
+                      />
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {saved[item.category] ? (
+                        <span className="text-xs text-green-400">Saved</span>
+                      ) : (
+                        <button
+                          onClick={() => update.mutate({ category: item.category, retain_days: cur })}
+                          disabled={update.isPending || cur === item.retain_days}
+                          className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40 transition-colors"
+                        >
+                          Save
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   )

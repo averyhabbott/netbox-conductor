@@ -11,6 +11,8 @@ import ConfigEditor from './pages/ConfigEditor'
 import Settings from './pages/Settings'
 import AvailableAgents from './pages/AvailableAgents'
 import Nodes from './pages/Nodes'
+import EventsPage from './pages/EventsPage'
+import AlertingPage from './pages/AlertingPage'
 import ProtectedRoute from './components/ProtectedRoute'
 
 const queryClient = new QueryClient({
@@ -83,6 +85,22 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <Settings />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/events"
+            element={
+              <ProtectedRoute>
+                <EventsPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/alerting"
+            element={
+              <ProtectedRoute>
+                <AlertingPage />
               </ProtectedRoute>
             }
           />

@@ -161,11 +161,44 @@ func main() {
 	}
 	wsClient = client
 
+	// Per-heartbeat service state tracking for fast TypeServiceStateChange emission.
+	type svcState struct {
+		netbox, rq, redis, sentinel, patroni, postgres *bool
+	}
+	var prevSvc svcState
+
 	// Wire heartbeat function
 	client.HeartbeatFn = func() (protocol.HeartbeatPayload, error) {
 		hb, err := metrics.Collect()
-		if err == nil && cfg.PatroniRESTURL != "" && hb.PatroniRunning && hb.PatroniRole == "" {
-			slog.Warn("patroni service is running but not connected to cluster")
+		if err == nil {
+			sendIfChanged := func(svc string, old *bool, cur bool) {
+				if old == nil || *old == cur {
+					return
+				}
+				p, _ := json.Marshal(protocol.ServiceStateChangePayload{
+					NodeID:  cfg.NodeID,
+					Service: svc,
+					Running: cur,
+				})
+				wsClient.Send(protocol.Envelope{
+					ID:      uuid.New().String(),
+					Type:    protocol.TypeServiceStateChange,
+					Payload: json.RawMessage(p),
+				})
+			}
+			sendIfChanged("netbox", prevSvc.netbox, hb.NetboxRunning)
+			sendIfChanged("rq", prevSvc.rq, hb.RQRunning)
+			sendIfChanged("redis", prevSvc.redis, hb.RedisRunning)
+			sendIfChanged("sentinel", prevSvc.sentinel, hb.SentinelRunning)
+			sendIfChanged("patroni", prevSvc.patroni, hb.PatroniRunning)
+			sendIfChanged("postgres", prevSvc.postgres, hb.PostgresRunning)
+
+			nb, rq, rd, sn, pa, pg := hb.NetboxRunning, hb.RQRunning, hb.RedisRunning, hb.SentinelRunning, hb.PatroniRunning, hb.PostgresRunning
+			prevSvc = svcState{netbox: &nb, rq: &rq, redis: &rd, sentinel: &sn, patroni: &pa, postgres: &pg}
+
+			if cfg.PatroniRESTURL != "" && hb.PatroniRunning && hb.PatroniRole == "" {
+				slog.Warn("patroni service is running but not connected to cluster")
+			}
 		}
 		return hb, err
 	}
