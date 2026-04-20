@@ -156,6 +156,7 @@ func run(ctx context.Context) error {
 	alertTransQ := queries.NewAlertTransportQuerier(store.Pool())
 	alertSchedQ := queries.NewAlertScheduleQuerier(store.Pool())
 	alertStateQ := queries.NewAlertStateQuerier(store.Pool())
+	alertFireLogQ := queries.NewAlertFireLogQuerier(store.Pool())
 	syslogDestQ := queries.NewSyslogDestinationQuerier(store.Pool())
 	eventRetentionQ := queries.NewEventRetentionQuerier(store.Pool())
 
@@ -184,11 +185,16 @@ func run(ctx context.Context) error {
 	// restart until configure_failover is manually triggered again.
 	go recoverWitnesses(ctx, witnessManager, clusterQ, nodeQ)
 
+	// Shared name resolver used by both the emitter and the alert engine.
+	nameRes := newNameResolver(clusterQ, nodeQ)
+
 	// Event emitter — central event bus; alert engine + syslog forwarder subscribe as sinks
-	emitter := events.NewEmitter(eventQ).WithResolver(newNameResolver(clusterQ, nodeQ))
+	emitter := events.NewEmitter(eventQ).WithResolver(nameRes)
 
 	// Alert engine
-	alertEngine := alerting.NewEngine(alertRuleQ, alertStateQ, alertTransQ, alertSchedQ, hbQ)
+	alertEngine := alerting.NewEngine(alertRuleQ, alertStateQ, alertTransQ, alertSchedQ, hbQ).
+		WithFireLog(alertFireLogQ).
+		WithResolver(nameRes)
 	emitter.RegisterSink(alertEngine)
 	alertEngine.Start(ctx)
 
@@ -205,7 +211,7 @@ func run(ctx context.Context) error {
 	failoverManager := failover.New(nodeQ, clusterQ, taskQ, emitter, h, dispatcher, broker, credQ, enc)
 
 	// Handlers
-	alertHandler := handlers.NewAlertHandler(alertRuleQ, alertTransQ, alertSchedQ, alertStateQ, eventRetentionQ, logDir, logName)
+	alertHandler := handlers.NewAlertHandler(alertRuleQ, alertTransQ, alertSchedQ, alertStateQ, alertFireLogQ, eventRetentionQ, logDir, logName)
 	eventsHandler := handlers.NewEventsHandler(eventQ, hbQ)
 	syslogHandler := handlers.NewSyslogHandler(syslogDestQ)
 	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, tlsKeyFile, serverURL, enc)

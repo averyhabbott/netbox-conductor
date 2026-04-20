@@ -195,6 +195,7 @@ func New(cfg RouterConfig) *echo.Echo {
 		protected.GET("/alerts/active", cfg.AlertHandler.ListActiveAlerts)
 		protected.POST("/alerts/active/:id/acknowledge", cfg.AlertHandler.AcknowledgeAlert, mw.RequireRole("operator"))
 		protected.POST("/alerts/active/:id/resolve", cfg.AlertHandler.ResolveAlert, mw.RequireRole("operator"))
+		protected.GET("/alerts/history", cfg.AlertHandler.ListFireLog)
 
 		protected.GET("/settings/retention", cfg.AlertHandler.GetRetention)
 		protected.PUT("/settings/retention", cfg.AlertHandler.UpdateRetention, mw.RequireRole("operator"))

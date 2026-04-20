@@ -23,11 +23,13 @@ type Engine struct {
 	rules     []queries.AlertRule
 	schedules map[uuid.UUID]*queries.AlertSchedule
 
-	ruleQ   *queries.AlertRuleQuerier
-	stateQ  *queries.AlertStateQuerier
-	transQ  *queries.AlertTransportQuerier
-	schedQ  *queries.AlertScheduleQuerier
-	hbQ     *queries.HeartbeatQuerier
+	ruleQ      *queries.AlertRuleQuerier
+	stateQ     *queries.AlertStateQuerier
+	transQ     *queries.AlertTransportQuerier
+	schedQ     *queries.AlertScheduleQuerier
+	hbQ        *queries.HeartbeatQuerier
+	fireLogQ   *queries.AlertFireLogQuerier
+	resolver   events.NameResolver
 
 	eventCh chan events.Event
 }
@@ -49,6 +51,19 @@ func NewEngine(
 		hbQ:       hbQ,
 		eventCh:   make(chan events.Event, 512),
 	}
+}
+
+// WithFireLog attaches a fire log querier so every delivery is recorded.
+func (e *Engine) WithFireLog(q *queries.AlertFireLogQuerier) *Engine {
+	e.fireLogQ = q
+	return e
+}
+
+// WithResolver attaches a name resolver used to enrich synthetic events
+// (re-alerts, escalations) that bypass the emitter's own resolver.
+func (e *Engine) WithResolver(r events.NameResolver) *Engine {
+	e.resolver = r
+	return e
 }
 
 // OnEvent implements events.Sink. Events are enqueued for async processing.
@@ -221,7 +236,7 @@ func (e *Engine) processTimers(ctx context.Context) {
 			maxOK := rule.MaxReAlerts == nil || state.ReAlertCount < *rule.MaxReAlerts
 			if maxOK && now.After(state.LastAlertedAt.Add(interval)) {
 				ev := e.syntheticEvent(rule, state,
-					fmt.Sprintf("Re-alert #%d: rule %q still active", state.ReAlertCount+1, rule.Name))
+					fmt.Sprintf("Re-alert #%d: %s still active", state.ReAlertCount+1, rule.Name))
 				e.dispatchToTransports(ctx, rule, ev, false)
 				_ = e.stateQ.MarkAlerted(ctx, state.ID)
 			}
@@ -234,7 +249,7 @@ func (e *Engine) processTimers(ctx context.Context) {
 				t, err := e.transQ.GetByID(ctx, *rule.EscalateTransportID)
 				if err == nil && t.Enabled {
 					ev := e.syntheticEvent(rule, state,
-						fmt.Sprintf("Escalation: rule %q has been active for %d minutes", rule.Name, *rule.EscalateAfterMins))
+						fmt.Sprintf("Escalation: %s has been active for %d minutes", rule.Name, *rule.EscalateAfterMins))
 					go dispatch(*t, rule, ev, false)
 					_ = e.stateQ.MarkEscalated(ctx, state.ID)
 				}
@@ -319,6 +334,24 @@ func (e *Engine) dispatchToTransports(ctx context.Context, rule queries.AlertRul
 		if !t.Enabled {
 			continue
 		}
+		if e.fireLogQ != nil {
+			entry := queries.AlertFireLogEntry{
+				RuleID:        &rule.ID,
+				RuleName:      rule.Name,
+				TransportID:   &t.ID,
+				TransportName: t.Name,
+				TransportType: t.Type,
+				ClusterID:     ev.ClusterID,
+				ClusterName:   ev.ClusterName,
+				NodeID:        ev.NodeID,
+				NodeName:      ev.NodeName,
+				EventCode:     ev.Code,
+				EventMessage:  ev.Message,
+				EventSeverity: ev.Severity,
+				IsResolve:     isResolve,
+			}
+			_ = e.fireLogQ.Insert(ctx, entry)
+		}
 		go dispatch(*t, rule, ev, isResolve)
 	}
 }
@@ -336,7 +369,7 @@ func (e *Engine) syntheticEvent(rule queries.AlertRule, state queries.AlertState
 	if len(rule.Categories) > 0 {
 		category = rule.Categories[0]
 	}
-	return events.Event{
+	ev := events.Event{
 		ID:         uuid.New(),
 		ClusterID:  state.ClusterID,
 		NodeID:     state.NodeID,
@@ -347,4 +380,18 @@ func (e *Engine) syntheticEvent(rule queries.AlertRule, state queries.AlertState
 		Actor:      events.ActorSystem,
 		OccurredAt: time.Now().UTC(),
 	}
+	if e.resolver != nil {
+		ctx := context.Background()
+		if ev.ClusterID != nil && ev.ClusterName == nil {
+			if n := e.resolver.ResolveClusterName(ctx, *ev.ClusterID); n != "" {
+				ev.ClusterName = &n
+			}
+		}
+		if ev.NodeID != nil && ev.NodeName == nil {
+			if n := e.resolver.ResolveNodeName(ctx, *ev.NodeID); n != "" {
+				ev.NodeName = &n
+			}
+		}
+	}
+	return ev
 }

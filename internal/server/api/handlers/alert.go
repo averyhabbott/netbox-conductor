@@ -20,6 +20,7 @@ type AlertHandler struct {
 	transQ     *queries.AlertTransportQuerier
 	schedQ     *queries.AlertScheduleQuerier
 	stateQ     *queries.AlertStateQuerier
+	fireLogQ   *queries.AlertFireLogQuerier
 	retentionQ *queries.EventRetentionQuerier
 	logDir     string
 	logName    string
@@ -30,6 +31,7 @@ func NewAlertHandler(
 	transQ *queries.AlertTransportQuerier,
 	schedQ *queries.AlertScheduleQuerier,
 	stateQ *queries.AlertStateQuerier,
+	fireLogQ *queries.AlertFireLogQuerier,
 	retentionQ *queries.EventRetentionQuerier,
 	logDir, logName string,
 ) *AlertHandler {
@@ -38,6 +40,7 @@ func NewAlertHandler(
 		transQ:     transQ,
 		schedQ:     schedQ,
 		stateQ:     stateQ,
+		fireLogQ:   fireLogQ,
 		retentionQ: retentionQ,
 		logDir:     logDir,
 		logName:    logName,
@@ -327,6 +330,19 @@ func (h *AlertHandler) AcknowledgeAlert(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to acknowledge alert")
 	}
 	return c.NoContent(http.StatusNoContent)
+}
+
+// ListFireLog returns the alert fire history for the last 30 days.
+// GET /api/v1/alerts/history
+func (h *AlertHandler) ListFireLog(c echo.Context) error {
+	entries, err := h.fireLogQ.List(c.Request().Context())
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list alert history")
+	}
+	if entries == nil {
+		entries = []queries.AlertFireLog{}
+	}
+	return c.JSON(http.StatusOK, entries)
 }
 
 // ─── Event Retention ──────────────────────────────────────────────────────────

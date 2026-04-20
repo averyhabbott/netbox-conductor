@@ -99,16 +99,39 @@ export interface ActiveAlertState {
   id: string
   rule_id: string
   cluster_id?: string
+  cluster_name?: string
   node_id?: string
+  node_name?: string
   state: 'active' | 'resolved' | 'acknowledged'
   re_alert_count: number
   escalated: boolean
   first_fired_at: string
   last_fired_at: string
+  last_alerted_at?: string
   resolved_at?: string
   acknowledged_at?: string
   acknowledged_by?: string
   rule_name?: string
+}
+
+// ─── Alert fire log ───────────────────────────────────────────────────────────
+
+export interface AlertFireLog {
+  id: string
+  rule_id?: string
+  rule_name: string
+  transport_id?: string
+  transport_name: string
+  transport_type: string
+  cluster_id?: string
+  cluster_name?: string
+  node_id?: string
+  node_name?: string
+  event_code: string
+  event_message: string
+  event_severity: string
+  is_resolve: boolean
+  fired_at: string
 }
 
 // ─── System logs ──────────────────────────────────────────────────────────────
@@ -159,6 +182,10 @@ export const alertsApi = {
     client.post(`/alerts/active/${id}/acknowledge`),
   resolve: (id: string) =>
     client.post(`/alerts/active/${id}/resolve`),
+
+  // Alert history
+  listHistory: () =>
+    client.get<AlertFireLog[]>('/alerts/history').then((r) => r.data),
 
   // System logs
   systemLogs: (lines = 200) =>

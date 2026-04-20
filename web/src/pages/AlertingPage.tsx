@@ -5,12 +5,13 @@ import {
   type AlertTransport, type AlertTransportBody,
   type AlertSchedule,
   type ActiveAlertState,
+  type AlertFireLog,
 } from '../api/alerts'
 import { clustersApi, type Cluster } from '../api/clusters'
 import { nodesApi, type Node } from '../api/nodes'
 import Layout from '../components/Layout'
 
-type Tab = 'active' | 'rules' | 'transports' | 'schedules'
+type Tab = 'active' | 'history' | 'rules' | 'transports' | 'schedules'
 
 function TabBtn({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
   return (
@@ -25,7 +26,7 @@ function TabBtn({ label, active, onClick }: { label: string; active: boolean; on
   )
 }
 
-// ─── Severity badge ───────────────────────────────────────────────────────────
+// ─── Shared style tokens ──────────────────────────────────────────────────────
 
 const SEV: Record<string, string> = {
   debug:    'text-gray-400',
@@ -35,11 +36,60 @@ const SEV: Record<string, string> = {
   critical: 'text-red-300 font-semibold',
 }
 
+const SEV_BG: Record<string, string> = {
+  debug:    'bg-gray-800 text-gray-400',
+  info:     'bg-blue-900/50 text-blue-300',
+  warn:     'bg-amber-900/50 text-amber-300',
+  error:    'bg-red-900/50 text-red-300',
+  critical: 'bg-red-900 text-red-200 font-semibold',
+}
+
+const inp = 'w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500'
+const sel = 'w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-blue-500'
+
+// ─── Fire mode labels ─────────────────────────────────────────────────────────
+
+const FIRE_MODES = ['once', 're_alert', 'every_occurrence'] as const
+
+const FIRE_MODE_LABELS: Record<string, string> = {
+  once:             'Alert once — stays active until resolved',
+  re_alert:         'Re-alert on interval',
+  every_occurrence: 'Alert on every matching event',
+}
+
+const FIRE_MODE_SHORT: Record<string, string> = {
+  once:             'Once',
+  re_alert:         'Re-alert',
+  every_occurrence: 'Every occurrence',
+}
+
+// ─── Section card wrapper ─────────────────────────────────────────────────────
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 space-y-4">
+      <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">{title}</h4>
+      {children}
+    </div>
+  )
+}
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="block text-xs text-gray-400 mb-1">{label}</label>
+      {children}
+      {hint && <p className="text-xs text-gray-600 mt-1">{hint}</p>}
+    </div>
+  )
+}
+
 // ─── Active Alerts ────────────────────────────────────────────────────────────
 
 function ActiveTab() {
   const [states, setStates] = useState<ActiveAlertState[]>([])
   const [loading, setLoading] = useState(true)
+  const [expanded, setExpanded] = useState<string | null>(null)
 
   async function load() {
     setLoading(true)
@@ -52,59 +102,162 @@ function ActiveTab() {
     return () => clearInterval(id)
   }, [])
 
-  async function ack(id: string) {
-    await alertsApi.acknowledge(id)
-    load()
-  }
-
-  async function resolve(id: string) {
-    await alertsApi.resolve(id)
-    load()
-  }
+  async function ack(id: string) { await alertsApi.acknowledge(id); load() }
+  async function resolve(id: string) { await alertsApi.resolve(id); load() }
 
   if (loading) return <p className="text-gray-500 text-sm py-8 text-center">Loading…</p>
   if (states.length === 0) return <p className="text-gray-600 text-sm py-8 text-center">No active alerts.</p>
 
   return (
-    <div className="space-y-3">
-      {states.map((s) => (
-        <div key={s.id} className="bg-gray-900 border border-gray-700 rounded-lg p-4 flex items-start justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                s.state === 'active' ? 'bg-red-900 text-red-300' :
-                s.state === 'acknowledged' ? 'bg-amber-900 text-amber-300' : 'bg-gray-800 text-gray-400'
+    <div className="space-y-2">
+      {states.map((s) => {
+        const isExpanded = expanded === s.id
+        return (
+          <div key={s.id} className="bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
+            {/* Summary row */}
+            <button
+              type="button"
+              onClick={() => setExpanded(isExpanded ? null : s.id)}
+              className="w-full text-left px-4 py-3 flex items-center gap-3 hover:bg-gray-800/50 transition-colors"
+            >
+              <span className={`text-xs px-1.5 py-0.5 rounded font-medium shrink-0 ${
+                s.state === 'active'       ? 'bg-red-900 text-red-300' :
+                s.state === 'acknowledged' ? 'bg-amber-900 text-amber-300' :
+                                             'bg-gray-800 text-gray-400'
               }`}>{s.state}</span>
-              <span className="text-white text-sm font-medium">{s.rule_name ?? `Unknown rule (${s.rule_id.slice(0, 8)})`}</span>
-              {s.escalated && <span className="text-xs bg-orange-900 text-orange-300 px-1.5 py-0.5 rounded">escalated</span>}
-            </div>
-            <div className="text-gray-500 text-xs space-x-3">
-              <span>First fired: {new Date(s.first_fired_at).toLocaleString()}</span>
-              <span>Re-alerts: {s.re_alert_count}</span>
-              {s.cluster_id && <span>Cluster: {s.cluster_id.slice(0, 8)}</span>}
-              {s.node_id && <span>Node: {s.node_id.slice(0, 8)}</span>}
-            </div>
-          </div>
-          {(s.state === 'active' || s.state === 'acknowledged') && (
-            <div className="flex gap-2 shrink-0">
-              {s.state === 'active' && (
-                <button
-                  onClick={() => ack(s.id)}
-                  className="px-3 py-1.5 text-sm bg-amber-700 hover:bg-amber-600 text-white rounded transition-colors"
-                >
-                  Acknowledge
-                </button>
+              <span className="text-white text-sm font-medium flex-1 truncate">
+                {s.rule_name ?? `Unknown rule`}
+              </span>
+              {s.escalated && (
+                <span className="text-xs bg-orange-900 text-orange-300 px-1.5 py-0.5 rounded shrink-0">escalated</span>
               )}
-              <button
-                onClick={() => resolve(s.id)}
-                className="px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-gray-200 rounded transition-colors"
-              >
-                Resolve
-              </button>
-            </div>
-          )}
-        </div>
-      ))}
+              <div className="text-gray-500 text-xs shrink-0 space-x-3">
+                {s.cluster_name && <span>{s.cluster_name}</span>}
+                {s.node_name    && <span>› {s.node_name}</span>}
+                {s.re_alert_count > 0 && <span>· re-alerted {s.re_alert_count}×</span>}
+              </div>
+              <span className="text-gray-600 text-xs shrink-0">{isExpanded ? '▲' : '▼'}</span>
+            </button>
+
+            {/* Detail panel */}
+            {isExpanded && (
+              <div className="border-t border-gray-800 px-4 py-4 space-y-4">
+                <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-xs">
+                  <div className="text-gray-500">Rule</div>
+                  <div className="text-gray-300">{s.rule_name ?? s.rule_id}</div>
+
+                  {s.cluster_name && <>
+                    <div className="text-gray-500">Cluster</div>
+                    <div className="text-gray-300">{s.cluster_name}</div>
+                  </>}
+                  {s.node_name && <>
+                    <div className="text-gray-500">Node</div>
+                    <div className="text-gray-300">{s.node_name}</div>
+                  </>}
+
+                  <div className="text-gray-500">First fired</div>
+                  <div className="text-gray-300">{new Date(s.first_fired_at).toLocaleString()}</div>
+
+                  {s.last_alerted_at && <>
+                    <div className="text-gray-500">Last alerted</div>
+                    <div className="text-gray-300">{new Date(s.last_alerted_at).toLocaleString()}</div>
+                  </>}
+
+                  <div className="text-gray-500">Re-alert count</div>
+                  <div className="text-gray-300">{s.re_alert_count}</div>
+
+                  <div className="text-gray-500">Escalated</div>
+                  <div className="text-gray-300">{s.escalated ? 'Yes' : 'No'}</div>
+                </div>
+
+                {(s.state === 'active' || s.state === 'acknowledged') && (
+                  <div className="flex gap-2 pt-1">
+                    {s.state === 'active' && (
+                      <button onClick={() => ack(s.id)}
+                        className="px-3 py-1.5 text-sm bg-amber-700 hover:bg-amber-600 text-white rounded transition-colors">
+                        Acknowledge
+                      </button>
+                    )}
+                    <button onClick={() => resolve(s.id)}
+                      className="px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-gray-200 rounded transition-colors">
+                      Resolve
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ─── Alert History ────────────────────────────────────────────────────────────
+
+function HistoryTab() {
+  const [entries, setEntries] = useState<AlertFireLog[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    alertsApi.listHistory()
+      .then(setEntries)
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <p className="text-gray-500 text-sm py-8 text-center">Loading…</p>
+  if (entries.length === 0) return <p className="text-gray-600 text-sm py-8 text-center">No alert history in the last 30 days.</p>
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs text-gray-500 border-b border-gray-800">
+            <th className="pb-2 pr-4 font-medium">Time</th>
+            <th className="pb-2 pr-4 font-medium">Rule</th>
+            <th className="pb-2 pr-4 font-medium">Transport</th>
+            <th className="pb-2 pr-4 font-medium">Severity</th>
+            <th className="pb-2 pr-4 font-medium">Code</th>
+            <th className="pb-2 pr-4 font-medium">Cluster / Node</th>
+            <th className="pb-2 font-medium">Message</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-800/60">
+          {entries.map((e) => (
+            <tr key={e.id} className="text-gray-300 hover:bg-gray-800/30 transition-colors">
+              <td className="py-2 pr-4 text-xs text-gray-500 whitespace-nowrap">
+                {new Date(e.fired_at).toLocaleString()}
+              </td>
+              <td className="py-2 pr-4 font-medium text-white whitespace-nowrap">
+                {e.rule_name}
+                {e.is_resolve && (
+                  <span className="ml-1.5 text-xs bg-emerald-900/50 text-emerald-400 px-1 py-0.5 rounded">resolved</span>
+                )}
+              </td>
+              <td className="py-2 pr-4 text-xs whitespace-nowrap">
+                <span className="text-gray-300">{e.transport_name}</span>
+                <span className="text-gray-600 ml-1">({e.transport_type})</span>
+              </td>
+              <td className="py-2 pr-4">
+                <span className={`text-xs px-1.5 py-0.5 rounded ${SEV_BG[e.event_severity] ?? 'bg-gray-800 text-gray-400'}`}>
+                  {e.event_severity}
+                </span>
+              </td>
+              <td className="py-2 pr-4 text-xs font-mono text-gray-400 whitespace-nowrap">{e.event_code}</td>
+              <td className="py-2 pr-4 text-xs text-gray-400 whitespace-nowrap">
+                {e.cluster_name ?? (e.cluster_id ? e.cluster_id.slice(0, 8) : '—')}
+                {(e.node_name || e.node_id) && (
+                  <span className="text-gray-600"> › {e.node_name ?? e.node_id?.slice(0, 8)}</span>
+                )}
+              </td>
+              <td className="py-2 text-xs text-gray-400 max-w-xs truncate" title={e.event_message}>
+                {e.event_message}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -118,16 +271,6 @@ const TRANSPORT_TYPES: { value: AlertTransportBody['type']; label: string }[] = 
   { value: 'slack_bot',     label: 'Slack — Bot Token' },
 ]
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <label className="block text-xs text-gray-400 mb-1">{label}</label>
-      {children}
-      {hint && <p className="text-xs text-gray-600 mt-1">{hint}</p>}
-    </div>
-  )
-}
-
 function TInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input {...props}
@@ -140,12 +283,11 @@ function TransportForm({
   onSave,
   onCancel,
 }: {
-  initial?: Partial<AlertTransport>
+  initial?: AlertTransport
   onSave: (b: AlertTransportBody) => Promise<void>
   onCancel: () => void
 }) {
-  const cfg = initial?.config ?? {}
-  const isEdit = !!initial?.id
+  const cfg = (initial?.config ?? {}) as Record<string, unknown>
 
   const [name, setName]       = useState(initial?.name ?? '')
   const [type, setType]       = useState<AlertTransportBody['type']>(initial?.type ?? 'webhook')
@@ -153,45 +295,35 @@ function TransportForm({
   const [saving, setSaving]   = useState(false)
   const [err, setErr]         = useState('')
 
-  // ── Webhook fields ──────────────────────────────────────────────────────────
   const [whUrl,          setWhUrl]          = useState((cfg.url as string)           ?? '')
   const [whMethod,       setWhMethod]       = useState((cfg.method as string)        ?? 'POST')
   const [whBodyTemplate, setWhBodyTemplate] = useState((cfg.body_template as string) ?? '')
 
-  // ── Email fields ────────────────────────────────────────────────────────────
+  const isEdit = !!initial
   const [emailTo,   setEmailTo]   = useState(
-    Array.isArray(cfg.to) ? (cfg.to as string[]).join(', ') : (cfg.to as string) ?? ''
+    Array.isArray(cfg.to) ? (cfg.to as string[]).join(', ') : ((cfg.to as string) ?? '')
   )
   const [smtpHost,  setSmtpHost]  = useState((cfg.smtp_host as string)  ?? '')
   const [smtpPort,  setSmtpPort]  = useState((cfg.smtp_port as number)  ?? 587)
   const [smtpTLS,   setSmtpTLS]   = useState((cfg.smtp_tls  as boolean) ?? true)
   const [smtpFrom,  setSmtpFrom]  = useState((cfg.smtp_from as string)  ?? '')
   const [smtpUser,  setSmtpUser]  = useState((cfg.smtp_user as string)  ?? '')
-  const [smtpPass,  setSmtpPass]  = useState('') // never echo stored password
+  const [smtpPass,  setSmtpPass]  = useState('')
 
-  // ── Slack Webhook fields ────────────────────────────────────────────────────
   const [slackWhUrl, setSlackWhUrl] = useState((cfg.url as string) ?? '')
-
-  // ── Slack Bot fields ────────────────────────────────────────────────────────
-  const [slackToken,   setSlackToken]   = useState('') // never echo stored token
+  const [slackToken,   setSlackToken]   = useState('')
   const [slackChannel, setSlackChannel] = useState((cfg.channel as string) ?? '')
 
   function buildConfig(): Record<string, unknown> {
     switch (type) {
-      case 'webhook': {
-        const c: Record<string, unknown> = { url: whUrl, method: whMethod }
-        if (whBodyTemplate) c.body_template = whBodyTemplate
-        return c
-      }
+      case 'webhook':
+        return { url: whUrl, method: whMethod, body_template: whBodyTemplate || undefined }
       case 'email': {
         const c: Record<string, unknown> = {
-          smtp_host: smtpHost,
-          smtp_port: Number(smtpPort),
-          smtp_tls:  smtpTLS,
-          smtp_from: smtpFrom,
+          smtp_host: smtpHost, smtp_port: smtpPort, smtp_tls: smtpTLS,
+          smtp_from: smtpFrom, smtp_user: smtpUser,
           to: emailTo.split(',').map((s) => s.trim()).filter(Boolean),
         }
-        if (smtpUser) c.smtp_user = smtpUser
         if (smtpPass) {
           c.smtp_pass_enc = smtpPass
         } else if (isEdit && cfg.smtp_pass_enc) {
@@ -206,7 +338,6 @@ function TransportForm({
         if (slackToken) {
           c.token_enc = slackToken
         } else if (isEdit && cfg.token_enc) {
-          // preserve the stored token when editing without re-entering it
           c.token_enc = cfg.token_enc
         }
         return c
@@ -224,126 +355,101 @@ function TransportForm({
   }
 
   return (
-    <form onSubmit={submit} className="space-y-4">
-      {/* Name + Type */}
+    <form onSubmit={submit} className="space-y-5">
       <div className="grid grid-cols-2 gap-4">
         <Field label="Name">
-          <TInput value={name} onChange={(e) => setName(e.target.value)} required placeholder="e.g. PagerDuty webhook" />
+          <TInput value={name} onChange={(e) => setName(e.target.value)} required />
         </Field>
         <Field label="Type">
-          <select value={type}
-            onChange={(e) => setType(e.target.value as AlertTransportBody['type'])}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-blue-500">
+          <select value={type} onChange={(e) => setType(e.target.value as AlertTransportBody['type'])} className={sel}>
             {TRANSPORT_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
           </select>
         </Field>
       </div>
 
-      {/* ── Webhook ──────────────────────────────────────────────────────────── */}
       {type === 'webhook' && (
         <div className="space-y-3 bg-gray-800/40 border border-gray-700 rounded-lg p-4">
-          <Field label="URL" hint="The endpoint that will receive the HTTP POST.">
-            <TInput value={whUrl} onChange={(e) => setWhUrl(e.target.value)} required
-              type="url" placeholder="https://hooks.example.com/…" className="font-mono" />
+          <Field label="URL">
+            <TInput value={whUrl} onChange={(e) => setWhUrl(e.target.value)} required placeholder="https://…" />
           </Field>
-          <Field label="Method">
-            <select value={whMethod} onChange={(e) => setWhMethod(e.target.value)}
-              className="w-32 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-blue-500">
-              <option>POST</option>
-              <option>GET</option>
-              <option>PUT</option>
-            </select>
-          </Field>
-          <Field label="Body template (optional)"
-            hint='JSON template. Use {{.Message}}, {{.Code}}, {{.Severity}} as placeholders.'>
-            <textarea value={whBodyTemplate} onChange={(e) => setWhBodyTemplate(e.target.value)} rows={4}
-              placeholder={'{\n  "text": "{{.Message}}",\n  "code": "{{.Code}}"\n}'}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono text-gray-300 focus:outline-none focus:border-blue-500" />
-          </Field>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Method">
+              <select value={whMethod} onChange={(e) => setWhMethod(e.target.value)} className={sel}>
+                {['POST','PUT','PATCH'].map((m) => <option key={m}>{m}</option>)}
+              </select>
+            </Field>
+            <div className="col-span-2">
+              <Field label="Body template (optional — leave blank for default JSON)">
+                <TInput value={whBodyTemplate} onChange={(e) => setWhBodyTemplate(e.target.value)}
+                  placeholder='{"text":"{{.Message}}"}' />
+              </Field>
+            </div>
+          </div>
         </div>
       )}
 
-      {/* ── Email ────────────────────────────────────────────────────────────── */}
       {type === 'email' && (
         <div className="space-y-3 bg-gray-800/40 border border-gray-700 rounded-lg p-4">
-          <Field label="Recipients" hint="Comma-separated list of email addresses.">
-            <TInput value={emailTo} onChange={(e) => setEmailTo(e.target.value)} required
-              placeholder="ops@example.com, alerts@example.com" />
+          <Field label="To (comma-separated)">
+            <TInput value={emailTo} onChange={(e) => setEmailTo(e.target.value)} required placeholder="ops@example.com" />
           </Field>
-          <div className="grid grid-cols-3 gap-3">
-            <div className="col-span-2">
-              <Field label="SMTP host">
-                <TInput value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} required
-                  placeholder="smtp.example.com" className="font-mono" />
-              </Field>
-            </div>
-            <Field label="Port">
-              <TInput value={smtpPort} onChange={(e) => setSmtpPort(Number(e.target.value))}
-                type="number" min={1} max={65535} />
-            </Field>
-          </div>
           <div className="grid grid-cols-2 gap-3">
-            <Field label="From address">
-              <TInput value={smtpFrom} onChange={(e) => setSmtpFrom(e.target.value)} required
-                type="email" placeholder="alerts@example.com" />
+            <Field label="SMTP host">
+              <TInput value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} required />
             </Field>
-            <Field label="SMTP username (optional)">
-              <TInput value={smtpUser} onChange={(e) => setSmtpUser(e.target.value)}
-                autoComplete="off" placeholder="smtp-user" />
+            <Field label="From address">
+              <TInput value={smtpFrom} onChange={(e) => setSmtpFrom(e.target.value)} required />
             </Field>
           </div>
-          <Field label={isEdit ? 'SMTP password (leave blank to keep existing)' : 'SMTP password (optional)'}
-            hint="Stored encrypted.">
-            <TInput value={smtpPass} onChange={(e) => setSmtpPass(e.target.value)}
-              type="password" autoComplete="new-password" placeholder={isEdit ? '••••••••' : ''} />
-          </Field>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Port">
+              <TInput type="number" value={smtpPort} onChange={(e) => setSmtpPort(Number(e.target.value))} required />
+            </Field>
+            <Field label="Username (optional)">
+              <TInput value={smtpUser} onChange={(e) => setSmtpUser(e.target.value)} />
+            </Field>
+            <Field label={isEdit ? 'Password (leave blank to keep current)' : 'Password (optional)'}>
+              <TInput type="password" value={smtpPass} onChange={(e) => setSmtpPass(e.target.value)}
+                autoComplete="new-password" />
+            </Field>
+          </div>
           <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-            <input type="checkbox" checked={smtpTLS} onChange={(e) => setSmtpTLS(e.target.checked)}
-              className="accent-blue-500" />
-            Use TLS (STARTTLS / SMTPS)
+            <input type="checkbox" checked={smtpTLS} onChange={(e) => setSmtpTLS(e.target.checked)} className="accent-blue-500" />
+            Use TLS
           </label>
         </div>
       )}
 
-      {/* ── Slack Incoming Webhook ────────────────────────────────────────────── */}
       {type === 'slack_webhook' && (
         <div className="space-y-3 bg-gray-800/40 border border-gray-700 rounded-lg p-4">
-          <Field label="Webhook URL"
-            hint="From Slack → Your App → Incoming Webhooks → Add New Webhook.">
-            <TInput value={slackWhUrl} onChange={(e) => setSlackWhUrl(e.target.value)} required
-              type="url" placeholder="https://hooks.slack.com/services/T00000000/B00000000/…"
-              className="font-mono" />
+          <Field label="Webhook URL">
+            <TInput value={slackWhUrl} onChange={(e) => setSlackWhUrl(e.target.value)} required placeholder="https://hooks.slack.com/…" />
           </Field>
         </div>
       )}
 
-      {/* ── Slack Bot ────────────────────────────────────────────────────────── */}
       {type === 'slack_bot' && (
         <div className="space-y-3 bg-gray-800/40 border border-gray-700 rounded-lg p-4">
-          <Field label={isEdit ? 'Bot token (leave blank to keep existing)' : 'Bot token'}
-            hint="Requires chat:write scope. Stored encrypted.">
-            <TInput value={slackToken} onChange={(e) => setSlackToken(e.target.value)}
-              type="password" autoComplete="new-password"
-              placeholder={isEdit ? '••••••••' : 'xoxb-…'}
-              required={!isEdit} className="font-mono" />
+          <Field label={isEdit ? 'Bot token (leave blank to keep current)' : 'Bot token'}>
+            <TInput type="password" value={slackToken} onChange={(e) => setSlackToken(e.target.value)}
+              autoComplete="new-password" placeholder="xoxb-…" />
           </Field>
-          <Field label="Channel" hint='e.g. #alerts or a channel ID like C01234ABCDE.'>
-            <TInput value={slackChannel} onChange={(e) => setSlackChannel(e.target.value)} required
-              placeholder="#alerts" />
+          <Field label="Channel">
+            <TInput value={slackChannel} onChange={(e) => setSlackChannel(e.target.value)} required placeholder="#alerts" />
           </Field>
         </div>
       )}
 
       <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)}
-          className="accent-blue-500" />
+        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="accent-blue-500" />
         Enabled
       </label>
+
       {err && <p className="text-red-400 text-sm">{err}</p>}
       <div className="flex gap-2">
         <button type="submit" disabled={saving}
           className="px-4 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors">
-          {saving ? 'Saving…' : 'Save'}
+          {saving ? 'Saving…' : 'Save Transport'}
         </button>
         <button type="button" onClick={onCancel}
           className="px-4 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 rounded transition-colors">
@@ -380,9 +486,12 @@ function TransportsTab() {
 
   async function test(id: string) {
     setTesting(id)
-    try { await alertsApi.testTransport(id); alert('Test message sent!') }
-    catch { alert('Test failed — check conductor logs.') }
-    finally { setTesting(null) }
+    try {
+      await alertsApi.testTransport(id)
+      alert('Test notification sent successfully.')
+    } catch (ex: unknown) {
+      alert('Test failed: ' + (ex instanceof Error ? ex.message : String(ex)))
+    } finally { setTesting(null) }
   }
 
   return (
@@ -394,7 +503,7 @@ function TransportsTab() {
         </button>
       )}
       {adding && (
-        <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
           <h3 className="text-sm font-medium text-white mb-4">New Transport</h3>
           <TransportForm onSave={(b) => save(b)} onCancel={() => setAdding(false)} />
         </div>
@@ -404,21 +513,21 @@ function TransportsTab() {
           {transports.map((t) => (
             <div key={t.id}>
               {editing === t.id ? (
-                <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
                   <TransportForm initial={t} onSave={(b) => save(b, t.id)} onCancel={() => setEditing(null)} />
                 </div>
               ) : (
                 <div className="bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 flex items-center justify-between gap-4">
                   <div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-white text-sm font-medium">{t.name}</span>
-                      <span className="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded">{t.type}</span>
-                      {!t.enabled && <span className="text-xs text-gray-600">disabled</span>}
-                    </div>
+                    <span className="text-white text-sm font-medium">{t.name}</span>
+                    <span className="text-gray-500 text-xs ml-2">
+                      {TRANSPORT_TYPES.find((x) => x.value === t.type)?.label ?? t.type}
+                    </span>
+                    {!t.enabled && <span className="text-gray-600 text-xs ml-2">disabled</span>}
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 shrink-0">
                     <button onClick={() => test(t.id)} disabled={testing === t.id}
-                      className="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 rounded transition-colors">
+                      className="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 rounded transition-colors disabled:opacity-50">
                       {testing === t.id ? 'Testing…' : 'Test'}
                     </button>
                     <button onClick={() => setEditing(t.id)}
@@ -445,7 +554,6 @@ function TransportsTab() {
 
 const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
 const SEVERITIES = ['debug', 'info', 'warn', 'error', 'critical']
-const FIRE_MODES = ['once', 're_alert', 'every_occurrence'] as const
 
 const METRIC_FIELDS: { value: string; label: string }[] = [
   { value: 'disk_used_pct',         label: 'Disk used %' },
@@ -469,40 +577,40 @@ function RuleForm({
   onSave: (b: AlertRuleBody) => Promise<void>
   onCancel: () => void
 }) {
-  const [name,          setName]          = useState(initial?.name ?? '')
-  const [description,   setDescription]   = useState(initial?.description ?? '')
-  const [enabled,       setEnabled]       = useState(initial?.enabled ?? true)
-  const [categories,    setCategories]    = useState<string[]>(initial?.categories ?? [])
-  const [codes,         setCodes]         = useState((initial?.codes ?? []).join(', '))
-  const [minSeverity,   setMinSeverity]   = useState(initial?.min_severity ?? 'warn')
-  const [msgRegex,      setMsgRegex]      = useState(initial?.message_regex ?? '')
-  const [fireMode,      setFireMode]      = useState<AlertRuleBody['fire_mode']>(initial?.fire_mode ?? 'once')
-  const [reAlertMins,   setReAlertMins]   = useState(String(initial?.re_alert_mins ?? ''))
-  const [maxReAlerts,   setMaxReAlerts]   = useState(String(initial?.max_re_alerts ?? ''))
-  const [notifyOnClear, setNotifyOnClear] = useState(initial?.notify_on_clear ?? true)
-  const [scheduleId,    setScheduleId]    = useState(initial?.schedule_id ?? '')
-  const [selectedTransports, setSelectedTransports] = useState<string[]>(initial?.transport_ids ?? [])
-  const [saving, setSaving] = useState(false)
-  const [err,    setErr]    = useState('')
+  // Identification
+  const [name,        setName]        = useState(initial?.name ?? '')
+  const [description, setDescription] = useState(initial?.description ?? '')
+  const [enabled,     setEnabled]     = useState(initial?.enabled ?? true)
 
-  // ── Scope ─────────────────────────────────────────────────────────────────
-  const [clusterId, setClusterId] = useState(initial?.cluster_id ?? '')
-  const [nodeId,    setNodeId]    = useState(initial?.node_id ?? '')
-  const [clusters,  setClusters]  = useState<Cluster[]>([])
-  const [nodes,     setNodes]     = useState<Node[]>([])
-
-  // ── Metric threshold ──────────────────────────────────────────────────────
+  // Matching
+  const [categories,  setCategories]  = useState<string[]>(initial?.categories ?? [])
+  const [codes,       setCodes]       = useState((initial?.codes ?? []).join(', '))
+  const [minSeverity, setMinSeverity] = useState(initial?.min_severity ?? 'warn')
+  const [msgRegex,    setMsgRegex]    = useState(initial?.message_regex ?? '')
+  const [scheduleId,  setScheduleId]  = useState(initial?.schedule_id ?? '')
+  const [clusterId,   setClusterId]   = useState(initial?.cluster_id ?? '')
+  const [nodeId,      setNodeId]      = useState(initial?.node_id ?? '')
+  const [clusters,    setClusters]    = useState<Cluster[]>([])
+  const [nodes,       setNodes]       = useState<Node[]>([])
   const [metricField,    setMetricField]    = useState(initial?.metric_field ?? '')
   const [metricOperator, setMetricOperator] = useState(initial?.metric_operator ?? '>')
   const [metricValue,    setMetricValue]    = useState(
     initial?.metric_value != null ? String(initial.metric_value) : ''
   )
 
-  // ── Escalation ────────────────────────────────────────────────────────────
+  // Action
+  const [selectedTransports, setSelectedTransports] = useState<string[]>(initial?.transport_ids ?? [])
+  const [fireMode,      setFireMode]      = useState<AlertRuleBody['fire_mode']>(initial?.fire_mode ?? 'once')
+  const [reAlertMins,   setReAlertMins]   = useState(String(initial?.re_alert_mins ?? ''))
+  const [maxReAlerts,   setMaxReAlerts]   = useState(String(initial?.max_re_alerts ?? ''))
+  const [notifyOnClear, setNotifyOnClear] = useState(initial?.notify_on_clear ?? true)
   const [escalateAfterMins,   setEscalateAfterMins]   = useState(
     initial?.escalate_after_mins != null ? String(initial.escalate_after_mins) : ''
   )
   const [escalateTransportId, setEscalateTransportId] = useState(initial?.escalate_transport_id ?? '')
+
+  const [saving, setSaving] = useState(false)
+  const [err,    setErr]    = useState('')
 
   useEffect(() => { clustersApi.list().then(setClusters).catch(() => {}) }, [])
   useEffect(() => {
@@ -546,213 +654,192 @@ function RuleForm({
     } finally { setSaving(false) }
   }
 
-  const sel = 'w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-blue-500'
-  const inp = 'w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500'
-
   return (
-    <form onSubmit={submit} className="space-y-5">
-      {/* ── Basic ─────────────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">Name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} required className={inp} />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">Min severity</label>
-          <select value={minSeverity} onChange={(e) => setMinSeverity(e.target.value)} className={sel}>
-            {SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
-          </select>
-        </div>
-      </div>
-      <div>
-        <label className="block text-xs text-gray-400 mb-1">Description</label>
-        <input value={description} onChange={(e) => setDescription(e.target.value)} className={inp} />
-      </div>
+    <form onSubmit={submit} className="space-y-4">
 
-      {/* ── Match conditions ──────────────────────────────────────────────── */}
-      <div>
-        <label className="block text-xs text-gray-400 mb-2">Categories (empty = all)</label>
-        <div className="flex flex-wrap gap-2">
-          {CATEGORIES.map((c) => (
-            <button key={c} type="button" onClick={() => toggleCat(c)}
-              className={`px-2.5 py-1 text-xs rounded border transition-colors ${
-                categories.includes(c)
-                  ? 'bg-blue-700 border-blue-600 text-white'
-                  : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'
-              }`}>
-              {c}
-            </button>
-          ))}
+      {/* ── Identification ──────────────────────────────────────────────────── */}
+      <Section title="Identification">
+        <div className="grid grid-cols-3 gap-4 items-end">
+          <div className="col-span-2">
+            <Field label="Name">
+              <input value={name} onChange={(e) => setName(e.target.value)} required className={inp} />
+            </Field>
+          </div>
+          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer pb-1.5">
+            <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)}
+              className="accent-blue-500" />
+            Enabled
+          </label>
         </div>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">Event codes (comma-sep, prefix ok)</label>
-          <input value={codes} onChange={(e) => setCodes(e.target.value)}
-            placeholder="NBC-HA, NBC-SVC-002" className={inp} />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">Message regex (optional)</label>
-          <input value={msgRegex} onChange={(e) => setMsgRegex(e.target.value)}
-            placeholder="stopped|failed" className={inp} />
-        </div>
-      </div>
+        <Field label="Description (optional)">
+          <input value={description} onChange={(e) => setDescription(e.target.value)} className={inp}
+            placeholder="What does this rule monitor?" />
+        </Field>
+      </Section>
 
-      {/* ── Scope ─────────────────────────────────────────────────────────── */}
-      <div className="bg-gray-800/40 border border-gray-700 rounded-lg p-4 space-y-3">
-        <p className="text-xs font-medium text-gray-400">Scope — optional, leave blank to match any cluster / node</p>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Cluster</label>
+      {/* ── Matching ────────────────────────────────────────────────────────── */}
+      <Section title="Matching">
+        <div className="grid grid-cols-2 gap-4">
+          <Field label="Min severity">
+            <select value={minSeverity} onChange={(e) => setMinSeverity(e.target.value)} className={sel}>
+              {SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </Field>
+          <Field label="Schedule (optional)">
+            <select value={scheduleId} onChange={(e) => setScheduleId(e.target.value)} className={sel}>
+              <option value="">Always active</option>
+              {schedules.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </Field>
+        </div>
+
+        <Field label="Categories (empty = all)">
+          <div className="flex flex-wrap gap-2 mt-1">
+            {CATEGORIES.map((c) => (
+              <button key={c} type="button" onClick={() => toggleCat(c)}
+                className={`px-2.5 py-1 text-xs rounded border transition-colors ${
+                  categories.includes(c)
+                    ? 'bg-blue-700 border-blue-600 text-white'
+                    : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'
+                }`}>
+                {c}
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        <div className="grid grid-cols-2 gap-4">
+          <Field label="Cluster scope (optional)">
             <select value={clusterId}
               onChange={(e) => { setClusterId(e.target.value); setNodeId('') }}
               className={sel}>
               <option value="">Any cluster</option>
               {clusters.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
-          </div>
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Node</label>
+          </Field>
+          <Field label="Node scope (optional)">
             <select value={nodeId} onChange={(e) => setNodeId(e.target.value)}
               disabled={!clusterId} className={sel}>
               <option value="">Any node</option>
               {nodes.map((n) => <option key={n.id} value={n.id}>{n.hostname}</option>)}
             </select>
-          </div>
+          </Field>
         </div>
-      </div>
 
-      {/* ── Metric threshold ──────────────────────────────────────────────── */}
-      <div className="bg-gray-800/40 border border-gray-700 rounded-lg p-4 space-y-3">
-        <p className="text-xs font-medium text-gray-400">Metric threshold — optional, evaluates against latest heartbeat</p>
-        <div className="grid grid-cols-3 gap-3">
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Metric field</label>
+        <div className="grid grid-cols-2 gap-4">
+          <Field label="Event codes (comma-sep, prefix ok)" hint="e.g. NBC-HA, NBC-SVC-002">
+            <input value={codes} onChange={(e) => setCodes(e.target.value)}
+              placeholder="NBC-HA, NBC-SVC-002" className={inp} />
+          </Field>
+          <Field label="Message regex (optional)">
+            <input value={msgRegex} onChange={(e) => setMsgRegex(e.target.value)}
+              placeholder="stopped|failed" className={inp} />
+          </Field>
+        </div>
+
+        {/* Metric threshold */}
+        <div>
+          <label className="block text-xs text-gray-400 mb-2">Metric threshold (optional)</label>
+          <div className="grid grid-cols-3 gap-3">
             <select value={metricField} onChange={(e) => setMetricField(e.target.value)} className={sel}>
               <option value="">None</option>
               {METRIC_FIELDS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
             </select>
-          </div>
-          {metricField && (
-            <>
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Operator</label>
+            {metricField && (
+              <>
                 <select value={metricOperator} onChange={(e) => setMetricOperator(e.target.value)} className={sel}>
                   {METRIC_OPERATORS.map((op) => <option key={op} value={op}>{op}</option>)}
                 </select>
-              </div>
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Threshold</label>
                 <input type="number" step="any" required value={metricValue}
-                  onChange={(e) => setMetricValue(e.target.value)} className={inp} />
-              </div>
-            </>
+                  onChange={(e) => setMetricValue(e.target.value)}
+                  placeholder="Threshold" className={inp} />
+              </>
+            )}
+          </div>
+          {metricField && !nodeId && (
+            <p className="text-amber-400 text-xs mt-2">
+              ⚠ Metric rules require a specific node — select a cluster and node above.
+            </p>
           )}
         </div>
-        {metricField && !nodeId && (
-          <p className="text-amber-400 text-xs">
-            ⚠ Metric rules require a specific node — select a cluster and node in the Scope section above.
-          </p>
-        )}
-      </div>
+      </Section>
 
-      {/* ── Fire behavior ─────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-3 gap-4">
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">Fire mode</label>
-          <select value={fireMode} onChange={(e) => setFireMode(e.target.value as AlertRuleBody['fire_mode'])} className={sel}>
-            {FIRE_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
+      {/* ── Action ──────────────────────────────────────────────────────────── */}
+      <Section title="Action">
+        <Field label="Transports">
+          {transports.length === 0 ? (
+            <p className="text-gray-600 text-xs mt-1">No transports configured yet.</p>
+          ) : (
+            <div className="flex flex-wrap gap-2 mt-1">
+              {transports.map((t) => (
+                <button key={t.id} type="button" onClick={() => toggleTransport(t.id)}
+                  className={`px-2.5 py-1 text-xs rounded border transition-colors ${
+                    selectedTransports.includes(t.id)
+                      ? 'bg-blue-700 border-blue-600 text-white'
+                      : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'
+                  }`}>
+                  {t.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </Field>
+
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <Field label="Fire mode">
+              <select value={fireMode} onChange={(e) => setFireMode(e.target.value as AlertRuleBody['fire_mode'])} className={sel}>
+                {FIRE_MODES.map((m) => <option key={m} value={m}>{FIRE_MODE_LABELS[m]}</option>)}
+              </select>
+            </Field>
+            {fireMode === 'every_occurrence' && (
+              <p className="text-gray-500 text-xs mt-1.5">
+                No active state is tracked — acknowledge and resolve do not apply.
+              </p>
+            )}
+          </div>
+          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer pt-5">
+            <input type="checkbox" checked={notifyOnClear} onChange={(e) => setNotifyOnClear(e.target.checked)}
+              className="accent-blue-500" />
+            Notify when alert clears
+          </label>
         </div>
+
         {fireMode === 're_alert' && (
-          <>
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">Re-alert every (mins)</label>
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Re-alert every (minutes)">
               <input type="number" min={1} required value={reAlertMins}
                 onChange={(e) => setReAlertMins(e.target.value)} className={inp} />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">Max re-alerts (blank = unlimited)</label>
+            </Field>
+            <Field label="Max re-alerts (blank = unlimited)">
               <input type="number" min={1} value={maxReAlerts}
                 onChange={(e) => setMaxReAlerts(e.target.value)} className={inp} />
-            </div>
-          </>
-        )}
-      </div>
-      {fireMode === 'every_occurrence' && (
-        <p className="text-gray-500 text-xs -mt-2">
-          Each matching event fires and delivers immediately. No active state is tracked — acknowledge and resolve do not apply.
-        </p>
-      )}
-
-      {/* ── Escalation ────────────────────────────────────────────────────── */}
-      {fireMode !== 'every_occurrence' && (
-        <div className="bg-gray-800/40 border border-gray-700 rounded-lg p-4 space-y-3">
-          <p className="text-xs font-medium text-gray-400">Escalation — optional, fires a second transport if the alert stays active</p>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">Escalate after (mins)</label>
-              <input type="number" min={1} value={escalateAfterMins}
-                onChange={(e) => setEscalateAfterMins(e.target.value)}
-                placeholder="e.g. 30" className={inp} />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">Escalate to transport</label>
-              <select value={escalateTransportId} onChange={(e) => setEscalateTransportId(e.target.value)}
-                disabled={!escalateAfterMins} className={sel}>
-                <option value="">None</option>
-                {transports.filter((t) => t.enabled).map((t) => (
-                  <option key={t.id} value={t.id}>{t.name}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── Options ───────────────────────────────────────────────────────── */}
-      <div className="flex gap-6">
-        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)}
-            className="accent-blue-500" />
-          Enabled
-        </label>
-        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-          <input type="checkbox" checked={notifyOnClear} onChange={(e) => setNotifyOnClear(e.target.checked)}
-            className="accent-blue-500" />
-          Notify on clear
-        </label>
-      </div>
-
-      {schedules.length > 0 && (
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">Schedule (optional)</label>
-          <select value={scheduleId} onChange={(e) => setScheduleId(e.target.value)} className={sel}>
-            <option value="">Always active</option>
-            {schedules.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-        </div>
-      )}
-
-      <div>
-        <label className="block text-xs text-gray-400 mb-2">Transports</label>
-        {transports.length === 0 ? (
-          <p className="text-gray-600 text-xs">No transports configured yet.</p>
-        ) : (
-          <div className="flex flex-wrap gap-2">
-            {transports.map((t) => (
-              <button key={t.id} type="button" onClick={() => toggleTransport(t.id)}
-                className={`px-2.5 py-1 text-xs rounded border transition-colors ${
-                  selectedTransports.includes(t.id)
-                    ? 'bg-blue-700 border-blue-600 text-white'
-                    : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'
-                }`}>
-                {t.name}
-              </button>
-            ))}
+            </Field>
           </div>
         )}
-      </div>
+
+        {fireMode !== 'every_occurrence' && (
+          <div>
+            <label className="block text-xs text-gray-400 mb-2">Escalation (optional)</label>
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="Escalate after (minutes)">
+                <input type="number" min={1} value={escalateAfterMins}
+                  onChange={(e) => setEscalateAfterMins(e.target.value)}
+                  placeholder="e.g. 30" className={inp} />
+              </Field>
+              <Field label="Escalate to transport">
+                <select value={escalateTransportId} onChange={(e) => setEscalateTransportId(e.target.value)}
+                  disabled={!escalateAfterMins} className={sel}>
+                  <option value="">None</option>
+                  {transports.filter((t) => t.enabled).map((t) => (
+                    <option key={t.id} value={t.id}>{t.name}</option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+          </div>
+        )}
+      </Section>
 
       {err && <p className="text-red-400 text-sm">{err}</p>}
       <div className="flex gap-2">
@@ -836,7 +923,9 @@ function RulesTab() {
                     <div className="flex items-center gap-2 mb-1">
                       <span className="text-white text-sm font-medium">{r.name}</span>
                       <span className={`text-xs ${SEV[r.min_severity]}`}>{r.min_severity}+</span>
-                      <span className="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded">{r.fire_mode}</span>
+                      <span className="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded">
+                        {FIRE_MODE_SHORT[r.fire_mode] ?? r.fire_mode}
+                      </span>
                       {!r.enabled && <span className="text-xs text-gray-600">disabled</span>}
                     </div>
                     <div className="text-gray-500 text-xs">
@@ -883,71 +972,21 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 const TIMEZONES = [
   'UTC',
-  'America/New_York',
-  'America/Chicago',
-  'America/Denver',
-  'America/Los_Angeles',
-  'America/Phoenix',
-  'America/Anchorage',
-  'America/Honolulu',
-  'America/Toronto',
-  'America/Vancouver',
-  'America/Sao_Paulo',
-  'America/Argentina/Buenos_Aires',
-  'America/Mexico_City',
-  'Europe/London',
-  'Europe/Dublin',
-  'Europe/Lisbon',
-  'Europe/Paris',
-  'Europe/Berlin',
-  'Europe/Amsterdam',
-  'Europe/Brussels',
-  'Europe/Zurich',
-  'Europe/Rome',
-  'Europe/Madrid',
-  'Europe/Stockholm',
-  'Europe/Oslo',
-  'Europe/Helsinki',
-  'Europe/Warsaw',
-  'Europe/Prague',
-  'Europe/Budapest',
-  'Europe/Bucharest',
-  'Europe/Athens',
-  'Europe/Istanbul',
-  'Europe/Moscow',
-  'Asia/Dubai',
-  'Asia/Kolkata',
-  'Asia/Dhaka',
-  'Asia/Colombo',
-  'Asia/Bangkok',
-  'Asia/Jakarta',
-  'Asia/Singapore',
-  'Asia/Kuala_Lumpur',
-  'Asia/Shanghai',
-  'Asia/Hong_Kong',
-  'Asia/Taipei',
-  'Asia/Seoul',
-  'Asia/Tokyo',
-  'Asia/Manila',
-  'Asia/Karachi',
-  'Asia/Tashkent',
-  'Asia/Almaty',
-  'Asia/Yekaterinburg',
-  'Asia/Novosibirsk',
-  'Asia/Vladivostok',
-  'Australia/Perth',
-  'Australia/Darwin',
-  'Australia/Adelaide',
-  'Australia/Brisbane',
-  'Australia/Sydney',
-  'Australia/Melbourne',
-  'Pacific/Auckland',
-  'Pacific/Fiji',
-  'Pacific/Honolulu',
-  'Africa/Cairo',
-  'Africa/Johannesburg',
-  'Africa/Lagos',
-  'Africa/Nairobi',
+  'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+  'America/Phoenix', 'America/Anchorage', 'America/Honolulu', 'America/Toronto',
+  'America/Vancouver', 'America/Sao_Paulo', 'America/Argentina/Buenos_Aires', 'America/Mexico_City',
+  'Europe/London', 'Europe/Dublin', 'Europe/Lisbon', 'Europe/Paris', 'Europe/Berlin',
+  'Europe/Amsterdam', 'Europe/Brussels', 'Europe/Zurich', 'Europe/Rome', 'Europe/Madrid',
+  'Europe/Stockholm', 'Europe/Oslo', 'Europe/Helsinki', 'Europe/Warsaw', 'Europe/Prague',
+  'Europe/Budapest', 'Europe/Bucharest', 'Europe/Athens', 'Europe/Istanbul', 'Europe/Moscow',
+  'Asia/Dubai', 'Asia/Kolkata', 'Asia/Dhaka', 'Asia/Colombo', 'Asia/Bangkok', 'Asia/Jakarta',
+  'Asia/Singapore', 'Asia/Kuala_Lumpur', 'Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Taipei',
+  'Asia/Seoul', 'Asia/Tokyo', 'Asia/Manila', 'Asia/Karachi', 'Asia/Tashkent', 'Asia/Almaty',
+  'Asia/Yekaterinburg', 'Asia/Novosibirsk', 'Asia/Vladivostok',
+  'Australia/Perth', 'Australia/Darwin', 'Australia/Adelaide', 'Australia/Brisbane',
+  'Australia/Sydney', 'Australia/Melbourne',
+  'Pacific/Auckland', 'Pacific/Fiji', 'Pacific/Honolulu',
+  'Africa/Cairo', 'Africa/Johannesburg', 'Africa/Lagos', 'Africa/Nairobi',
 ]
 
 function SchedulesTab() {
@@ -964,10 +1003,6 @@ function SchedulesTab() {
     try { setSchedules(await alertsApi.listSchedules()) } finally { setLoading(false) }
   }
   useEffect(() => { load() }, [])
-
-  function addWindow() {
-    setWindows((w) => [...w, { days: [1,2,3,4,5], start: '09:00', end: '17:00' }])
-  }
 
   function toggleDay(wi: number, day: number) {
     setWindows((ws) => ws.map((w, i) => i !== wi ? w : {
@@ -992,6 +1027,8 @@ function SchedulesTab() {
     await alertsApi.deleteSchedule(id); load()
   }
 
+  const baseInput = 'w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500'
+
   return (
     <div className="space-y-4">
       {!adding && (
@@ -1006,13 +1043,11 @@ function SchedulesTab() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs text-gray-400 mb-1">Name</label>
-              <input value={name} onChange={(e) => setName(e.target.value)} required
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500" />
+              <input value={name} onChange={(e) => setName(e.target.value)} required className={baseInput} />
             </div>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Timezone</label>
-              <select value={timezone} onChange={(e) => setTimezone(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500">
+              <select value={timezone} onChange={(e) => setTimezone(e.target.value)} className={baseInput}>
                 {TIMEZONES.map((tz) => <option key={tz} value={tz}>{tz}</option>)}
               </select>
             </div>
@@ -1020,7 +1055,8 @@ function SchedulesTab() {
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs text-gray-400">Time windows</span>
-              <button type="button" onClick={addWindow}
+              <button type="button"
+                onClick={() => setWindows((w) => [...w, { days: [1,2,3,4,5], start: '09:00', end: '17:00' }])}
                 className="text-xs text-blue-400 hover:text-blue-300">+ Add window</button>
             </div>
             {windows.map((w, wi) => (
@@ -1093,16 +1129,18 @@ export default function AlertingPage() {
         <h1 className="text-xl font-semibold text-white mb-6">Alerting</h1>
 
         <div className="flex gap-1 mb-6 border-b border-gray-800">
-          <TabBtn label="Active Alerts" active={tab === 'active'} onClick={() => setTab('active')} />
-          <TabBtn label="Rules" active={tab === 'rules'} onClick={() => setTab('rules')} />
-          <TabBtn label="Transports" active={tab === 'transports'} onClick={() => setTab('transports')} />
-          <TabBtn label="Schedules" active={tab === 'schedules'} onClick={() => setTab('schedules')} />
+          <TabBtn label="Active Alerts" active={tab === 'active'}     onClick={() => setTab('active')} />
+          <TabBtn label="History"       active={tab === 'history'}    onClick={() => setTab('history')} />
+          <TabBtn label="Rules"         active={tab === 'rules'}      onClick={() => setTab('rules')} />
+          <TabBtn label="Transports"    active={tab === 'transports'} onClick={() => setTab('transports')} />
+          <TabBtn label="Schedules"     active={tab === 'schedules'}  onClick={() => setTab('schedules')} />
         </div>
 
-        {tab === 'active' && <ActiveTab />}
-        {tab === 'rules' && <RulesTab />}
+        {tab === 'active'     && <ActiveTab />}
+        {tab === 'history'    && <HistoryTab />}
+        {tab === 'rules'      && <RulesTab />}
         {tab === 'transports' && <TransportsTab />}
-        {tab === 'schedules' && <SchedulesTab />}
+        {tab === 'schedules'  && <SchedulesTab />}
       </div>
     </Layout>
   )

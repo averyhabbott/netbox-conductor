@@ -14,7 +14,9 @@ type AlertState struct {
 	RuleID         uuid.UUID  `json:"rule_id"`
 	RuleName       *string    `json:"rule_name,omitempty"`
 	ClusterID      *uuid.UUID `json:"cluster_id,omitempty"`
+	ClusterName    *string    `json:"cluster_name,omitempty"`
 	NodeID         *uuid.UUID `json:"node_id,omitempty"`
+	NodeName       *string    `json:"node_name,omitempty"`
 	State          string     `json:"state"` // active | resolved | acknowledged
 	ReAlertCount   int        `json:"re_alert_count"`
 	Escalated      bool       `json:"escalated"`
@@ -137,15 +139,19 @@ func (q *AlertStateQuerier) Acknowledge(ctx context.Context, id, userID uuid.UUI
 	return err
 }
 
-// ListActive returns all non-resolved alert states joined with the rule name.
+// ListActive returns all non-resolved alert states joined with rule, cluster, and node names.
 func (q *AlertStateQuerier) ListActive(ctx context.Context) ([]AlertState, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT s.id, s.rule_id, s.cluster_id, s.node_id, s.state, s.re_alert_count, s.escalated,
 		       s.first_fired_at, s.last_fired_at, s.last_alerted_at,
 		       s.resolved_at, s.acknowledged_at, s.acknowledged_by,
-		       r.name AS rule_name
+		       r.name AS rule_name,
+		       c.name AS cluster_name,
+		       n.hostname AS node_name
 		FROM active_alert_states s
 		LEFT JOIN alert_rules r ON r.id = s.rule_id
+		LEFT JOIN clusters c ON c.id = s.cluster_id
+		LEFT JOIN nodes n ON n.id = s.node_id
 		WHERE s.state != 'resolved'
 		ORDER BY s.first_fired_at DESC`)
 	if err != nil {
@@ -160,7 +166,7 @@ func (q *AlertStateQuerier) ListActive(ctx context.Context) ([]AlertState, error
 			&s.ReAlertCount, &s.Escalated,
 			&s.FirstFiredAt, &s.LastFiredAt, &s.LastAlertedAt,
 			&s.ResolvedAt, &s.AcknowledgedAt, &s.AcknowledgedBy,
-			&s.RuleName,
+			&s.RuleName, &s.ClusterName, &s.NodeName,
 		); err != nil {
 			return nil, err
 		}
