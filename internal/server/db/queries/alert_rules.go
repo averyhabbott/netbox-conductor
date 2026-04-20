@@ -52,33 +52,33 @@ type AlertRule struct {
 
 // AlertRuleParams holds the fields for creating or updating a rule.
 type AlertRuleParams struct {
-	Name        string
-	Description string
-	Enabled     bool
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Enabled     bool   `json:"enabled"`
 
-	Categories   []string
-	Codes        []string
-	MinSeverity  string
-	MessageRegex *string
+	Categories   []string `json:"categories"`
+	Codes        []string `json:"codes"`
+	MinSeverity  string   `json:"min_severity"`
+	MessageRegex *string  `json:"message_regex"`
 
-	MetricField    *string
-	MetricOperator *string
-	MetricValue    *float64
+	MetricField    *string  `json:"metric_field"`
+	MetricOperator *string  `json:"metric_operator"`
+	MetricValue    *float64 `json:"metric_value"`
 
-	ClusterID *uuid.UUID
-	NodeID    *uuid.UUID
+	ClusterID *uuid.UUID `json:"cluster_id"`
+	NodeID    *uuid.UUID `json:"node_id"`
 
-	FireMode      string
-	ReAlertMins   *int
-	MaxReAlerts   *int
-	NotifyOnClear bool
+	FireMode      string `json:"fire_mode"`
+	ReAlertMins   *int   `json:"re_alert_mins"`
+	MaxReAlerts   *int   `json:"max_re_alerts"`
+	NotifyOnClear bool   `json:"notify_on_clear"`
 
-	EscalateAfterMins   *int
-	EscalateTransportID *uuid.UUID
+	EscalateAfterMins   *int       `json:"escalate_after_mins"`
+	EscalateTransportID *uuid.UUID `json:"escalate_transport_id"`
 
-	ScheduleID *uuid.UUID
+	ScheduleID *uuid.UUID `json:"schedule_id"`
 
-	TransportIDs []uuid.UUID
+	TransportIDs []uuid.UUID `json:"transport_ids"`
 }
 
 // AlertRuleQuerier performs alert_rules operations.
@@ -278,7 +278,7 @@ func (q *AlertRuleQuerier) getTransportIDs(ctx context.Context, ruleID uuid.UUID
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []uuid.UUID
+	ids := make([]uuid.UUID, 0)
 	for rows.Next() {
 		var id uuid.UUID
 		if err := rows.Scan(&id); err != nil {

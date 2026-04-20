@@ -842,8 +842,8 @@ function RulesTab() {
                     <div className="text-gray-500 text-xs">
                       {r.categories.length > 0 ? r.categories.join(', ') : 'all categories'}
                       {r.codes.length > 0 && <> · codes: {r.codes.join(', ')}</>}
-                      {r.transport_ids.length > 0 && (
-                        <> · → {r.transport_ids.map((id) => transports.find((t) => t.id === id)?.name ?? '?').join(', ')}</>
+                      {(r.transport_ids ?? []).length > 0 && (
+                        <> · → {(r.transport_ids ?? []).map((id) => transports.find((t) => t.id === id)?.name ?? '?').join(', ')}</>
                       )}
                       {r.description && <> · {r.description}</>}
                     </div>
