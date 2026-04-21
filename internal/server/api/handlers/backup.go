@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
@@ -13,6 +15,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -29,6 +32,9 @@ type BackupHandler struct {
 	taskResults *queries.TaskResultQuerier
 	enc         *crypto.Encryptor
 	dispatcher  *hub.Dispatcher
+	hub         *hub.Hub
+	creds       *queries.CredentialQuerier
+	witness     *patroni.WitnessManager
 	emitter     events.Emitter
 }
 
@@ -44,6 +50,9 @@ func NewBackupHandler(
 	taskResults *queries.TaskResultQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
+	h *hub.Hub,
+	creds *queries.CredentialQuerier,
+	witness *patroni.WitnessManager,
 ) *BackupHandler {
 	return &BackupHandler{
 		clusters:    clusters,
@@ -55,6 +64,9 @@ func NewBackupHandler(
 		taskResults: taskResults,
 		enc:         enc,
 		dispatcher:  dispatcher,
+		hub:         h,
+		creds:       creds,
+		witness:     witness,
 	}
 }
 
@@ -73,11 +85,13 @@ func (h *BackupHandler) GetBackupConfig(c echo.Context) error {
 	}
 
 	schedule, _ := h.schedules.Get(ctx, clusterID) // nil = not yet configured
+	cached, _ := h.catalog.GetLatest(ctx, clusterID)
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id": clusterID.String(),
-		"targets":    serializeTargets(targetList),
-		"schedule":   serializeSchedule(schedule),
+		"cluster_id":     clusterID.String(),
+		"targets":        serializeTargets(targetList),
+		"schedule":       serializeSchedule(schedule),
+		"cached_catalog": serializeCatalog(cached),
 	})
 }
 
@@ -215,9 +229,12 @@ func (h *BackupHandler) DeleteBackupTarget(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"deleted": tid.String()})
 }
 
-// EnableBackups runs the bootstrap sequence for a cluster:
-// push updated Patroni config (with archive settings) → push pgbackrest.conf →
-// stanza-create → stanza-check → set stanza_initialized=true.
+// EnableBackups runs the full backup bootstrap sequence for a cluster:
+//  1. Push pgbackrest.conf to all DB nodes.
+//  2. Push Patroni config with archive_mode/archive_command to all DB nodes (requires restart).
+//  3. Background: wait for Patroni config tasks → dispatch stanza-create to primary →
+//     wait for success → set stanza_initialized=true.
+//
 // POST /api/v1/clusters/:id/backup-config/enable
 func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
@@ -246,8 +263,61 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "no database nodes found in cluster")
 	}
 
-	// Render pgbackrest.conf from targets + cluster data dir.
-	pgbConf, err := renderPGBackRestConf(cluster.PatroniScope, targetList, h.enc)
+	stanzaName := cluster.PatroniScope
+
+	// Ensure a schedule row exists so SetStanzaInitialized has a row to UPDATE.
+	// If the user hasn't saved a schedule yet, create one with defaults.
+	// If one already exists, leave its values untouched.
+	if existing, _ := h.schedules.Get(ctx, clusterID); existing == nil {
+		if _, err := h.schedules.Upsert(ctx, queries.UpsertBackupScheduleParams{
+			ClusterID:             clusterID,
+			Enabled:               true,
+			FullBackupCron:        "0 1 * * 0",
+			DiffBackupCron:        "0 1 * * 1-6",
+			IncrBackupIntervalHrs: 1,
+		}); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to initialize backup schedule: "+err.Error())
+		}
+	}
+
+	// Fetch cluster credentials for Patroni config rendering.
+	superUser, superPass := "postgres", ""
+	replicaUser, replicaPass := "replicator", ""
+	restUser, restPass := "patroni", ""
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_superuser"); err == nil {
+		superUser = cred.Username
+		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
+			superPass = string(pw)
+		}
+	}
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_replication"); err == nil {
+		replicaUser = cred.Username
+		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
+			replicaPass = string(pw)
+		}
+	}
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+		restUser = cred.Username
+		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
+			restPass = string(pw)
+		}
+	}
+
+	// Witness address (empty for HA 3+ node clusters).
+	witnessAddr := ""
+	if h.witness != nil {
+		witnessAddr = h.witness.Addr(clusterID)
+	}
+
+	// Build Raft peer list.
+	raftPeers := make([]string, 0, len(dbNodes))
+	for _, n := range dbNodes {
+		nodeIP, _, _ := strings.Cut(n.IPAddress, "/")
+		raftPeers = append(raftPeers, nodeIP+":5433")
+	}
+
+	// Render pgbackrest.conf.
+	pgbConf, err := renderPGBackRestConf(stanzaName, targetList, h.enc)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to render backup configuration: "+err.Error())
 	}
@@ -260,11 +330,16 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		Error    string `json:"error,omitempty"`
 	}
 
-	confTasks := make([]taskRef, 0, len(dbNodes))
 	var primaryNode *queries.Node
+	pgbTasks := make([]taskRef, 0, len(dbNodes))
+	patroniTaskIDs := make([]uuid.UUID, 0, len(dbNodes))
+	patroniTasks := make([]taskRef, 0, len(dbNodes))
 
 	for i := range dbNodes {
 		n := &dbNodes[i]
+		nodeIP, _, _ := strings.Cut(n.IPAddress, "/")
+
+		// Identify primary from Patroni state.
 		if n.PatroniState != nil {
 			var ps map[string]any
 			if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
@@ -272,26 +347,87 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			}
 		}
 
-		params, _ := json.Marshal(protocol.PGBackRestConfigParams{Config: pgbConf})
-		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, taskID, string(protocol.TaskPGBackRestConfigure), params)
+		// 1. Dispatch pgbackrest.configure.
+		pgbParams, _ := json.Marshal(protocol.PGBackRestConfigParams{Config: pgbConf})
+		pgbTaskID := uuid.New()
+		_ = h.taskResults.Create(ctx, n.ID, pgbTaskID, string(protocol.TaskPGBackRestConfigure), pgbParams)
 		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
+			TaskID:      pgbTaskID.String(),
 			TaskType:    protocol.TaskPGBackRestConfigure,
-			Params:      json.RawMessage(params),
+			Params:      json.RawMessage(pgbParams),
 			TimeoutSecs: 30,
 		}); dispErr != nil {
-			confTasks = append(confTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
+			pgbTasks = append(pgbTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
+		} else {
+			_ = h.taskResults.SetSent(ctx, pgbTaskID)
+			pgbTasks = append(pgbTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: pgbTaskID.String(), Status: "dispatched"})
+		}
+
+		// 2a. Dispatch patroni.write_config with archive settings.
+		partners := make([]string, 0, len(raftPeers)-1)
+		for _, p := range raftPeers {
+			if !strings.HasPrefix(p, nodeIP+":") {
+				partners = append(partners, p)
+			}
+		}
+		patroniContent, renderErr := configgen.RenderPatroni(configgen.PatroniInput{
+			Scope:         stanzaName,
+			NodeName:      n.Hostname,
+			NodeAddr:      nodeIP,
+			RaftSelfAddr:  nodeIP + ":5433",
+			RaftPartners:  partners,
+			WitnessAddr:   witnessAddr,
+			RESTUsername:  restUser,
+			RESTPassword:  restPass,
+			DBSuperUser:   superUser,
+			DBSuperPass:   superPass,
+			DBReplicaUser: replicaUser,
+			DBReplicaPass: replicaPass,
+			ArchiveEnabled: true,
+			ArchiveStanza:  stanzaName,
+		})
+		if renderErr != nil {
+			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "error", Error: renderErr.Error()})
 			continue
 		}
-		_ = h.taskResults.SetSent(ctx, taskID)
-		confTasks = append(confTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: taskID.String(), Status: "dispatched"})
+		writeParams, _ := json.Marshal(protocol.PatroniConfigWriteParams{Content: patroniContent})
+		writeTaskID := uuid.New()
+		_ = h.taskResults.Create(ctx, n.ID, writeTaskID, string(protocol.TaskWritePatroniConf), writeParams)
+		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
+			TaskID:      writeTaskID.String(),
+			TaskType:    protocol.TaskWritePatroniConf,
+			Params:      json.RawMessage(writeParams),
+			TimeoutSecs: 30,
+		}); dispErr != nil {
+			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
+			continue
+		}
+		_ = h.taskResults.SetSent(ctx, writeTaskID)
+		patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: writeTaskID.String(), Status: "dispatched"})
+
+		// 2b. Dispatch service.restart.patroni — agent processes tasks in order
+		// so this runs after the config write completes on that node.
+		restartParams, _ := json.Marshal(struct{}{})
+		restartTaskID := uuid.New()
+		_ = h.taskResults.Create(ctx, n.ID, restartTaskID, string(protocol.TaskRestartPatroni), restartParams)
+		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
+			TaskID:      restartTaskID.String(),
+			TaskType:    protocol.TaskRestartPatroni,
+			Params:      json.RawMessage(restartParams),
+			TimeoutSecs: 60,
+		}); dispErr != nil {
+			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: "restart: " + dispErr.Error()})
+		} else {
+			_ = h.taskResults.SetSent(ctx, restartTaskID)
+			patroniTaskIDs = append(patroniTaskIDs, restartTaskID) // wait on restart, not write
+			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: restartTaskID.String(), Status: "dispatched"})
+		}
 	}
 
-	// Dispatch stanza-create to primary (or first online node if primary unknown).
+	// Fall back to any connected node if primary is unknown.
 	if primaryNode == nil {
 		for i := range dbNodes {
-			if dbNodes[i].AgentStatus == "connected" {
+			if h.hub.IsConnected(dbNodes[i].ID) {
 				primaryNode = &dbNodes[i]
 				break
 			}
@@ -299,41 +435,67 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	}
 
 	var stanzaTask *taskRef
+	var stanzaTaskID uuid.UUID
 	if primaryNode != nil {
-		stanzaName := cluster.PatroniScope
-		params, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
-		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, primaryNode.ID, taskID, string(protocol.TaskPGBackRestStanzaCreate), params)
-		if dispErr := h.dispatcher.Dispatch(primaryNode.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskPGBackRestStanzaCreate,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 120,
-		}); dispErr != nil {
-			ref := taskRef{NodeID: primaryNode.ID.String(), Hostname: primaryNode.Hostname, Status: "offline", Error: dispErr.Error()}
-			stanzaTask = &ref
-		} else {
-			_ = h.taskResults.SetSent(ctx, taskID)
-			// Mark stanza initialized in background once task completes (optimistic).
-			go func(tid uuid.UUID, cid uuid.UUID, name string) {
-				time.Sleep(5 * time.Second)
-				_ = h.schedules.SetStanzaInitialized(context.Background(), cid, name)
-			}(taskID, clusterID, stanzaName)
-			ref := taskRef{NodeID: primaryNode.ID.String(), Hostname: primaryNode.Hostname, TaskID: taskID.String(), Status: "dispatched"}
-			stanzaTask = &ref
-		}
+		stanzaTaskID = uuid.New()
+		stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
+		// Register the waiter before dispatching to avoid a race.
+		_ = h.taskResults.Create(ctx, primaryNode.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams)
+		ref := taskRef{NodeID: primaryNode.ID.String(), Hostname: primaryNode.Hostname, TaskID: stanzaTaskID.String(), Status: "pending"}
+		// Stanza-create is dispatched in the background goroutine after Patroni
+		// config tasks finish — only pre-register the task here.
+		stanzaTask = &ref
 	}
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodePatroniConfigured,
-			"Backup configuration pushed to cluster nodes",
+			"Backup configuration pushed to cluster nodes — activating WAL archiving",
 			actorFromCtx(c)).Cluster(clusterID).Build())
 	}
 
+	// Background goroutine: poll DB for Patroni restart tasks to complete, then
+	// dispatch stanza-create and poll for its success before marking stanza_initialized.
+	// DB polling avoids the WaitForTask race condition where tasks complete before
+	// the waiter is registered.
+	if primaryNode != nil {
+		capturedPrimary := primaryNode
+		capturedPatroniIDs := patroniTaskIDs
+		capturedStanzaID := stanzaTaskID
+		go func() {
+			bgCtx := context.Background()
+
+			// Poll DB until all Patroni restart tasks reach a terminal state.
+			for _, tid := range capturedPatroniIDs {
+				if ok := pollTaskSuccess(bgCtx, h.taskResults, tid, 5*time.Minute); !ok {
+					return
+				}
+			}
+
+			// Now dispatch stanza-create to the primary.
+			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
+			if dispErr := h.dispatcher.Dispatch(capturedPrimary.ID, protocol.TaskDispatchPayload{
+				TaskID:      capturedStanzaID.String(),
+				TaskType:    protocol.TaskPGBackRestStanzaCreate,
+				Params:      json.RawMessage(stanzaParams),
+				TimeoutSecs: 120,
+			}); dispErr != nil {
+				return
+			}
+			_ = h.taskResults.SetSent(bgCtx, capturedStanzaID)
+
+			if ok := pollTaskSuccess(bgCtx, h.taskResults, capturedStanzaID, 5*time.Minute); !ok {
+				return
+			}
+
+			_ = h.schedules.SetStanzaInitialized(bgCtx, clusterID, stanzaName)
+		}()
+	}
+
 	return c.JSON(http.StatusAccepted, map[string]any{
-		"cluster_id":   clusterID.String(),
-		"config_tasks": confTasks,
-		"stanza_task":  stanzaTask,
+		"cluster_id":  clusterID.String(),
+		"pgbackrest":  pgbTasks,
+		"patroni":     patroniTasks,
+		"stanza_task": stanzaTask,
 	})
 }
 
@@ -702,65 +864,14 @@ func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "no connected node available to run the test")
 	}
 
-	// Use positional $1 to safely pass the path without shell injection risk.
-	params, _ := json.Marshal(protocol.RunCommandParams{
-		Command: "/bin/sh",
-		Args:    []string{"-c", `touch "$1"/.conductor_test && rm -f "$1"/.conductor_test && echo ok`, "--", req.Path},
-	})
+	params, _ := json.Marshal(protocol.PGBackRestTestPathParams{Path: req.Path})
 	taskID := uuid.New()
-	_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskRunCommand), params)
+	_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskPGBackRestTestPath), params)
 	if dispErr := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
 		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskRunCommand,
+		TaskType:    protocol.TaskPGBackRestTestPath,
 		Params:      json.RawMessage(params),
 		TimeoutSecs: 15,
-	}); dispErr != nil {
-		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+dispErr.Error())
-	}
-	_ = h.taskResults.SetSent(ctx, taskID)
-
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"task_id":  taskID.String(),
-		"node_id":  node.ID.String(),
-		"hostname": node.Hostname,
-	})
-}
-
-// ProvisionBackupPath creates the local backup directory on the primary node.
-// POST /api/v1/clusters/:id/backup-path/provision
-func (h *BackupHandler) ProvisionBackupPath(c echo.Context) error {
-	clusterID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
-	}
-	var req struct {
-		Path string `json:"path"`
-	}
-	if err := c.Bind(&req); err != nil || req.Path == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "path is required")
-	}
-	ctx := c.Request().Context()
-
-	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
-	}
-	node := primaryDBNode(nodes)
-	if node == nil {
-		return echo.NewHTTPError(http.StatusConflict, "no connected node available to provision the directory")
-	}
-
-	params, _ := json.Marshal(protocol.RunCommandParams{
-		Command: "/bin/sh",
-		Args:    []string{"-c", `mkdir -p "$1" && chown postgres:postgres "$1" && chmod 750 "$1"`, "--", req.Path},
-	})
-	taskID := uuid.New()
-	_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskRunCommand), params)
-	if dispErr := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskRunCommand,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 30,
 	}); dispErr != nil {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+dispErr.Error())
 	}
@@ -845,13 +956,17 @@ func renderPGBackRestConf(stanza string, targets []queries.BackupTarget, enc *cr
 
 	repos := make([]configgen.PGBackRestRepo, 0, len(targets))
 	for _, t := range targets {
+		days := t.RecoveryDays
+		if days == 0 {
+			days = 14
+		}
 		repo := configgen.PGBackRestRepo{
 			Index:            t.RepoIndex,
 			RepoType:         t.TargetType,
 			Label:            t.Label,
-			FullRetention:    t.FullRetention,
-			DiffRetention:    t.DiffRetention,
-			WALRetentionDays: t.WalRetentionDays,
+			FullRetention:    int(math.Ceil(float64(days)/7)) + 1,
+			DiffRetention:    days,
+			WALRetentionDays: days + 7,
 		}
 
 		switch t.TargetType {
@@ -914,23 +1029,16 @@ func (h *BackupHandler) bindCreateTarget(ctx context.Context, c echo.Context, cl
 	if err := c.Bind(&req); err != nil || req.Label == "" || req.TargetType == "" {
 		return nil, echo.NewHTTPError(http.StatusBadRequest, "label and target_type are required")
 	}
+	recoveryDays := req.RecoveryDays
+	if recoveryDays == 0 {
+		recoveryDays = 14
+	}
 	p := &queries.CreateBackupTargetParams{
-		ClusterID:        clusterID,
-		Label:            req.Label,
-		TargetType:       req.TargetType,
-		FullRetention:    req.FullRetention,
-		DiffRetention:    req.DiffRetention,
-		WalRetentionDays: req.WalRetentionDays,
-		SyncToNodes:      req.SyncToNodes,
-	}
-	if p.FullRetention == 0 {
-		p.FullRetention = 2
-	}
-	if p.DiffRetention == 0 {
-		p.DiffRetention = 7
-	}
-	if p.WalRetentionDays == 0 {
-		p.WalRetentionDays = 14
+		ClusterID:    clusterID,
+		Label:        req.Label,
+		TargetType:   req.TargetType,
+		RecoveryDays: recoveryDays,
+		SyncToNodes:  req.SyncToNodes,
 	}
 
 	if err := encryptTargetCredentials(req, p, h.enc); err != nil {
@@ -949,13 +1057,15 @@ func (h *BackupHandler) bindUpdateTarget(ctx context.Context, c echo.Context, ex
 		req.Label = existing.Label
 	}
 
+	recoveryDays := req.RecoveryDays
+	if recoveryDays == 0 {
+		recoveryDays = existing.RecoveryDays
+	}
 	p := &queries.UpdateBackupTargetParams{
-		ID:               existing.ID,
-		Label:            req.Label,
-		FullRetention:    req.FullRetention,
-		DiffRetention:    req.DiffRetention,
-		WalRetentionDays: req.WalRetentionDays,
-		SyncToNodes:      req.SyncToNodes,
+		ID:           existing.ID,
+		Label:        req.Label,
+		RecoveryDays: recoveryDays,
+		SyncToNodes:  req.SyncToNodes,
 
 		// Start with existing encrypted values — only overwrite if new plaintext provided.
 		PosixPath:      existing.PosixPath,
@@ -1039,9 +1149,7 @@ type backupTargetRequest struct {
 	TargetType string      `json:"target_type"`
 	SyncToNodes []uuid.UUID `json:"sync_to_nodes"`
 
-	FullRetention    int `json:"full_retention"`
-	DiffRetention    int `json:"diff_retention"`
-	WalRetentionDays int `json:"wal_retention_days"`
+	RecoveryDays int `json:"recovery_days"`
 
 	// posix
 	PosixPath string `json:"posix_path"`
@@ -1137,9 +1245,7 @@ func serializeTarget(t *queries.BackupTarget) map[string]any {
 		"repo_index":         t.RepoIndex,
 		"label":              t.Label,
 		"target_type":        t.TargetType,
-		"full_retention":     t.FullRetention,
-		"diff_retention":     t.DiffRetention,
-		"wal_retention_days": t.WalRetentionDays,
+		"recovery_days": t.RecoveryDays,
 		"sync_to_nodes":      uuidsToStrings(t.SyncToNodes),
 		"created_at":         t.CreatedAt.UTC().Format(time.RFC3339),
 		"updated_at":         t.UpdatedAt.UTC().Format(time.RFC3339),
@@ -1204,10 +1310,9 @@ func serializeCatalog(c *queries.BackupCatalogCache) any {
 		return nil
 	}
 	m := map[string]any{
-		"id":           c.ID.String(),
-		"cluster_id":   c.ClusterID.String(),
-		"fetched_at":   c.FetchedAt.UTC().Format(time.RFC3339),
-		"catalog_json": json.RawMessage(c.CatalogJSON),
+		"id":         c.ID.String(),
+		"cluster_id": c.ClusterID.String(),
+		"fetched_at": c.FetchedAt.UTC().Format(time.RFC3339),
 	}
 	if c.OldestRestorePoint != nil {
 		m["oldest_restore_point"] = c.OldestRestorePoint.UTC().Format(time.RFC3339)
@@ -1215,6 +1320,23 @@ func serializeCatalog(c *queries.BackupCatalogCache) any {
 	if c.NewestRestorePoint != nil {
 		m["newest_restore_point"] = c.NewestRestorePoint.UTC().Format(time.RFC3339)
 	}
+	_, _, backups := parsePGBackRestInfo(string(c.CatalogJSON))
+	type backupEntry struct {
+		Type       string `json:"type"`
+		Label      string `json:"label"`
+		StartedAt  string `json:"started_at"`
+		FinishedAt string `json:"finished_at"`
+	}
+	out := make([]backupEntry, 0, len(backups))
+	for _, b := range backups {
+		out = append(out, backupEntry{
+			Type:       b.Type,
+			Label:      b.Label,
+			StartedAt:  time.Unix(b.Timestamp.Start, 0).UTC().Format(time.RFC3339),
+			FinishedAt: time.Unix(b.Timestamp.Stop, 0).UTC().Format(time.RFC3339),
+		})
+	}
+	m["backups"] = out
 	return m
 }
 
@@ -1247,6 +1369,30 @@ func serializeRuns(runs []queries.BackupRun) []map[string]any {
 		out = append(out, m)
 	}
 	return out
+}
+
+// pollTaskSuccess polls the DB every 3 seconds until the task reaches a terminal
+// state (success/failure/timeout), returning true only on success. This avoids
+// the WaitForTask race condition where the task completes before the waiter registers.
+func pollTaskSuccess(ctx context.Context, q *queries.TaskResultQuerier, taskID uuid.UUID, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		t, err := q.GetByTaskID(ctx, taskID)
+		if err == nil {
+			switch t.Status {
+			case "success":
+				return true
+			case "failure", "timeout":
+				return false
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(3 * time.Second):
+		}
+	}
+	return false
 }
 
 func strVal(s *string) string {

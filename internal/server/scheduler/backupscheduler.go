@@ -19,18 +19,27 @@ import (
 const (
 	backupScheduleInterval = time.Minute
 	backupRetryDelay       = 5 * time.Minute
-	backupMaxAttempts      = 3
+	backupMaxAttempts      = 10
+	defaultBackupRepoPath  = "/var/lib/pgbackrest"
 )
 
 // BackupScheduler fires pgBackRest backup tasks on schedule and handles retries.
 type BackupScheduler struct {
-	nodes     *queries.NodeQuerier
-	schedules *queries.BackupScheduleQuerier
-	runs      *queries.BackupRunQuerier
-	tasks     *queries.TaskResultQuerier
-	catalog   *queries.BackupCatalogQuerier
+	nodes      *queries.NodeQuerier
+	schedules  *queries.BackupScheduleQuerier
+	runs       *queries.BackupRunQuerier
+	tasks      *queries.TaskResultQuerier
+	catalog    *queries.BackupCatalogQuerier
+	targets    *queries.BackupTargetQuerier
 	dispatcher *hub.Dispatcher
+	backupSync BackupSyncRegistrar
 	emitter    events.Emitter
+}
+
+// BackupSyncRegistrar is implemented by backupsync.Manager. Using an interface
+// avoids an import cycle between the scheduler and backupsync packages.
+type BackupSyncRegistrar interface {
+	Register(transferID uuid.UUID, targets []uuid.UUID)
 }
 
 func NewBackupScheduler(
@@ -39,7 +48,9 @@ func NewBackupScheduler(
 	runs *queries.BackupRunQuerier,
 	tasks *queries.TaskResultQuerier,
 	catalog *queries.BackupCatalogQuerier,
+	targets *queries.BackupTargetQuerier,
 	dispatcher *hub.Dispatcher,
+	backupSync BackupSyncRegistrar,
 ) *BackupScheduler {
 	return &BackupScheduler{
 		nodes:      nodes,
@@ -47,7 +58,9 @@ func NewBackupScheduler(
 		runs:       runs,
 		tasks:      tasks,
 		catalog:    catalog,
+		targets:    targets,
 		dispatcher: dispatcher,
+		backupSync: backupSync,
 	}
 }
 
@@ -72,6 +85,9 @@ func (s *BackupScheduler) Run(ctx context.Context) {
 
 func (s *BackupScheduler) tick(ctx context.Context) {
 	now := time.Now().UTC()
+
+	// Sync completed task results back to backup_runs before processing retries.
+	s.syncCompletedRuns(ctx, now)
 
 	// Process retries first.
 	retries, err := s.runs.PendingRetries(ctx)
@@ -165,7 +181,6 @@ func (s *BackupScheduler) dispatchRetry(ctx context.Context, r queries.BackupRun
 		return
 	}
 
-	// Look up stanza name.
 	sched, err := s.schedules.Get(ctx, r.ClusterID)
 	if err != nil || sched.StanzaName == nil {
 		return
@@ -178,18 +193,14 @@ func (s *BackupScheduler) dispatchRetry(ctx context.Context, r queries.BackupRun
 		return
 	}
 
-	newRun, err := s.runs.Create(ctx, r.ClusterID, r.BackupType, r.ScheduledAt, r.Attempt+1)
-	if err != nil {
-		return
-	}
-
 	taskID, dispErr := s.dispatchBackup(ctx, primary, *sched.StanzaName, r.BackupType)
 	if dispErr != nil {
 		t := now.Add(backupRetryDelay)
-		_ = s.runs.SetFailed(ctx, newRun.ID, dispErr.Error(), &t)
+		_ = s.runs.SetFailed(ctx, r.ID, dispErr.Error(), &t)
 		return
 	}
-	_ = s.runs.SetDispatched(ctx, newRun.ID, taskID)
+	// Update the existing row in-place — no new row per retry.
+	_ = s.runs.SetRetrying(ctx, r.ID, taskID, r.Attempt+1)
 
 	slog.Info("backupscheduler: retry dispatched",
 		"cluster", r.ClusterID, "type", r.BackupType, "attempt", r.Attempt+1, "task_id", taskID)
@@ -239,6 +250,144 @@ func (s *BackupScheduler) findPrimaryNode(ctx context.Context, clusterID uuid.UU
 		}
 	}
 	return best
+}
+
+func (s *BackupScheduler) syncCompletedRuns(ctx context.Context, now time.Time) {
+	completed, err := s.runs.ListRunningWithCompletedTask(ctx)
+	if err != nil {
+		slog.Warn("backupscheduler: failed to query completed runs", "error", err)
+		return
+	}
+	for _, r := range completed {
+		if r.TaskStatus == "success" {
+			_ = s.runs.SetSuccess(ctx, r.RunID)
+			slog.Info("backupscheduler: backup run succeeded", "run", r.RunID)
+			// Auto-refresh catalog and trigger posix sync in the background.
+			go s.postBackupSuccess(r.ClusterID)
+			continue
+		}
+		// failure or timeout — extract the most useful error message
+		var p struct {
+			Output string `json:"output"`
+			Error  string `json:"error"`
+		}
+		errMsg := "task failed"
+		if len(r.ResponsePayload) > 0 {
+			if json.Unmarshal(r.ResponsePayload, &p) == nil {
+				if p.Output != "" {
+					errMsg = p.Output
+				} else if p.Error != "" {
+					errMsg = p.Error
+				}
+			}
+		}
+		if r.TaskStatus == "timeout" {
+			errMsg = "task timed out: " + errMsg
+		}
+		retryAfter := now.Add(backupRetryDelay)
+		_ = s.runs.SetFailed(ctx, r.RunID, errMsg, &retryAfter)
+		slog.Warn("backupscheduler: backup run failed", "run", r.RunID, "task_status", r.TaskStatus, "error", errMsg)
+	}
+}
+
+// postBackupSuccess runs after a successful backup: refreshes the catalog cache
+// and initiates posix repo sync to any configured secondary nodes.
+func (s *BackupScheduler) postBackupSuccess(clusterID uuid.UUID) {
+	ctx := context.Background()
+
+	sched, err := s.schedules.Get(ctx, clusterID)
+	if err != nil || sched.StanzaName == nil {
+		return
+	}
+
+	primary := s.findPrimaryNode(ctx, clusterID)
+	if primary == nil {
+		return
+	}
+
+	// Dispatch catalog refresh so the UI reflects the new backup.
+	catParams, _ := json.Marshal(protocol.PGBackRestCatalogParams{Stanza: *sched.StanzaName})
+	catTaskID := uuid.New()
+	_ = s.tasks.Create(ctx, primary.ID, catTaskID, string(protocol.TaskPGBackRestCatalog), catParams)
+	if err := s.dispatcher.Dispatch(primary.ID, protocol.TaskDispatchPayload{
+		TaskID:      catTaskID.String(),
+		TaskType:    protocol.TaskPGBackRestCatalog,
+		Params:      json.RawMessage(catParams),
+		TimeoutSecs: 60,
+	}); err == nil {
+		_ = s.tasks.SetSent(ctx, catTaskID)
+	}
+
+	// For each posix target with sync nodes, dispatch a backup repo sync.
+	if s.targets == nil || s.backupSync == nil {
+		return
+	}
+	targetList, err := s.targets.ListByCluster(ctx, clusterID)
+	if err != nil {
+		return
+	}
+	for _, t := range targetList {
+		if t.TargetType != "posix" || len(t.SyncToNodes) == 0 {
+			continue
+		}
+		s.dispatchBackupSync(ctx, primary, t.SyncToNodes, t.PosixPath)
+	}
+}
+
+// dispatchBackupSync sends backup.sync.write to each target node, registers the
+// transfer in the relay manager, then sends backup.sync.read to the source node.
+func (s *BackupScheduler) dispatchBackupSync(ctx context.Context, primary *queries.Node, targetNodeIDs []uuid.UUID, posixPath *string) {
+	repoPath := defaultBackupRepoPath
+	if posixPath != nil && *posixPath != "" {
+		repoPath = *posixPath
+	}
+
+	transferID := uuid.New()
+
+	// Prime target nodes first so they're listening before chunks arrive.
+	targetStrs := make([]string, 0, len(targetNodeIDs))
+	for _, nid := range targetNodeIDs {
+		writeParams, _ := json.Marshal(protocol.BackupSyncWriteParams{
+			RepoPath:   repoPath,
+			TransferID: transferID.String(),
+		})
+		writeTaskID := uuid.New()
+		_ = s.tasks.Create(ctx, nid, writeTaskID, string(protocol.TaskBackupSyncWrite), writeParams)
+		if err := s.dispatcher.Dispatch(nid, protocol.TaskDispatchPayload{
+			TaskID:      writeTaskID.String(),
+			TaskType:    protocol.TaskBackupSyncWrite,
+			Params:      json.RawMessage(writeParams),
+			TimeoutSecs: 3600,
+		}); err == nil {
+			_ = s.tasks.SetSent(ctx, writeTaskID)
+			targetStrs = append(targetStrs, nid.String())
+		}
+	}
+	if len(targetStrs) == 0 {
+		return
+	}
+
+	// Register transfer in relay manager before source starts sending chunks.
+	s.backupSync.Register(transferID, targetNodeIDs)
+
+	readParams, _ := json.Marshal(protocol.BackupSyncReadParams{
+		RepoPath:    repoPath,
+		TransferID:  transferID.String(),
+		TargetNodes: targetStrs,
+	})
+	readTaskID := uuid.New()
+	_ = s.tasks.Create(ctx, primary.ID, readTaskID, string(protocol.TaskBackupSyncRead), readParams)
+	if err := s.dispatcher.Dispatch(primary.ID, protocol.TaskDispatchPayload{
+		TaskID:      readTaskID.String(),
+		TaskType:    protocol.TaskBackupSyncRead,
+		Params:      json.RawMessage(readParams),
+		TimeoutSecs: 3600,
+	}); err == nil {
+		_ = s.tasks.SetSent(ctx, readTaskID)
+	}
+
+	slog.Info("backupscheduler: backup sync dispatched",
+		"cluster", primary.ClusterID, "transfer_id", transferID, "targets", len(targetNodeIDs))
 }
 
 // ─────────────────────────────────────────────────────────────

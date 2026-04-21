@@ -27,6 +27,13 @@ import (
 
 const serverVersion = "0.1.0"
 
+// BackupChunkRouter fan-outs backup.chunk messages to registered target nodes.
+// Implemented by backupsync.Manager; interface avoids import cycle.
+type BackupChunkRouter interface {
+	GetTargets(transferID uuid.UUID) ([]uuid.UUID, bool)
+	Remove(transferID uuid.UUID)
+}
+
 // AgentHandler handles agent WebSocket connections and registration.
 type AgentHandler struct {
 	hub           *hub.Hub
@@ -39,8 +46,10 @@ type AgentHandler struct {
 	stagingToks   *queries.StagingTokenQuerier
 	stagingAgents *queries.StagingAgentQuerier
 	taskResults   *queries.TaskResultQuerier
+	catalog       *queries.BackupCatalogQuerier
 	enc           *crypto.Encryptor
 	media         *media.Manager
+	backupSync    BackupChunkRouter
 	failover      *failover.Manager
 	emitter       events.Emitter
 	hbQ           *queries.HeartbeatQuerier
@@ -82,6 +91,12 @@ func NewAgentHandler(
 		logName:       logName,
 	}
 }
+
+// SetCatalogQuerier wires the backup catalog querier for catalog task processing.
+func (h *AgentHandler) SetCatalogQuerier(q *queries.BackupCatalogQuerier) { h.catalog = q }
+
+// SetBackupSyncRouter wires the backup sync relay manager.
+func (h *AgentHandler) SetBackupSyncRouter(r BackupChunkRouter) { h.backupSync = r }
 
 // SetEmitter wires up the event emitter (called from main after construction).
 func (h *AgentHandler) SetEmitter(e events.Emitter) { h.emitter = e }
@@ -376,13 +391,24 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 		slog.Info("dispatching pending tasks on reconnect", "node", nodeID, "count", len(pending))
 		for i := range pending {
 			t := &pending[i]
-			if len(t.RequestPayload) == 0 {
+			if len(t.RequestPayload) == 0 || t.TaskType == "" {
+				continue
+			}
+			// Reconstruct the full TaskDispatchPayload wrapper. request_payload stores
+			// only the inner params; the agent expects the complete dispatch shape.
+			wrapped, err := json.Marshal(protocol.TaskDispatchPayload{
+				TaskID:      t.TaskID.String(),
+				TaskType:    protocol.TaskType(t.TaskType),
+				Params:      t.RequestPayload,
+				TimeoutSecs: 60,
+			})
+			if err != nil {
 				continue
 			}
 			sess.Send(protocol.Envelope{
 				ID:      t.TaskID.String(),
 				Type:    protocol.TypeTaskDispatch,
-				Payload: t.RequestPayload,
+				Payload: json.RawMessage(wrapped),
 			})
 			// Advance queued → sent; "sent" tasks are already in the correct state.
 			if t.Status == "queued" {
@@ -536,6 +562,8 @@ func (h *AgentHandler) handleInbound(ctx context.Context, sess *hub.Session, env
 		h.handleMediaChunk(ctx, sess, env, logger)
 	case protocol.TypeMediaChunkAck:
 		h.handleMediaChunkAck(ctx, sess, env, logger)
+	case protocol.TypeBackupChunk:
+		h.handleBackupChunk(sess, env, logger)
 	case protocol.TypeNetboxLog:
 		h.handleNetboxLog(ctx, sess, env, logger)
 	default:
@@ -841,6 +869,14 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 		})
 		_ = h.taskResults.Complete(ctx, taskID, result.Success, responseJSON)
 		h.hub.NotifyTaskResult(taskID, result)
+
+		if result.Success && h.catalog != nil {
+			if rec, err := h.taskResults.GetByTaskID(ctx, taskID); err == nil &&
+				rec.TaskType == string(protocol.TaskPGBackRestCatalog) {
+				oldest, newest, _ := parsePGBackRestInfo(result.Output)
+				_, _ = h.catalog.Upsert(ctx, sess.ClusterID, []byte(result.Output), oldest, newest)
+			}
+		}
 	}
 
 	h.broker.Publish(sse.Event{
@@ -919,6 +955,35 @@ func (h *AgentHandler) handleMediaChunkAck(_ context.Context, sess *hub.Session,
 		return
 	}
 	logger.Debug("media chunk ack", "transfer_id", ack.TransferID, "chunk", ack.ChunkIndex)
+}
+
+// handleBackupChunk fans out a backup repo chunk to all registered target nodes.
+func (h *AgentHandler) handleBackupChunk(_ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+	var chunk protocol.BackupChunkPayload
+	if err := json.Unmarshal(env.Payload, &chunk); err != nil {
+		return
+	}
+	tid, err := uuid.Parse(chunk.TransferID)
+	if err != nil {
+		return
+	}
+	if h.backupSync == nil {
+		return
+	}
+	targets, ok := h.backupSync.GetTargets(tid)
+	if !ok {
+		logger.Warn("backup.chunk: unknown transfer", "transfer_id", chunk.TransferID)
+		return
+	}
+	for _, nodeID := range targets {
+		if s := h.hub.Get(nodeID); s != nil {
+			s.Send(env)
+		}
+	}
+	if chunk.EOF && chunk.RelativePath == "" {
+		h.backupSync.Remove(tid)
+		logger.Info("backup sync transfer complete", "transfer_id", chunk.TransferID)
+	}
 }
 
 // StartMediaSync initiates a media sync from sourceNode → targetNode.

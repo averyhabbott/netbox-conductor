@@ -1,4 +1,5 @@
 import client from './client'
+import type { Event } from './events'
 
 export interface Cluster {
   id: string
@@ -114,9 +115,7 @@ export interface BackupTarget {
   repo_index: number
   label: string
   target_type: BackupTargetType
-  full_retention: number
-  diff_retention: number
-  wal_retention_days: number
+  recovery_days: number
   sync_to_nodes: string[]
   created_at: string
   updated_at: string
@@ -156,10 +155,25 @@ export interface BackupSchedule {
   updated_at: string
 }
 
+export interface BackupCatalogEntry {
+  type: 'full' | 'diff' | 'incr'
+  label: string
+  started_at: string
+  finished_at: string
+}
+
 export interface BackupConfig {
   cluster_id: string
   targets: BackupTarget[]
   schedule: BackupSchedule | null
+  cached_catalog?: {
+    id: string
+    cluster_id: string
+    fetched_at: string
+    oldest_restore_point?: string
+    newest_restore_point?: string
+    backups: BackupCatalogEntry[]
+  }
 }
 
 export interface BackupRun {
@@ -196,9 +210,7 @@ export interface BackupTaskRef {
 export interface CreateBackupTargetBody {
   label: string
   target_type: BackupTargetType
-  full_retention?: number
-  diff_retention?: number
-  wal_retention_days?: number
+  recovery_days?: number
   sync_to_nodes?: string[]
   // posix
   posix_path?: string
@@ -263,7 +275,7 @@ export const clustersApi = {
     client.post<ConfigureFailoverResult>(`/clusters/${id}/configure-failover`, body).then((r) => r.data),
 
   failoverEvents: (id: string) =>
-    client.get<FailoverEvent[]>(`/clusters/${id}/failover-events`).then((r) => r.data),
+    client.get<Event[]>(`/clusters/${id}/failover-events`).then((r) => r.data),
 
   // ── Backup ─────────────────────────────────────────────────────────────────
 
@@ -336,11 +348,6 @@ export const clustersApi = {
   testBackupPath: (id: string, path: string) =>
     client
       .post<{ task_id: string; node_id: string; hostname: string }>(`/clusters/${id}/backup-path/test`, { path })
-      .then((r) => r.data),
-
-  provisionBackupPath: (id: string, path: string) =>
-    client
-      .post<{ task_id: string; node_id: string; hostname: string }>(`/clusters/${id}/backup-path/provision`, { path })
       .then((r) => r.data),
 
   getTask: (taskId: string) =>

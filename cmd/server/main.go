@@ -19,6 +19,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/alerting"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/handlers"
+	"github.com/averyhabbott/netbox-conductor/internal/server/backupsync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db"
 	dbmigrations "github.com/averyhabbott/netbox-conductor/internal/server/db/migrations"
@@ -164,6 +165,12 @@ func run(ctx context.Context) error {
 	syslogDestQ := queries.NewSyslogDestinationQuerier(store.Pool())
 	eventRetentionQ := queries.NewEventRetentionQuerier(store.Pool())
 
+	// Reset node agent_status to 'unknown' — state is re-determined as agents reconnect.
+	if err := nodeQ.MarkAllUnknown(ctx); err != nil {
+		return fmt.Errorf("resetting node status: %w", err)
+	}
+	log.Println("node statuses reset to unknown")
+
 	// Seed default admin
 	if err := seedAdminIfEmpty(ctx, userQ); err != nil {
 		return fmt.Errorf("seeding admin: %w", err)
@@ -219,9 +226,12 @@ func run(ctx context.Context) error {
 	eventsHandler := handlers.NewEventsHandler(eventQ, hbQ)
 	syslogHandler := handlers.NewSyslogHandler(syslogDestQ)
 	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, tlsKeyFile, serverURL, enc)
+	backupSyncMgr := backupsync.New()
 	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, failoverManager, logDir, logName)
 	agentHandler.SetEmitter(emitter)
 	agentHandler.SetHeartbeatQuerier(hbQ)
+	agentHandler.SetCatalogQuerier(backupCatalogQ)
+	agentHandler.SetBackupSyncRouter(backupSyncMgr)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
 	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, witnessManager)
 	clusterHandler.SetEmitter(emitter)
@@ -235,9 +245,9 @@ func run(ctx context.Context) error {
 	configHandler.SetEmitter(emitter)
 	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, enc, dispatcher, witnessManager)
 	patroniHandler.SetEmitter(emitter)
-	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, enc, dispatcher)
+	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, enc, dispatcher, h, credQ, witnessManager)
 	backupHandler.SetEmitter(emitter)
-	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, dispatcher)
+	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, backupTargetQ, dispatcher, backupSyncMgr)
 	backupScheduler.SetEmitter(emitter)
 	go backupScheduler.Run(ctx)
 	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)

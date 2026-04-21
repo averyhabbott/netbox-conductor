@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
-import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, FailoverEvent, BackupTarget, BackupTargetType, CreateBackupTargetBody } from '../api/clusters'
+import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, BackupTarget, BackupTargetType, CreateBackupTargetBody } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import type { Node, EditNodeBody } from '../api/nodes'
 import { credentialsApi, credentialLabels, secretOnlyKinds } from '../api/credentials'
@@ -13,6 +13,7 @@ import { patroniApi } from '../api/patroni'
 import type { PushResult } from '../api/patroni'
 import { alertsApi } from '../api/alerts'
 import { eventsApi } from '../api/events'
+import type { Event } from '../api/events'
 import EventsTable from '../components/EventsTable'
 import client from '../api/client'
 import Layout from '../components/Layout'
@@ -165,6 +166,7 @@ function EditNodeModal({
           <div>
             <label className={labelCls}>Hostname</label>
             <input
+              autoFocus
               className={inputCls}
               value={form.hostname ?? ''}
               onChange={(e) => setForm((f) => ({ ...f, hostname: e.target.value }))}
@@ -952,121 +954,6 @@ function GeneratedCredsModal({
 
 // ── Retention policy card ────────────────────────────────────────────────────
 
-function RetentionCard({ clusterId }: { clusterId: string }) {
-  const qc = useQueryClient()
-  const [days, setDays] = useState<number | ''>('')
-  const [expireCmd, setExpireCmd] = useState('')
-  const [editing, setEditing] = useState(false)
-  const [msg, setMsg] = useState<string | null>(null)
-
-  const { data: policy } = useQuery({
-    queryKey: ['retention-policy', clusterId],
-    queryFn: () => patroniApi.getRetentionPolicy(clusterId),
-  })
-
-  const save = useMutation({
-    mutationFn: () => patroniApi.setRetentionPolicy(clusterId, Number(days), expireCmd),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['retention-policy', clusterId] })
-      setEditing(false)
-      setMsg(null)
-    },
-    onError: (e: any) => setMsg(e?.response?.data?.message ?? 'Failed to save'),
-  })
-
-  const enforce = useMutation({
-    mutationFn: () => patroniApi.enforceRetention(clusterId),
-    onSuccess: (d) => setMsg(`Enforcement dispatched to ${d.hostname}`),
-    onError: (e: any) => setMsg(e?.response?.data?.message ?? 'Failed to enforce'),
-  })
-
-  return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-      <h3 className="font-medium mb-1">Backup Retention</h3>
-      <p className="text-xs text-gray-500 mb-3">
-        Configure pgBackRest retention and trigger expiry on the primary DB node.
-      </p>
-
-      {!editing ? (
-        <div className="space-y-2">
-          <div className="flex items-center justify-between text-sm">
-            <span className="text-gray-400">Retention</span>
-            <span className="font-mono text-gray-200">
-              {policy?.retention_days ?? '—'} days
-            </span>
-          </div>
-          {policy?.expire_cmd && (
-            <div className="text-xs text-gray-500 font-mono break-all">{policy.expire_cmd}</div>
-          )}
-          <button
-            onClick={() => {
-              setDays(policy?.retention_days ?? 7)
-              setExpireCmd(policy?.expire_cmd ?? '')
-              setEditing(true)
-            }}
-            className="text-xs text-blue-400 hover:text-blue-300"
-          >
-            Edit
-          </button>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Retention days</label>
-            <input
-              type="number"
-              min={1}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"
-              value={days}
-              onChange={(e) => setDays(e.target.value === '' ? '' : Number(e.target.value))}
-            />
-          </div>
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">
-              Custom expire cmd <span className="text-gray-600">(optional)</span>
-            </label>
-            <input
-              type="text"
-              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm font-mono"
-              placeholder="pgbackrest --stanza=main expire"
-              value={expireCmd}
-              onChange={(e) => setExpireCmd(e.target.value)}
-            />
-          </div>
-          {msg && <p className="text-xs text-red-400">{msg}</p>}
-          <div className="flex gap-2">
-            <button
-              onClick={() => save.mutate()}
-              disabled={save.isPending || days === '' || Number(days) < 1}
-              className="text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-3 py-1 rounded"
-            >
-              {save.isPending ? 'Saving…' : 'Save'}
-            </button>
-            <button
-              onClick={() => { setEditing(false); setMsg(null) }}
-              className="text-xs text-gray-400 hover:text-gray-300"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {msg && !editing && (
-        <p className="text-xs text-emerald-400 mt-2">{msg}</p>
-      )}
-
-      <button
-        onClick={() => { setMsg(null); enforce.mutate() }}
-        disabled={enforce.isPending}
-        className="w-full mt-3 text-sm py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 rounded-lg transition-colors"
-      >
-        {enforce.isPending ? 'Running…' : 'Run expire now'}
-      </button>
-    </div>
-  )
-}
-
 // ── Shared push-result list ───────────────────────────────────────────────────
 
 function PushResultList({ results }: { results: PushResult[] }) {
@@ -1762,7 +1649,7 @@ function FileSyncCard({ cluster }: { cluster: Cluster }) {
 
 // ── Failover history tab ──────────────────────────────────────────────────────
 
-function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
+function FailoverHistoryTab({ events }: { events: Event[] }) {
   if (events.length === 0) {
     return (
       <div className="text-center py-16 text-gray-500 text-sm">
@@ -1772,16 +1659,20 @@ function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
     )
   }
 
-  const eventLabel: Record<string, string> = {
-    failover: 'Failover',
-    failback: 'Failback',
-    maintenance_failover: 'Maintenance',
+  const codeLabel: Record<string, string> = {
+    'NBC-HA-001': 'Failover',
+    'NBC-HA-002': 'Failover Complete',
+    'NBC-HA-003': 'Failover Failed',
+    'NBC-HA-004': 'Failback',
+    'NBC-HA-005': 'Failback Complete',
+    'NBC-HA-006': 'Role Changed',
+    'NBC-HA-007': 'Maint. Failover',
   }
-  const triggerLabel: Record<string, string> = {
-    disconnect: 'Agent disconnected',
-    heartbeat: 'NetBox stopped',
-    maintenance: 'Maintenance mode',
-    reconnect: 'Node reconnected',
+  const sevColor: Record<string, string> = {
+    info:     'text-blue-400',
+    warn:     'text-amber-400',
+    error:    'text-red-400',
+    critical: 'text-red-300 font-semibold',
   }
 
   return (
@@ -1791,38 +1682,26 @@ function FailoverHistoryTab({ events }: { events: FailoverEvent[] }) {
           <tr className="border-b border-gray-800 text-gray-400">
             <th className="text-left px-6 py-3 font-medium">Time</th>
             <th className="text-left px-6 py-3 font-medium">Type</th>
-            <th className="text-left px-6 py-3 font-medium">Trigger</th>
-            <th className="text-left px-6 py-3 font-medium">From</th>
-            <th className="text-left px-6 py-3 font-medium">To</th>
-            <th className="text-left px-6 py-3 font-medium">Result</th>
+            <th className="text-left px-6 py-3 font-medium">Node</th>
+            <th className="text-left px-6 py-3 font-medium">Details</th>
           </tr>
         </thead>
         <tbody>
           {events.map((ev) => (
             <tr key={ev.id} className="border-b border-gray-800 last:border-0 hover:bg-gray-800/30">
-              <td className="px-6 py-3 text-gray-400 whitespace-nowrap">
+              <td className="px-6 py-3 text-gray-400 whitespace-nowrap text-xs font-mono">
                 {new Date(ev.occurred_at).toLocaleString()}
               </td>
-              <td className="px-6 py-3 font-medium">
-                {eventLabel[ev.event_type] ?? ev.event_type}
-              </td>
-              <td className="px-6 py-3 text-gray-400">
-                {triggerLabel[ev.trigger] ?? ev.trigger}
-              </td>
-              <td className="px-6 py-3 text-gray-300">
-                {ev.failed_node_name || '—'}
-              </td>
-              <td className="px-6 py-3 text-gray-300">
-                {ev.target_node_name || '—'}
-              </td>
               <td className="px-6 py-3">
-                {ev.success ? (
-                  <span className="text-emerald-400 font-medium">Success</span>
-                ) : (
-                  <span className="text-red-400 font-medium" title={ev.reason ?? ''}>
-                    Failed{ev.reason ? ` — ${ev.reason}` : ''}
-                  </span>
-                )}
+                <span className={`font-medium ${sevColor[ev.severity] ?? 'text-gray-300'}`}>
+                  {codeLabel[ev.code] ?? ev.code}
+                </span>
+              </td>
+              <td className="px-6 py-3 text-gray-300 text-xs">
+                {ev.node_name ?? '—'}
+              </td>
+              <td className="px-6 py-3 text-gray-400 text-xs">
+                {ev.message}
               </td>
             </tr>
           ))}
@@ -1890,7 +1769,7 @@ function ClusterEventsTab({ clusterId }: { clusterId: string }) {
         <button onClick={() => refetch()} className="text-xs text-gray-500 hover:text-gray-300">Refresh</button>
       </div>
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-        <EventsTable events={events} loading={isLoading} />
+        <EventsTable events={events} loading={isLoading} showNode />
       </div>
     </div>
   )
@@ -1903,11 +1782,13 @@ function NodeLogView({
   nodeId,
   source,
   filter,
+  hideHeartbeats,
 }: {
   clusterId: string
   nodeId: string
   source: 'agent' | 'netbox'
   filter: string
+  hideHeartbeats: boolean
 }) {
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['node-logs', clusterId, nodeId, source],
@@ -1916,9 +1797,9 @@ function NodeLogView({
   })
 
   const lines = data?.lines ?? []
-  const filtered = filter
-    ? lines.filter((l) => l.toLowerCase().includes(filter.toLowerCase()))
-    : lines
+  const filtered = lines
+    .filter((l) => !hideHeartbeats || !l.includes('msg=heartbeat') && !l.includes('"heartbeat"'))
+    .filter((l) => !filter || l.toLowerCase().includes(filter.toLowerCase()))
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
@@ -1954,6 +1835,7 @@ function NodeLogsTab({ clusterId, nodes }: { clusterId: string; nodes: Node[] })
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(() => nodes.map((n) => n.id))
   const [source, setSource] = useState<'agent' | 'netbox'>('agent')
   const [filter, setFilter] = useState('')
+  const [hideHeartbeats, setHideHeartbeats] = useState(true)
   const [activeNodeId, setActiveNodeId] = useState(nodes[0]?.id ?? '')
 
   const selectedNodes = nodes.filter((n) => selectedNodeIds.includes(n.id))
@@ -2012,6 +1894,15 @@ function NodeLogsTab({ clusterId, nodes }: { clusterId: string; nodes: Node[] })
           onChange={(e) => setFilter(e.target.value)}
           className="flex-1 min-w-32 text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-gray-500"
         />
+        <label className="flex items-center gap-1.5 text-xs cursor-pointer text-gray-400 whitespace-nowrap">
+          <input
+            type="checkbox"
+            checked={hideHeartbeats}
+            onChange={(e) => setHideHeartbeats(e.target.checked)}
+            className="accent-blue-500"
+          />
+          Filter heartbeats
+        </label>
       </div>
 
       {selectedNodes.length === 0 ? (
@@ -2042,6 +1933,7 @@ function NodeLogsTab({ clusterId, nodes }: { clusterId: string; nodes: Node[] })
                   nodeId={n.id}
                   source={source}
                   filter={filter}
+                  hideHeartbeats={hideHeartbeats}
                 />
               )
           )}
@@ -2052,6 +1944,72 @@ function NodeLogsTab({ clusterId, nodes }: { clusterId: string; nodes: Node[] })
 }
 
 // ── Database events tab ───────────────────────────────────────────────────────
+
+function DatabaseEventRow({ row }: { row: import('../api/patroni').HistoryRow }) {
+  const [expanded, setExpanded] = useState(false)
+
+  const req = row.request_payload as Record<string, unknown> | undefined
+  const res = row.response_payload as Record<string, unknown> | undefined
+
+  const cmdLabel = row.task_type === 'exec.run' && req
+    ? [req.command as string, ...((req.args as string[]) ?? [])].join(' ')
+    : null
+
+  const hasDetail = !!(res?.output || res?.error)
+
+  return (
+    <div className="border-b border-gray-800 last:border-0">
+      <div
+        className={`flex items-center justify-between text-xs px-4 py-2 ${hasDetail ? 'cursor-pointer hover:bg-gray-800/40' : 'hover:bg-gray-800/40'}`}
+        onClick={() => hasDetail && setExpanded((v) => !v)}
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <span
+            className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+              row.status === 'success'
+                ? 'bg-emerald-400'
+                : row.status === 'failure' || row.status === 'timeout'
+                ? 'bg-red-400'
+                : 'bg-amber-400'
+            }`}
+          />
+          <span className="font-mono text-gray-400 flex-shrink-0">{row.task_type}</span>
+          {cmdLabel && (
+            <span className="font-mono text-gray-500 truncate" title={cmdLabel}>{cmdLabel}</span>
+          )}
+          <span className="text-gray-600 flex-shrink-0">{row.hostname}</span>
+        </div>
+        <div className="flex items-center gap-3 text-gray-500 flex-shrink-0">
+          {hasDetail && (
+            <span className="text-gray-600">{expanded ? '▲' : '▼'}</span>
+          )}
+          <span
+            className={
+              row.status === 'success'
+                ? 'text-emerald-400'
+                : row.status === 'failure'
+                ? 'text-red-400'
+                : ''
+            }
+          >
+            {row.status}
+          </span>
+          <span>{new Date(row.queued_at).toLocaleString()}</span>
+        </div>
+      </div>
+      {expanded && hasDetail && (
+        <div className="px-4 pb-3 font-mono text-xs text-gray-400 whitespace-pre-wrap bg-gray-950/60">
+          {res?.output ? (
+            <div className="text-gray-300">{String(res.output)}</div>
+          ) : null}
+          {res?.error ? (
+            <div className="text-red-400">{String(res.error)}</div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function DatabaseEventsTab({ clusterId }: { clusterId: string }) {
   const { data: history, isLoading } = useQuery({
@@ -2070,38 +2028,7 @@ function DatabaseEventsTab({ clusterId }: { clusterId: string }) {
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
           <div className="divide-y divide-gray-800">
             {history.history.map((row) => (
-              <div
-                key={row.task_id}
-                className="flex items-center justify-between text-xs px-4 py-2 hover:bg-gray-800/40"
-              >
-                <div className="flex items-center gap-3">
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                      row.status === 'success'
-                        ? 'bg-emerald-400'
-                        : row.status === 'failure' || row.status === 'timeout'
-                        ? 'bg-red-400'
-                        : 'bg-amber-400'
-                    }`}
-                  />
-                  <span className="font-mono text-gray-400">{row.task_type}</span>
-                  <span className="text-gray-600">{row.hostname}</span>
-                </div>
-                <div className="flex items-center gap-3 text-gray-500">
-                  <span
-                    className={
-                      row.status === 'success'
-                        ? 'text-emerald-400'
-                        : row.status === 'failure'
-                        ? 'text-red-400'
-                        : ''
-                    }
-                  >
-                    {row.status}
-                  </span>
-                  <span>{new Date(row.queued_at).toLocaleString()}</span>
-                </div>
-              </div>
+              <DatabaseEventRow key={row.task_id} row={row} />
             ))}
           </div>
         </div>
@@ -2157,14 +2084,18 @@ function AuditTab({ clusterId }: { clusterId: string }) {
                   <td className="px-4 py-2 font-mono text-xs text-gray-300">{l.action}</td>
                   <td className="px-4 py-2 text-xs text-gray-400">
                     {l.target_type ?? '—'}
-                    {l.target_id ? (
-                      <span className="ml-1 text-gray-600 font-mono">
-                        {String(l.target_id).slice(0, 8)}…
+                    {(l.target_name || l.target_id) ? (
+                      <span className="ml-1 text-gray-300">
+                        {l.target_name ?? String(l.target_id).slice(0, 8) + '…'}
                       </span>
                     ) : null}
                   </td>
-                  <td className="px-4 py-2 text-xs font-mono text-gray-400">
-                    {l.actor_user_id
+                  <td className="px-4 py-2 text-xs text-gray-400">
+                    {l.actor_username
+                      ? l.actor_username
+                      : l.actor_node_name
+                      ? 'agent:' + l.actor_node_name
+                      : l.actor_user_id
                       ? String(l.actor_user_id).slice(0, 8) + '…'
                       : l.actor_agent_node_id
                       ? 'agent:' + String(l.actor_agent_node_id).slice(0, 8) + '…'
@@ -2433,10 +2364,12 @@ function AddStorageModal({
   clusterId,
   onClose,
   existing,
+  dbNodes = [],
 }: {
   clusterId: string
   onClose: () => void
   existing?: BackupTarget
+  dbNodes?: Node[]
 }) {
   const qc = useQueryClient()
   const [type, setType] = useState<BackupTargetType>(existing?.target_type ?? 'posix')
@@ -2457,13 +2390,12 @@ function AddStorageModal({
   const [sftpUser, setSftpUser] = useState(existing?.sftp_user ?? '')
   const [sftpKey, setSftpKey] = useState('')
   const [sftpPath, setSftpPath] = useState(existing?.sftp_path ?? '')
-  const [fullRet, setFullRet] = useState(existing?.full_retention ?? 2)
-  const [diffRet, setDiffRet] = useState(existing?.diff_retention ?? 7)
-  const [walRet, setWalRet] = useState(existing?.wal_retention_days ?? 14)
+  const [recoveryDays, setRecoveryDays] = useState(existing?.recovery_days ?? 14)
+  const [syncEnabled, setSyncEnabled] = useState((existing?.sync_to_nodes?.length ?? 0) > 0)
+  const [syncToNodes, setSyncToNodes] = useState<string[]>(existing?.sync_to_nodes ?? [])
   const [error, setError] = useState('')
 
   const [testStatus, setTestStatus] = useState<'idle' | 'running' | 'ok' | 'fail'>('idle')
-  const [provisionStatus, setProvisionStatus] = useState<'idle' | 'running' | 'ok' | 'fail'>('idle')
   const [showScriptModal, setShowScriptModal] = useState(false)
   const [errorPopup, setErrorPopup] = useState<string | null>(null)
   const pollAbortRef = useRef<AbortController | null>(null)
@@ -2493,10 +2425,10 @@ function AddStorageModal({
   }
 
   const handleTestPath = async () => {
-    if (!posixPath) return
+    const effectivePath = posixPath || '/var/lib/postgresql/backups'
     setTestStatus('running')
     try {
-      const { task_id } = await clustersApi.testBackupPath(clusterId, posixPath)
+      const { task_id } = await clustersApi.testBackupPath(clusterId, effectivePath)
       const result = await pollTask(task_id)
       setTestStatus(result.ok ? 'ok' : 'fail')
       if (!result.ok) setErrorPopup(result.message)
@@ -2507,30 +2439,14 @@ function AddStorageModal({
     }
   }
 
-  const handleProvisionPath = async () => {
-    if (!posixPath) return
-    setProvisionStatus('running')
-    try {
-      const { task_id } = await clustersApi.provisionBackupPath(clusterId, posixPath)
-      const result = await pollTask(task_id)
-      setProvisionStatus(result.ok ? 'ok' : 'fail')
-      if (!result.ok) setErrorPopup(result.message)
-    } catch (e: any) {
-      setProvisionStatus('fail')
-      const rawMsg: string = e?.response?.data?.message ?? e?.message ?? 'Request failed'
-      setErrorPopup(e?.response?.status === 409 ? 'Node unreachable — the agent may be temporarily disconnected.' : rawMsg)
-    }
-  }
-
   const save = useMutation({
     mutationFn: () => {
       const body: CreateBackupTargetBody = {
         label,
         target_type: type,
-        full_retention: fullRet,
-        diff_retention: diffRet,
-        wal_retention_days: walRet,
-        posix_path: type === 'posix' ? posixPath : undefined,
+        recovery_days: recoveryDays,
+        posix_path: type === 'posix' ? (posixPath || '/var/lib/postgresql/backups') : undefined,
+        sync_to_nodes: type === 'posix' && syncEnabled ? syncToNodes : [],
         s3_bucket: type === 's3' ? s3Bucket : undefined,
         s3_region: type === 's3' ? s3Region : undefined,
         s3_endpoint: type === 's3' && s3Endpoint ? s3Endpoint : undefined,
@@ -2565,8 +2481,9 @@ function AddStorageModal({
       {el}
     </div>
   )
-  const inp = (val: string, set: (v: string) => void, placeholder?: string, type?: string) => (
+  const inp = (val: string, set: (v: string) => void, placeholder?: string, type?: string, autoFocus?: boolean) => (
     <input
+      autoFocus={autoFocus}
       className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
       value={val}
       onChange={(e) => set(e.target.value)}
@@ -2584,7 +2501,7 @@ function AddStorageModal({
           <button onClick={onClose} className="text-gray-500 hover:text-white">✕</button>
         </div>
         <div className="px-6 py-4 space-y-4">
-          {field('Display name', inp(label, setLabel, 'e.g. Primary backup storage'))}
+          {field('Display name', inp(label, setLabel, 'e.g. Primary backup storage', undefined, true))}
 
           {field('Storage type',
             <select
@@ -2603,39 +2520,58 @@ function AddStorageModal({
           {type === 'posix' && (
             <div className="space-y-2">
               {field('Path', inp(posixPath, setPosixPath, '/var/lib/postgresql/backups'))}
-              {posixPath && (
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={handleTestPath}
-                      disabled={testStatus === 'running' || provisionStatus === 'running'}
-                      className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white disabled:opacity-50"
-                    >
-                      {testStatus === 'running' ? 'Testing…' : 'Test path'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleProvisionPath}
-                      disabled={testStatus === 'running' || provisionStatus === 'running'}
-                      className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white disabled:opacity-50"
-                    >
-                      {provisionStatus === 'running' ? 'Provisioning…' : 'Provision directory'}
-                    </button>
-                    {(testStatus === 'fail' || provisionStatus === 'fail') && (
-                      <button
-                        type="button"
-                        onClick={() => setShowScriptModal(true)}
-                        className="text-xs px-2.5 py-1 border border-amber-800/60 rounded text-amber-400 hover:text-amber-300"
-                      >
-                        Show setup script
-                      </button>
-                    )}
-                  </div>
-                  {testStatus === 'ok' && <p className="text-xs text-emerald-400">✓ Path is writable</p>}
-                  {testStatus === 'fail' && <p className="text-xs text-red-400">✗ Path test failed</p>}
-                  {provisionStatus === 'ok' && <p className="text-xs text-emerald-400">✓ Directory created and ready</p>}
-                  {provisionStatus === 'fail' && <p className="text-xs text-red-400">✗ Provisioning failed</p>}
+              <p className="text-xs text-gray-500 -mt-1">The <span className="font-mono text-gray-400">postgres</span> user and group must have write access to this path (<span className="font-mono text-gray-400">chown postgres:postgres</span>, <span className="font-mono text-gray-400">chmod 770</span>).</p>
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={handleTestPath}
+                    disabled={testStatus === 'running'}
+                    className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white disabled:opacity-50"
+                  >
+                    {testStatus === 'running' ? 'Testing…' : 'Test path'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowScriptModal(true)}
+                    className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white"
+                  >
+                    Setup script
+                  </button>
+                </div>
+                {testStatus === 'ok' && <p className="text-xs text-emerald-400">✓ Path is writable</p>}
+                {testStatus === 'fail' && <p className="text-xs text-red-400">✗ Path test failed — run the setup script on each node</p>}
+              </div>
+              {dbNodes.length > 1 && (
+                <div className="border-t border-gray-800 pt-3 space-y-2">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={syncEnabled}
+                      onChange={(e) => setSyncEnabled(e.target.checked)}
+                      className="w-3.5 h-3.5 accent-blue-500"
+                    />
+                    <span className="text-xs text-gray-300">Sync backups to other nodes after each backup</span>
+                  </label>
+                  {syncEnabled && (
+                    <div className="pl-5 space-y-1">
+                      {dbNodes.map((n) => (
+                        <label key={n.id} className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={syncToNodes.includes(n.id)}
+                            onChange={(e) =>
+                              setSyncToNodes((prev) =>
+                                e.target.checked ? [...prev, n.id] : prev.filter((id) => id !== n.id),
+                              )
+                            }
+                            className="w-3.5 h-3.5 accent-blue-500"
+                          />
+                          <span className="text-xs text-gray-400">{n.hostname}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -2688,22 +2624,20 @@ function AddStorageModal({
           </>}
 
           <div className="border-t border-gray-800 pt-4">
-            <p className="text-xs font-medium text-gray-400 mb-3">Retention settings</p>
-            <div className="grid grid-cols-3 gap-3">
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Full backups to keep</label>
-                <input type="number" min={1} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                  value={fullRet} onChange={(e) => setFullRet(Number(e.target.value))} />
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Daily snapshots (days)</label>
-                <input type="number" min={1} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                  value={diffRet} onChange={(e) => setDiffRet(Number(e.target.value))} />
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Backup history (days)</label>
-                <input type="number" min={1} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                  value={walRet} onChange={(e) => setWalRet(Number(e.target.value))} />
+            <p className="text-xs font-medium text-gray-400 mb-3">Recovery window</p>
+            <div>
+              <label className="text-xs text-gray-500 block mb-1">How far back do you want to be able to restore? (days)</label>
+              <div className="flex gap-2 items-center">
+                <input type="number" min={7} className="w-28 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                  value={recoveryDays} onChange={(e) => setRecoveryDays(Number(e.target.value))} />
+                <div className="flex gap-1">
+                  {[7, 14, 30, 60, 90].map((d) => (
+                    <button key={d} type="button"
+                      onClick={() => setRecoveryDays(d)}
+                      className={`text-xs px-2 py-1 rounded border ${recoveryDays === d ? 'bg-blue-600 border-blue-500 text-white' : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'}`}
+                    >{d}d</button>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
@@ -2749,7 +2683,7 @@ function ProvisionScriptModal({ path, onClose }: { path: string; onClose: () => 
 
 sudo mkdir -p "$BACKUP_DIR"
 sudo chown postgres:postgres "$BACKUP_DIR"
-sudo chmod 750 "$BACKUP_DIR"
+sudo chmod 770 "$BACKUP_DIR"
 echo "Backup directory ready: $BACKUP_DIR"`
 
   const [copied, setCopied] = useState(false)
@@ -2893,16 +2827,21 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
   const [editingTarget, setEditingTarget] = useState<BackupTarget | null>(null)
   const [showRestoreModal, setShowRestoreModal] = useState(false)
 
+  const { data: clusterNodes } = useQuery({
+    queryKey: ['nodes', clusterId],
+    queryFn: () => nodesApi.list(clusterId),
+  })
+  const dbNodes = (clusterNodes ?? []).filter(
+    (n) => n.role === 'hyperconverged' || n.role === 'db_only',
+  )
+
   const { data: config, isLoading } = useQuery({
     queryKey: ['backup-config', clusterId],
     queryFn: () => clustersApi.getBackupConfig(clusterId),
-    refetchInterval: 30_000,
-  })
-
-  const { data: runsData } = useQuery({
-    queryKey: ['backup-runs', clusterId],
-    queryFn: () => clustersApi.getBackupRuns(clusterId),
-    refetchInterval: 30_000,
+    // Poll every 5 s while Configure Backups is in progress (background task),
+    // then relax to 30 s once the stanza is ready.
+    refetchInterval: (q) =>
+      q.state.data?.schedule?.stanza_initialized ? 30_000 : 5_000,
   })
 
   const deleteTarget = useMutation({
@@ -2910,14 +2849,27 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
   })
 
+  const [enableError, setEnableError] = useState<string | null>(null)
+  const [configuringInProgress, setConfiguringInProgress] = useState(false)
   const enableBackups = useMutation({
     mutationFn: () => clustersApi.enableBackups(clusterId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+    onSuccess: () => {
+      setEnableError(null)
+      // Keep configuringInProgress true — the 5 s polling will flip it off
+      // when stanza_initialized becomes true (background task on server).
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+    },
+    onError: (e: any) => {
+      setConfiguringInProgress(false)
+      setEnableError(e?.response?.data?.message ?? e?.message ?? 'Request failed')
+    },
   })
 
   const pushConfig = useMutation({
     mutationFn: () => clustersApi.pushBackupConfig(clusterId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
   })
+
 
   const [scheduleEnabled, setScheduleEnabled] = useState(config?.schedule?.enabled ?? false)
   const [fullCron, setFullCron] = useState(config?.schedule?.full_backup_cron ?? '0 1 * * 0')
@@ -2937,7 +2889,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
 
   const runBackup = useMutation({
     mutationFn: () => clustersApi.runBackup(clusterId, 'full'),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-runs', clusterId] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
   })
 
   const refreshCatalog = useMutation({
@@ -2958,13 +2910,16 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
   const targets = config?.targets ?? []
   const stanzaReady = schedule?.stanza_initialized ?? false
 
+  // Clear in-progress flag once the server background task finishes.
+  useEffect(() => {
+    if (stanzaReady) setConfiguringInProgress(false)
+  }, [stanzaReady])
+
   if (isLoading) return <p className="text-gray-500 text-sm">Loading…</p>
 
-  const runs = runsData?.runs ?? []
-  // Derive oldest/newest from the last run's completed_at as a fallback.
-  // A real catalog fetch would populate these from pgbackrest info JSON.
-  const oldest = undefined as string | undefined
-  const newest = undefined as string | undefined
+  const catalogBackups = config?.cached_catalog?.backups ?? []
+  const oldest = config?.cached_catalog?.oldest_restore_point
+  const newest = config?.cached_catalog?.newest_restore_point
 
   return (
     <div className="space-y-6">
@@ -2976,15 +2931,6 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
             <p className="text-xs text-gray-500 mt-0.5">Where backups are stored. Up to 4 locations.</p>
           </div>
           <div className="flex gap-2">
-            {targets.length > 0 && (
-              <button
-                onClick={() => pushConfig.mutate()}
-                disabled={pushConfig.isPending}
-                className="text-xs px-3 py-1.5 border border-gray-700 hover:border-gray-500 rounded-lg text-gray-400 hover:text-white disabled:opacity-50"
-              >
-                {pushConfig.isPending ? 'Applying…' : 'Apply to nodes'}
-              </button>
-            )}
             {targets.length < 4 && (
               <button
                 onClick={() => setShowAddStorage(true)}
@@ -3010,7 +2956,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
                     {TARGET_TYPE_LABELS[t.target_type]}
                   </span>
                   <p className="text-xs text-gray-500 mt-0.5">
-                    Keep {t.full_retention} full · {t.diff_retention} daily snapshots · {t.wal_retention_days} days history
+                    {t.recovery_days}-day recovery window
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -3032,22 +2978,50 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
           </div>
         )}
 
+        {targets.length > 0 &&
+          targets.every((t) => t.target_type === 'posix') &&
+          targets.every((t) => (t.sync_to_nodes?.length ?? 0) === 0) && (
+          <div className="px-5 py-2 border-t border-gray-800 bg-amber-900/20">
+            <p className="text-xs text-amber-400">
+              Local disk backups can only restore this specific server. Enable sync or add a cloud storage location to restore from any node.
+            </p>
+          </div>
+        )}
+
         {targets.length > 0 && !stanzaReady && (
-          <div className="px-5 py-3 border-t border-gray-800 flex items-center justify-between">
-            <p className="text-xs text-amber-400">Backups not yet activated on nodes.</p>
-            <button
-              onClick={() => enableBackups.mutate()}
-              disabled={enableBackups.isPending}
-              className="text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg"
-            >
-              {enableBackups.isPending ? 'Activating…' : 'Activate backups'}
-            </button>
+          <div className="px-5 py-3 border-t border-gray-800">
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-amber-400">
+                {configuringInProgress
+                  ? 'Configuring — pushing pgBackRest and Patroni config, then initializing backup storage. This may take a minute.'
+                  : 'Backups not yet configured on nodes.'}
+              </p>
+              <button
+                onClick={() => { setEnableError(null); setConfiguringInProgress(true); enableBackups.mutate() }}
+                disabled={configuringInProgress}
+                className="ml-4 flex-shrink-0 text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg"
+              >
+                {configuringInProgress ? 'Configuring…' : 'Configure Backups'}
+              </button>
+            </div>
+            {enableError && (
+              <p className="mt-2 text-xs text-red-400">{enableError}</p>
+            )}
           </div>
         )}
 
         {stanzaReady && (
-          <div className="px-5 py-2 border-t border-gray-800">
-            <span className="text-xs text-emerald-400">Backups active</span>
+          <div className="px-5 py-3 border-t border-gray-800">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-emerald-400">Backups active</span>
+              <button
+                onClick={() => pushConfig.mutate()}
+                disabled={pushConfig.isPending}
+                className="ml-4 flex-shrink-0 text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded-lg"
+              >
+                {pushConfig.isPending ? 'Applying…' : 'Apply Config to Nodes'}
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -3173,27 +3147,19 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
               <p className="text-sm text-gray-500">Click Refresh to load available restore points from nodes.</p>
             )}
 
-            {runs.length > 0 && (
+            {catalogBackups.length > 0 && (
               <div className="border-t border-gray-800 pt-3">
-                <p className="text-xs text-gray-500 mb-2">Recent backup runs</p>
+                <p className="text-xs text-gray-500 mb-2">Completed backups</p>
                 <div className="space-y-1">
-                  {runs.slice(0, 8).map((r) => (
-                    <div key={r.id} className="flex items-center justify-between text-xs">
+                  {catalogBackups.slice(0, 8).map((b) => (
+                    <div key={b.label} className="flex items-center justify-between text-xs">
                       <div className="flex items-center gap-2">
-                        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                          r.status === 'success' ? 'bg-emerald-400' :
-                          r.status === 'failed' || r.status === 'abandoned' ? 'bg-red-400' :
-                          r.status === 'running' ? 'bg-blue-400' : 'bg-gray-500'
-                        }`} />
-                        <span className="text-gray-400 capitalize">{r.backup_type === 'full' ? 'Full backup' : r.backup_type === 'diff' ? 'Daily snapshot' : 'Log snapshot'}</span>
-                        {r.attempt > 1 && <span className="text-amber-500">attempt {r.attempt}</span>}
-                      </div>
-                      <div className="flex items-center gap-3 text-gray-500">
-                        <span className={r.status === 'success' ? 'text-emerald-400' : r.status === 'failed' || r.status === 'abandoned' ? 'text-red-400' : ''}>
-                          {r.status}
+                        <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-emerald-400" />
+                        <span className="text-gray-400">
+                          {b.type === 'full' ? 'Full backup' : b.type === 'diff' ? 'Daily snapshot' : 'Log snapshot'}
                         </span>
-                        <span>{new Date(r.scheduled_at).toLocaleString()}</span>
                       </div>
+                      <span className="text-gray-500">{new Date(b.started_at).toLocaleString()}</span>
                     </div>
                   ))}
                 </div>
@@ -3207,6 +3173,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
         <AddStorageModal
           clusterId={clusterId}
           existing={editingTarget ?? undefined}
+          dbNodes={dbNodes}
           onClose={() => { setShowAddStorage(false); setEditingTarget(null) }}
         />
       )}
@@ -3225,12 +3192,13 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
 
 // ── Tab / sub-tab type definitions ────────────────────────────────────────────
 
-type Tab = 'overview' | 'settings' | 'history' | 'backups'
+type Tab = 'overview' | 'settings' | 'history'
 
 const SETTINGS_TABS = [
   { id: 'general', label: 'General' },
   { id: 'credentials', label: 'Credentials' },
   { id: 'failover', label: 'Failover' },
+  { id: 'backup', label: 'Backup' },
 ]
 
 const HISTORY_TABS = [
@@ -3407,7 +3375,6 @@ export default function ClusterDetail() {
         {([
           { id: 'overview', label: 'Overview' },
           { id: 'settings', label: 'Settings' },
-          { id: 'backups', label: 'Backups' },
           { id: 'history', label: 'History' },
         ] as { id: Tab; label: string }[]).map((t) => (
           <button
@@ -3500,9 +3467,6 @@ export default function ClusterDetail() {
                 </div>
               </div>
 
-              {/* Backup Retention */}
-              {id && <RetentionCard clusterId={id} />}
-
               {/* File Sync */}
               <FileSyncCard cluster={cluster} />
 
@@ -3586,12 +3550,11 @@ export default function ClusterDetail() {
           {settingsSub === 'failover' && (
             <FailoverCard cluster={cluster} nodes={nodes} onOpenSyncModal={() => setShowSyncModal(true)} />
           )}
-        </div>
-      )}
 
-      {/* ── Backups tab ── */}
-      {tab === 'backups' && id && (
-        <BackupsTab clusterId={id} />
+          {settingsSub === 'backup' && id && (
+            <BackupsTab clusterId={id} />
+          )}
+        </div>
       )}
 
       {/* ── History tab ── */}

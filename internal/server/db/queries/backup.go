@@ -2,6 +2,7 @@ package queries
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,10 +48,8 @@ type BackupTarget struct {
 	SFTPPrivateKeyEnc  *string
 	SFTPPath           *string
 
-	// retention
-	FullRetention    int
-	DiffRetention    int
-	WalRetentionDays int
+	// how far back in days the user wants to be able to restore
+	RecoveryDays int
 
 	// conductor-relayed local repo sync (posix only)
 	SyncToNodes []uuid.UUID
@@ -74,7 +73,7 @@ const backupTargetCols = `
 	gcs_bucket, gcs_key_enc,
 	azure_account, azure_container, azure_key_enc,
 	sftp_host, sftp_port, sftp_user, sftp_private_key_enc, sftp_path,
-	full_retention, diff_retention, wal_retention_days,
+	recovery_days,
 	sync_to_nodes,
 	created_at, updated_at`
 
@@ -87,7 +86,7 @@ func scanBackupTarget(row interface{ Scan(...any) error }) (*BackupTarget, error
 		&t.GCSBucket, &t.GCSKeyEnc,
 		&t.AzureAccount, &t.AzureContainer, &t.AzureKeyEnc,
 		&t.SFTPHost, &t.SFTPPort, &t.SFTPUser, &t.SFTPPrivateKeyEnc, &t.SFTPPath,
-		&t.FullRetention, &t.DiffRetention, &t.WalRetentionDays,
+		&t.RecoveryDays,
 		&t.SyncToNodes,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
@@ -149,10 +148,8 @@ type CreateBackupTargetParams struct {
 	SFTPPrivateKeyEnc *string
 	SFTPPath          *string
 
-	FullRetention    int
-	DiffRetention    int
-	WalRetentionDays int
-	SyncToNodes      []uuid.UUID
+	RecoveryDays int
+	SyncToNodes  []uuid.UUID
 }
 
 func (q *BackupTargetQuerier) Create(ctx context.Context, p CreateBackupTargetParams) (*BackupTarget, error) {
@@ -167,7 +164,7 @@ func (q *BackupTargetQuerier) Create(ctx context.Context, p CreateBackupTargetPa
 			gcs_bucket, gcs_key_enc,
 			azure_account, azure_container, azure_key_enc,
 			sftp_host, sftp_port, sftp_user, sftp_private_key_enc, sftp_path,
-			full_retention, diff_retention, wal_retention_days,
+			recovery_days,
 			sync_to_nodes
 		) VALUES (
 			$1,$2,$3,$4,
@@ -176,8 +173,8 @@ func (q *BackupTargetQuerier) Create(ctx context.Context, p CreateBackupTargetPa
 			$11,$12,
 			$13,$14,$15,
 			$16,$17,$18,$19,$20,
-			$21,$22,$23,
-			$24
+			$21,
+			$22
 		)
 		RETURNING `+backupTargetCols,
 		p.ClusterID, p.RepoIndex, p.Label, p.TargetType,
@@ -186,7 +183,7 @@ func (q *BackupTargetQuerier) Create(ctx context.Context, p CreateBackupTargetPa
 		p.GCSBucket, p.GCSKeyEnc,
 		p.AzureAccount, p.AzureContainer, p.AzureKeyEnc,
 		p.SFTPHost, p.SFTPPort, p.SFTPUser, p.SFTPPrivateKeyEnc, p.SFTPPath,
-		p.FullRetention, p.DiffRetention, p.WalRetentionDays,
+		p.RecoveryDays,
 		p.SyncToNodes,
 	))
 }
@@ -218,10 +215,8 @@ type UpdateBackupTargetParams struct {
 	SFTPPrivateKeyEnc *string
 	SFTPPath          *string
 
-	FullRetention    int
-	DiffRetention    int
-	WalRetentionDays int
-	SyncToNodes      []uuid.UUID
+	RecoveryDays int
+	SyncToNodes  []uuid.UUID
 }
 
 func (q *BackupTargetQuerier) Update(ctx context.Context, p UpdateBackupTargetParams) (*BackupTarget, error) {
@@ -236,8 +231,8 @@ func (q *BackupTargetQuerier) Update(ctx context.Context, p UpdateBackupTargetPa
 			gcs_bucket = $9, gcs_key_enc = $10,
 			azure_account = $11, azure_container = $12, azure_key_enc = $13,
 			sftp_host = $14, sftp_port = $15, sftp_user = $16, sftp_private_key_enc = $17, sftp_path = $18,
-			full_retention = $19, diff_retention = $20, wal_retention_days = $21,
-			sync_to_nodes = $22,
+			recovery_days = $19,
+			sync_to_nodes = $20,
 			updated_at = now()
 		WHERE id = $1
 		RETURNING `+backupTargetCols,
@@ -247,7 +242,7 @@ func (q *BackupTargetQuerier) Update(ctx context.Context, p UpdateBackupTargetPa
 		p.GCSBucket, p.GCSKeyEnc,
 		p.AzureAccount, p.AzureContainer, p.AzureKeyEnc,
 		p.SFTPHost, p.SFTPPort, p.SFTPUser, p.SFTPPrivateKeyEnc, p.SFTPPath,
-		p.FullRetention, p.DiffRetention, p.WalRetentionDays,
+		p.RecoveryDays,
 		p.SyncToNodes,
 	))
 }
@@ -486,6 +481,53 @@ func (q *BackupRunQuerier) SetAbandoned(ctx context.Context, id uuid.UUID, errMs
 		SET status = 'abandoned', completed_at = now(), error_message = $2
 		WHERE id = $1
 	`, id, errMsg)
+	return err
+}
+
+// CompletedBackupRun pairs a backup_run ID with the terminal status and response
+// payload of the task it was waiting on. Returned by ListRunningWithCompletedTask.
+type CompletedBackupRun struct {
+	RunID           uuid.UUID
+	ClusterID       uuid.UUID
+	TaskStatus      string
+	ResponsePayload json.RawMessage
+}
+
+// ListRunningWithCompletedTask returns backup_runs that are still marked 'running'
+// but whose associated task_result has reached a terminal state. Used by the
+// scheduler to flip run status once the agent reports back.
+func (q *BackupRunQuerier) ListRunningWithCompletedTask(ctx context.Context) ([]CompletedBackupRun, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT br.id, br.cluster_id, tr.status, tr.response_payload
+		FROM backup_runs br
+		JOIN task_results tr ON tr.task_id = br.task_id
+		WHERE br.status = 'running'
+		  AND tr.status IN ('success', 'failure', 'timeout')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []CompletedBackupRun
+	for rows.Next() {
+		var r CompletedBackupRun
+		if err := rows.Scan(&r.RunID, &r.ClusterID, &r.TaskStatus, &r.ResponsePayload); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// SetRetrying updates an existing backup_run in-place for a retry attempt.
+// The same row is reused — attempt increments, task_id and dispatched_at update,
+// retry_after clears, and status returns to 'running'. No new row is inserted.
+func (q *BackupRunQuerier) SetRetrying(ctx context.Context, id, taskID uuid.UUID, newAttempt int) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE backup_runs
+		SET task_id=$2, attempt=$3, status='running', dispatched_at=now(), retry_after=NULL
+		WHERE id=$1
+	`, id, taskID, newAttempt)
 	return err
 }
 
