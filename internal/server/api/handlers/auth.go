@@ -113,7 +113,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "user not found")
 	}
 
-	accessToken, err := jwtutil.IssueAccess(user.ID, user.Role, h.jwtSecret)
+	accessToken, err := jwtutil.IssueAccess(user.ID, user.Username, user.Role, h.jwtSecret)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "could not issue token")
 	}
@@ -508,7 +508,7 @@ func (h *AuthHandler) callerID(c echo.Context) uuid.UUID {
 
 // issueFullTokens is shared by Login (no TOTP) and VerifyTOTP.
 func (h *AuthHandler) issueFullTokens(c echo.Context, user *queries.User) error {
-	accessToken, err := jwtutil.IssueAccess(user.ID, user.Role, h.jwtSecret)
+	accessToken, err := jwtutil.IssueAccess(user.ID, user.Username, user.Role, h.jwtSecret)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "could not issue token")
 	}

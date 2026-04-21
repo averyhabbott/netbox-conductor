@@ -133,6 +133,12 @@ mkdir -p /var/lib/pgbackrest
 chown postgres:postgres /var/lib/pgbackrest
 chmod 750 /var/lib/pgbackrest
 
+# Default posix backup target — group write (770) so netbox-agent (in postgres group)
+# can test path writability without requiring sudo.
+mkdir -p /var/lib/postgresql/backups
+chown postgres:postgres /var/lib/postgresql/backups
+chmod 770 /var/lib/postgresql/backups
+
 mkdir -p /var/log/pgbackrest
 chown postgres:postgres /var/log/pgbackrest
 chmod 770 /var/log/pgbackrest

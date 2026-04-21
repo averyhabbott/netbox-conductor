@@ -27,9 +27,10 @@ interface Props {
   events: Event[]
   loading?: boolean
   showCluster?: boolean
+  showNode?: boolean
 }
 
-export default function EventsTable({ events, loading, showCluster }: Props) {
+export default function EventsTable({ events, loading, showCluster, showNode }: Props) {
   if (loading) {
     return <div className="text-gray-500 text-sm py-8 text-center">Loading events…</div>
   }
@@ -46,7 +47,8 @@ export default function EventsTable({ events, loading, showCluster }: Props) {
             <th className="text-left py-2 pr-4 font-medium w-20">Sev</th>
             <th className="text-left py-2 pr-4 font-medium w-24">Category</th>
             <th className="text-left py-2 pr-4 font-medium w-28">Code</th>
-            {showCluster && <th className="text-left py-2 pr-4 font-medium w-28">Cluster</th>}
+            {showCluster && <th className="text-left py-2 pr-4 font-medium w-32">Cluster</th>}
+            {showNode    && <th className="text-left py-2 pr-4 font-medium w-32">Node</th>}
             <th className="text-left py-2 pr-4 font-medium">Message</th>
             <th className="text-left py-2 font-medium w-20">Actor</th>
           </tr>
@@ -69,8 +71,13 @@ export default function EventsTable({ events, loading, showCluster }: Props) {
               </td>
               <td className="py-2 pr-4 font-mono text-xs text-gray-400">{ev.code}</td>
               {showCluster && (
-                <td className="py-2 pr-4 text-gray-400 text-xs truncate max-w-[7rem]">
-                  {ev.cluster_id?.slice(0, 8) ?? '—'}
+                <td className="py-2 pr-4 text-gray-400 text-xs truncate max-w-[8rem]">
+                  {ev.cluster_name ?? ev.cluster_id?.slice(0, 8) ?? '—'}
+                </td>
+              )}
+              {showNode && (
+                <td className="py-2 pr-4 text-gray-400 text-xs truncate max-w-[8rem]">
+                  {ev.node_name ?? (ev.node_id ? ev.node_id.slice(0, 8) : '—')}
                 </td>
               )}
               <td className="py-2 pr-4 text-gray-200">{ev.message}</td>

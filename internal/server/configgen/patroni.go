@@ -32,6 +32,10 @@ type PatroniInput struct {
 	ConnectAddr string // Postgres connect address (usually same as NodeAddr)
 	Port        int    // Postgres port (default 5432)
 	UseUnixSocket bool // Use unix socket for Patroni's local postgres connections (set true when unix_socket_directories is configured)
+
+	// Archive settings — injected by the backup enable flow.
+	ArchiveEnabled bool   // add archive_mode/archive_command to DCS parameters
+	ArchiveStanza  string // pgBackRest stanza name (written into archive_command)
 }
 
 // RenderPatroni renders a complete patroni.yml for one node.
@@ -136,6 +140,10 @@ dcs:
       max_wal_senders: 5
       max_replication_slots: 5
       wal_log_hints: "on"
+{{- if .ArchiveEnabled}}
+      archive_mode: "on"
+      archive_command: 'pgbackrest --stanza={{.ArchiveStanza}} archive-push %p'
+{{- end}}
 
 bootstrap:
   # bootstrap.dcs seeds the DCS key on first cluster formation.
@@ -154,6 +162,10 @@ bootstrap:
         max_wal_senders: 5
         max_replication_slots: 5
         wal_log_hints: "on"
+{{- if .ArchiveEnabled}}
+        archive_mode: "on"
+        archive_command: 'pgbackrest --stanza={{.ArchiveStanza}} archive-push %p'
+{{- end}}
 
 postgresql:
   listen: 0.0.0.0:{{.Port}}
@@ -186,6 +198,10 @@ postgresql:
     - host    all             {{.DBSuperUser}}    0.0.0.0/0          scram-sha-256
   parameters:
     unix_socket_directories: '/var/run/postgresql'
+{{- if .ArchiveEnabled}}
+    archive_mode: "on"
+    archive_command: 'pgbackrest --stanza={{.ArchiveStanza}} archive-push %p'
+{{- end}}
 
 tags:
   nofailover: false

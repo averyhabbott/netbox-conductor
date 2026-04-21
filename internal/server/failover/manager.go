@@ -469,14 +469,6 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 		return
 	}
 
-	m.emitHAEvent(ctx, haEventParams{
-		ClusterID:      clusterID,
-		EventType:      "failback_initiated",
-		Trigger:        "reconnect",
-		TargetNodeID:   &reconnected.ID,
-		TargetNodeName: reconnected.Hostname,
-	})
-
 	if cluster.AppTierAlwaysAvailable {
 		m.attemptFailbackAlwaysAvailable(ctx, cluster, reconnected, nodes)
 	} else {
@@ -599,11 +591,44 @@ func (m *Manager) attemptFailbackActiveStandby(
 	}
 
 	if currentActive == nil {
-		return // no other node is actively running NetBox — nothing to fail back from
+		// No node is running NetBox. If auto-failover is on and the cluster is not
+		// in a restore, start NetBox on the highest-priority connected node — this
+		// recovers the cluster after a conductor restart where the previous start
+		// task was never acknowledged (e.g. conductor was restarted mid-dispatch).
+		if !cluster.AutoFailover {
+			return
+		}
+		var best *queries.Node
+		for i := range nodes {
+			n := &nodes[i]
+			if !m.h.IsConnected(n.ID) {
+				continue
+			}
+			if best == nil || n.FailoverPriority > best.FailoverPriority {
+				best = n
+			}
+		}
+		if best == nil {
+			return
+		}
+		slog.Info("failover: no node running NetBox — starting on highest-priority connected node",
+			"cluster", cluster.ID, "node", best.Hostname, "priority", best.FailoverPriority)
+		if err := m.dispatchServiceTask(ctx, best, protocol.TaskStartNetbox); err != nil {
+			slog.Error("failover: orphan-recovery start dispatch failed", "node", best.ID, "error", err)
+		}
+		return
 	}
 	if reconnected.FailoverPriority <= currentActive.FailoverPriority {
 		return // reconnected node is not higher priority
 	}
+
+	m.emitHAEvent(ctx, haEventParams{
+		ClusterID:      cluster.ID,
+		EventType:      "failback_initiated",
+		Trigger:        "reconnect",
+		TargetNodeID:   &reconnected.ID,
+		TargetNodeName: reconnected.Hostname,
+	})
 
 	slog.Info("failback: moving NetBox to higher-priority node",
 		"cluster", cluster.ID,

@@ -161,6 +161,7 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
                 <div className="flex-1">
                   <label className="block text-xs text-gray-400 mb-1">Hostname</label>
                   <input
+                    autoFocus
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
                     placeholder="netbox.example.com"
                     value={form.hostname}

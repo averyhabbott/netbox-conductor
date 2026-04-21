@@ -110,11 +110,37 @@ func (q *EventQuerier) List(ctx context.Context, f EventFilter) ([]events.Event,
 	limitP := add(f.Limit)
 	offsetP := add(f.Offset)
 
+	// Prefix conditions with "ev." since events is aliased below.
+	for i, c := range conds {
+		// The conditions reference bare column names; qualify them for the aliased query.
+		conds[i] = strings.NewReplacer(
+			"category =", "ev.category =",
+			"code LIKE", "ev.code LIKE",
+			"code =", "ev.code =",
+			"CASE severity", "CASE ev.severity",
+			"cluster_id =", "ev.cluster_id =",
+			"node_id =", "ev.node_id =",
+			"occurred_at >=", "ev.occurred_at >=",
+			"occurred_at <=", "ev.occurred_at <=",
+		).Replace(c)
+		_ = i
+	}
+
+	where = ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+
 	sql := fmt.Sprintf(`
-		SELECT id, cluster_id, node_id, category, severity, code, message, actor, metadata, occurred_at
-		FROM events
+		SELECT ev.id, ev.cluster_id, ev.node_id,
+		       c.name  AS cluster_name,
+		       n.hostname AS node_name,
+		       ev.category, ev.severity, ev.code, ev.message, ev.actor, ev.metadata, ev.occurred_at
+		FROM events ev
+		LEFT JOIN clusters c ON c.id = ev.cluster_id
+		LEFT JOIN nodes    n ON n.id  = ev.node_id
 		%s
-		ORDER BY occurred_at DESC
+		ORDER BY ev.occurred_at DESC
 		LIMIT %s OFFSET %s`, where, limitP, offsetP)
 
 	rows, err := q.pool.Query(ctx, sql, args...)
@@ -129,6 +155,7 @@ func (q *EventQuerier) List(ctx context.Context, f EventFilter) ([]events.Event,
 		var metaJSON []byte
 		if err := rows.Scan(
 			&e.ID, &e.ClusterID, &e.NodeID,
+			&e.ClusterName, &e.NodeName,
 			&e.Category, &e.Severity, &e.Code, &e.Message, &e.Actor,
 			&metaJSON, &e.OccurredAt,
 		); err != nil {

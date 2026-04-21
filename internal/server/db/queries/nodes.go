@@ -133,6 +133,13 @@ func (q *NodeQuerier) Create(ctx context.Context, p CreateNodeParams) (*Node, er
 	return scanNode(row)
 }
 
+// MarkAllUnknown resets every node to agent_status='unknown' on conductor startup.
+// State is re-determined as agents reconnect and send heartbeats.
+func (q *NodeQuerier) MarkAllUnknown(ctx context.Context) error {
+	_, err := q.pool.Exec(ctx, `UPDATE nodes SET agent_status = 'unknown', updated_at = now()`)
+	return err
+}
+
 func (q *NodeQuerier) UpdateAgentStatus(ctx context.Context, id uuid.UUID, status string) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE nodes SET agent_status = $2, last_seen_at = now(), updated_at = now()

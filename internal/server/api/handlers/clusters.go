@@ -48,10 +48,10 @@ func NewClusterHandler(
 
 func (h *ClusterHandler) SetEmitter(e events.Emitter) { h.emitter = e }
 
-// actorFromCtx returns the requesting user's ID, or "system" as a fallback.
+// actorFromCtx returns the requesting user's username, or "system" as a fallback.
 func actorFromCtx(c echo.Context) string {
-	if id, _ := c.Get(middleware.ContextKeyUserID).(string); id != "" {
-		return id
+	if name, _ := c.Get(middleware.ContextKeyUsername).(string); name != "" {
+		return name
 	}
 	return events.ActorSystem
 }

@@ -358,7 +358,7 @@ function TransportForm({
     <form onSubmit={submit} className="space-y-5">
       <div className="grid grid-cols-2 gap-4">
         <Field label="Name">
-          <TInput value={name} onChange={(e) => setName(e.target.value)} required />
+          <TInput autoFocus value={name} onChange={(e) => setName(e.target.value)} required />
         </Field>
         <Field label="Type">
           <select value={type} onChange={(e) => setType(e.target.value as AlertTransportBody['type'])} className={sel}>
@@ -662,7 +662,7 @@ function RuleForm({
         <div className="grid grid-cols-3 gap-4 items-end">
           <div className="col-span-2">
             <Field label="Name">
-              <input value={name} onChange={(e) => setName(e.target.value)} required className={inp} />
+              <input autoFocus value={name} onChange={(e) => setName(e.target.value)} required className={inp} />
             </Field>
           </div>
           <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer pb-1.5">
@@ -1043,7 +1043,7 @@ function SchedulesTab() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs text-gray-400 mb-1">Name</label>
-              <input value={name} onChange={(e) => setName(e.target.value)} required className={baseInput} />
+              <input autoFocus value={name} onChange={(e) => setName(e.target.value)} required className={baseInput} />
             </div>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Timezone</label>

@@ -170,7 +170,6 @@ func New(cfg RouterConfig) *echo.Echo {
 		protected.POST("/clusters/:id/backup-restore", cfg.BackupHandler.ClusterRestore, mw.RequireRole("admin"))
 		protected.GET("/clusters/:id/backup-runs", cfg.BackupHandler.GetBackupRuns)
 		protected.POST("/clusters/:id/backup-path/test", cfg.BackupHandler.TestBackupPath, mw.RequireRole("operator"))
-		protected.POST("/clusters/:id/backup-path/provision", cfg.BackupHandler.ProvisionBackupPath, mw.RequireRole("operator"))
 	}
 
 	// ── Sentinel ────────────────────────────────────────────────────────────────

@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	ContextKeyUserID = "user_id"
-	ContextKeyRole   = "user_role"
+	ContextKeyUserID   = "user_id"
+	ContextKeyUsername = "username"
+	ContextKeyRole     = "user_role"
 )
 
 // JWT validates the Authorization: Bearer <token> header and populates
@@ -31,6 +32,7 @@ func JWT(secret []byte) echo.MiddlewareFunc {
 			}
 
 			c.Set(ContextKeyUserID, claims.UserID)
+			c.Set(ContextKeyUsername, claims.Username)
 			c.Set(ContextKeyRole, claims.Role)
 			return next(c)
 		}

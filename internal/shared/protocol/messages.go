@@ -56,6 +56,7 @@ const (
 	TaskPGBackRestBackup       TaskType = "pgbackrest.backup"       // run pgbackrest backup (full|diff|incr)
 	TaskPGBackRestCatalog      TaskType = "pgbackrest.catalog"      // pgbackrest info --output=json
 	TaskPGBackRestRestore      TaskType = "pgbackrest.restore"      // full cluster restore (stops Patroni, runs pgBackRest restore)
+	TaskPGBackRestTestPath     TaskType = "pgbackrest.test_path"    // verify a posix backup path is writable by the postgres user
 	TaskBackupSyncRead         TaskType = "backup.sync.read"        // read local pgBackRest repo for conductor-relayed sync
 	TaskBackupSyncWrite        TaskType = "backup.sync.write"       // write conductor-relayed backup repo chunks to disk
 )
@@ -349,6 +350,11 @@ type PGBackRestRestoreParams struct {
 	TargetTime string `json:"target_time"` // RFC3339 UTC
 	DataDir    string `json:"data_dir"`    // PostgreSQL data directory (from Patroni config)
 	RestoreCmd string `json:"restore_cmd"` // optional: override the default pgbackrest restore command
+}
+
+// PGBackRestTestPathParams are the params for TaskPGBackRestTestPath.
+type PGBackRestTestPathParams struct {
+	Path string `json:"path"` // absolute path to test for write access by the postgres user
 }
 
 // BackupSyncReadParams are the params for TaskBackupSyncRead.

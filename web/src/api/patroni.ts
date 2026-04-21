@@ -23,6 +23,8 @@ export interface HistoryRow {
   status: string
   queued_at: string
   completed_at?: string
+  request_payload?: Record<string, unknown>
+  response_payload?: Record<string, unknown>
 }
 
 export interface PushResult {

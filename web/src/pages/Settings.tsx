@@ -142,6 +142,7 @@ function UsersTab({ currentUserId }: { currentUserId: string }) {
             <div>
               <label className="block text-xs text-gray-400 mb-1">Username</label>
               <input
+                autoFocus
                 className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500"
                 value={newUsername}
                 onChange={(e) => setNewUsername(e.target.value)}
@@ -848,7 +849,7 @@ function SyslogForm({
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-xs text-gray-400 mb-1">Name</label>
-          <input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. rsyslog-prod" className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500" />
+          <input autoFocus value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. rsyslog-prod" className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500" />
         </div>
         <div>
           <label className="block text-xs text-gray-400 mb-1">Protocol</label>

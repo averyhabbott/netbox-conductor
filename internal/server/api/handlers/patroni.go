@@ -409,20 +409,28 @@ func (h *PatroniHandler) History(c echo.Context) error {
 	}
 
 	patroniTypes := map[string]bool{
-		"patroni.write_config":    true,
-		"patroni.install":         true,
-		"service.restart.patroni": true,
-		"exec.run":                true, // switchover uses exec.run
+		"patroni.write_config":       true,
+		"patroni.install":            true,
+		"service.restart.patroni":    true,
+		"exec.run":                   true, // switchover uses exec.run
+		"pgbackrest.configure":       true,
+		"pgbackrest.stanza-create":   true,
+		"pgbackrest.backup":          true,
+		"pgbackrest.catalog":         true,
+		"pgbackrest.restore":         true,
+		"pgbackrest.test_path":       true,
 	}
 
 	type historyRow struct {
-		TaskID      string  `json:"task_id"`
-		NodeID      string  `json:"node_id"`
-		Hostname    string  `json:"hostname"`
-		TaskType    string  `json:"task_type"`
-		Status      string  `json:"status"`
-		QueuedAt    string  `json:"queued_at"`
-		CompletedAt *string `json:"completed_at,omitempty"`
+		TaskID          string              `json:"task_id"`
+		NodeID          string              `json:"node_id"`
+		Hostname        string              `json:"hostname"`
+		TaskType        string              `json:"task_type"`
+		Status          string              `json:"status"`
+		QueuedAt        string              `json:"queued_at"`
+		CompletedAt     *string             `json:"completed_at,omitempty"`
+		RequestPayload  json.RawMessage     `json:"request_payload,omitempty"`
+		ResponsePayload json.RawMessage     `json:"response_payload,omitempty"`
 	}
 
 	rows := make([]historyRow, 0)
@@ -431,12 +439,14 @@ func (h *PatroniHandler) History(c echo.Context) error {
 			continue
 		}
 		row := historyRow{
-			TaskID:   t.TaskID.String(),
-			NodeID:   t.NodeID.String(),
-			Hostname: hostnameByID[t.NodeID.String()],
-			TaskType: t.TaskType,
-			Status:   t.Status,
-			QueuedAt: t.QueuedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			TaskID:          t.TaskID.String(),
+			NodeID:          t.NodeID.String(),
+			Hostname:        hostnameByID[t.NodeID.String()],
+			TaskType:        t.TaskType,
+			Status:          t.Status,
+			QueuedAt:        t.QueuedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			RequestPayload:  t.RequestPayload,
+			ResponsePayload: t.ResponsePayload,
 		}
 		if t.CompletedAt != nil {
 			s := t.CompletedAt.UTC().Format("2006-01-02T15:04:05Z")
@@ -1479,6 +1489,38 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					}
 				}
 				time.Sleep(5 * time.Second)
+			}
+
+			// Apply any pending PostgreSQL config changes (e.g. listen_addresses,
+			// wal_log_hints) that require a PostgreSQL restart. Patroni detects these
+			// as "pending restart" but won't apply them automatically; we must call
+			// POST /restart on the primary so replicas can connect for pg_basebackup.
+			restartReq, err := http.NewRequestWithContext(bgCtx, http.MethodPost,
+				fmt.Sprintf("http://%s:8008/restart", primaryIP),
+				strings.NewReader(`{"restart_pending":true}`))
+			if err == nil {
+				restartReq.Header.Set("Content-Type", "application/json")
+				restartReq.SetBasicAuth(restU, restP)
+				if restartResp, err := http.DefaultClient.Do(restartReq); err == nil {
+					restartResp.Body.Close()
+					// Give PostgreSQL time to stop then start, then wait for primary to be ready.
+					time.Sleep(5 * time.Second)
+					deadline2 := time.Now().Add(60 * time.Second)
+					for time.Now().Before(deadline2) {
+						pollReq, _ := http.NewRequestWithContext(bgCtx, http.MethodGet,
+							fmt.Sprintf("http://%s:8008/primary", primaryIP), nil)
+						if pollReq != nil {
+							pollReq.SetBasicAuth(restU, restP)
+							if pollResp, err := http.DefaultClient.Do(pollReq); err == nil {
+								pollResp.Body.Close()
+								if pollResp.StatusCode == http.StatusOK {
+									break
+								}
+							}
+						}
+						time.Sleep(3 * time.Second)
+					}
+				}
 			}
 
 			for _, node := range replicas {

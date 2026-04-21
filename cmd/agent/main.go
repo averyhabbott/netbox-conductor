@@ -652,6 +652,20 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskPGBackRestTestPath:
+		var params protocol.PGBackRestTestPathParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.RunPGBackRestTestPath(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
 	case protocol.TaskBackupSyncRead:
 		var params protocol.BackupSyncReadParams
 		if err := json.Unmarshal(task.Params, &params); err != nil {

@@ -4,6 +4,8 @@ export interface Event {
   id: string
   cluster_id?: string
   node_id?: string
+  cluster_name?: string
+  node_name?: string
   category: string
   severity: 'debug' | 'info' | 'warn' | 'error' | 'critical'
   code: string

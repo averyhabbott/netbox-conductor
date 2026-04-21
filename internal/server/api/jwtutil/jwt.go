@@ -18,17 +18,19 @@ const (
 
 // Claims holds the custom JWT claims for access tokens.
 type Claims struct {
-	UserID string `json:"sub"`
-	Role   string `json:"role"`
+	UserID   string `json:"sub"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
 	jwt.RegisteredClaims
 }
 
 // IssueAccess creates a signed HS256 access token.
-func IssueAccess(userID uuid.UUID, role string, secret []byte) (string, error) {
+func IssueAccess(userID uuid.UUID, username, role string, secret []byte) (string, error) {
 	now := time.Now()
 	claims := Claims{
-		UserID: userID.String(),
-		Role:   role,
+		UserID:   userID.String(),
+		Username: username,
+		Role:     role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenTTL)),

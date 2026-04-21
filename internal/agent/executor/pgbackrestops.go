@@ -1,13 +1,10 @@
 package executor
 
 import (
-	"context"
 	"fmt"
 	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5" //nolint:depguard
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -19,6 +16,15 @@ func RunPGBackRestStanzaCreate(params protocol.PGBackRestStanzaCreateParams) (st
 	stanza := params.Stanza
 	if stanza == "" {
 		return "", fmt.Errorf("stanza is required")
+	}
+
+	// Wait for PostgreSQL to be primary before running stanza-create.
+	// After a Patroni restart, PostgreSQL starts briefly in recovery mode
+	// before promoting. pg_isready passes during that window, but pgbackrest
+	// stanza-create requires a primary and will fail with "all clusters in
+	// recovery" if it runs too early.
+	if err := waitForPromotion(postgresDataDir(), 2*time.Minute); err != nil {
+		return "", fmt.Errorf("PostgreSQL not ready as primary: %w", err)
 	}
 
 	createOut, err := pgbackrest(stanza, "stanza-create")
@@ -148,6 +154,24 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 	return log.String(), nil
 }
 
+// RunPGBackRestTestPath verifies that the given path is writable by the postgres
+// OS user, which is the user pgBackRest uses for posix repo operations.
+// It creates a temp file, verifies it exists, then removes it.
+func RunPGBackRestTestPath(params protocol.PGBackRestTestPathParams) (string, error) {
+	if params.Path == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	// Run as postgres (same user pgBackRest uses) so the test reflects actual access.
+	testFile := params.Path + "/.conductor_pgbackrest_test"
+	args := []string{"-u", "postgres", "/bin/sh", "-c",
+		`touch "$1" && rm -f "$1" && echo ok`, "--", testFile}
+	out, err := exec.Command("sudo", args...).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("path not writable by postgres: %w — %s", err, strings.TrimSpace(string(out)))
+	}
+	return fmt.Sprintf("path %s is writable", params.Path), nil
+}
+
 // pgbackrest runs the pgbackrest binary as the postgres OS user with the given
 // stanza and additional arguments. Returns combined stdout+stderr.
 func pgbackrest(stanza string, subcommand string, extraArgs ...string) (string, error) {
@@ -164,22 +188,18 @@ func runSystemctl(action, unit string) (string, error) {
 
 // waitForPromotion polls pg_is_in_recovery() until it returns false,
 // meaning PostgreSQL has completed recovery and promoted to primary.
-func waitForPromotion(dataDir string, timeout time.Duration) error {
-	connStr := fmt.Sprintf("user=postgres dbname=postgres sslmode=disable host=%s", pgSocketDir(dataDir))
+// Uses sudo -u postgres psql so peer authentication works regardless of
+// which OS user the agent service runs as.
+func waitForPromotion(_ string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := pgx.Connect(ctx, connStr)
-		cancel()
-		if err == nil {
-			var inRecovery bool
-			err = conn.QueryRow(context.Background(), "SELECT pg_is_in_recovery()").Scan(&inRecovery)
-			conn.Close(context.Background())
-			if err == nil && !inRecovery {
-				return nil
-			}
+		out, err := exec.Command(
+			"sudo", "-u", "postgres", "psql", "-Atc", "SELECT pg_is_in_recovery()", "postgres",
+		).CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) == "f" {
+			return nil
 		}
-		time.Sleep(5 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
 	return fmt.Errorf("timed out after %s waiting for PostgreSQL to promote", timeout)
 }

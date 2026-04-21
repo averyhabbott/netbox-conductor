@@ -96,7 +96,7 @@ export default function EventsPage() {
 
       {/* Table */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-        <EventsTable events={events} loading={loading} showCluster />
+        <EventsTable events={events} loading={loading} showCluster showNode />
 
         {/* Pagination */}
         {!loading && (
