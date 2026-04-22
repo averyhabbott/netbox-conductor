@@ -42,7 +42,7 @@ Priority also drives failback: when a higher-priority node reconnects after bein
 
 ## 3. Importing and Generating Credentials
 
-The conductor manages eight credential types for each cluster:
+The conductor manages seven credential types for each cluster:
 
 | Credential | Used For |
 |---|---|
@@ -50,8 +50,7 @@ The conductor manages eight credential types for each cluster:
 | `postgres_replication` | Patroni replication user |
 | `netbox_db_user` | NetBox application database user |
 | `patroni_rest_password` | Patroni REST API auth |
-| `redis_tasks_password` | Redis task queue auth |
-| `redis_caching_password` | Redis cache auth |
+| `redis_tasks_password` | Redis `requirepass` and both task queue and caching auth |
 | `netbox_secret_key` | NetBox `SECRET_KEY` |
 | `netbox_api_token_pepper` | NetBox API token pepper |
 
@@ -59,7 +58,7 @@ The conductor manages eight credential types for each cluster:
 
 **Import** lets you provide existing passwords — useful when taking over a cluster that already has PostgreSQL users established, or when your organization has a password management policy that pre-generates credentials.
 
-**Expected outcome:** All eight credential types should show as set before running Configure Failover. Configure Failover will auto-generate any missing credentials, but doing it explicitly first gives you the opportunity to record them.
+**Expected outcome:** All seven credential types should show as set before running Configure Failover. Configure Failover will auto-generate any missing credentials, but doing it explicitly first gives you the opportunity to record them.
 
 **Risk:** If you import a `postgres_superuser` or `postgres_replication` password that does not match what PostgreSQL currently has on the primary node, Configure Failover will fail when it tries to create or verify those roles. The create-role task will return an authentication error and the operation will stop before Patroni is configured.
 
@@ -81,7 +80,7 @@ Configure Failover is a single operation that bootstraps the full HA stack on th
 
 1. **Settings saved** — Failover parameters (delays, multipliers, VIP, sentinel master name) are written to the cluster record.
 
-2. **Missing credentials generated** — Any of the five required credential types (superuser, replication, patroni REST, redis tasks, redis caching) that are absent are auto-generated and encrypted.
+2. **Missing credentials generated** — Any of the four required credential types (superuser, replication, patroni REST, redis tasks) that are absent are auto-generated and encrypted.
 
 3. **Primary node identified** — The conductor picks the primary using this precedence: explicit override you provided → node already reporting `patroni role=primary` → the single node running NetBox → highest-priority connected node running NetBox.
 
@@ -95,11 +94,13 @@ Configure Failover is a single operation that bootstraps the full HA stack on th
 
 8. **Patroni installed, configured, and restarted on primary** — Config is rendered from the cluster settings and credentials, written to `/etc/patroni/patroni.yml`, and Patroni is restarted. Patroni takes over management of PostgreSQL from this point forward.
 
-9. **Redis Sentinel configured on primary** — `/etc/redis-sentinel/sentinel.conf` is written and Sentinel restarted.
+9. **Redis Sentinel stopped and disabled** — Sentinel is not used in Active/Standby mode. The `redis-sentinel` service is stopped and disabled on all nodes to prevent it from interfering with Redis.
 
-10. **NetBox configuration pushed to primary** — A full `configuration.py` is rendered with all credentials and database connection info and pushed to the primary node.
+10. **Redis auth configured** — `redis-cli CONFIG SET requirepass` is called on each node, then `CONFIG REWRITE` persists it to `/etc/redis/redis.conf`. The `redis_tasks_password` credential is used. This runs before `configuration.py` is pushed so that Redis and the application config are in sync when services start.
 
-11. **Replicas configured asynchronously** — In a background goroutine, the conductor polls the primary's Patroni REST API until it confirms leader status (up to 90 seconds), then dispatches the same Patroni → Sentinel → Config sequence to each replica node.
+11. **NetBox configuration pushed** — A full `configuration.py` is rendered with all credentials and database connection info and pushed to each node. Services are restarted immediately after the config is written.
+
+12. **Replicas configured asynchronously** — In a background goroutine, the conductor polls the primary's Patroni REST API until it confirms leader status (up to 90 seconds), then dispatches the same Patroni → Sentinel → Config sequence to each replica node.
 
 **Expected outcome:** The HTTP response returns immediately with a list of dispatched task IDs and their statuses. The primary node completes its sequence in approximately 2–5 minutes. Replicas follow once the primary has elected itself Patroni leader. You can monitor progress in the DB Events tab.
 

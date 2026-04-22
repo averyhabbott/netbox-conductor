@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/averyhabbott/netbox-conductor/internal/server/api/middleware"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
@@ -53,13 +52,6 @@ func (h *NodeHandler) SetFailoverManager(fm NodeFailoverManager) {
 
 func (h *NodeHandler) SetEmitter(e events.Emitter) { h.emitter = e }
 
-// nodeActorFromCtx returns the requesting user's ID from the JWT, or "system".
-func nodeActorFromCtx(c echo.Context) string {
-	if id, _ := c.Get(middleware.ContextKeyUserID).(string); id != "" {
-		return id
-	}
-	return events.ActorSystem
-}
 
 func NewNodeHandler(
 	nodes *queries.NodeQuerier,
@@ -256,7 +248,7 @@ func (h *NodeHandler) Create(c echo.Context) error {
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityInfo, events.CodeNodeAdded,
-			fmt.Sprintf("Node %q added to cluster", node.Hostname), nodeActorFromCtx(c)).
+			fmt.Sprintf("Node %q added to cluster", node.Hostname), actorFromCtx(c)).
 			Cluster(clusterID).Node(node.ID).Build())
 	}
 
@@ -346,7 +338,7 @@ func (h *NodeHandler) Update(c echo.Context) error {
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodeNodeConfigUpdated,
-			fmt.Sprintf("Node %q configuration updated", node.Hostname), nodeActorFromCtx(c)).
+			fmt.Sprintf("Node %q configuration updated", node.Hostname), actorFromCtx(c)).
 			Cluster(node.ClusterID).Node(nid).Build())
 	}
 
@@ -376,7 +368,7 @@ func (h *NodeHandler) Delete(c echo.Context) error {
 
 	if h.emitter != nil && nodeErr == nil {
 		h.emitter.Emit(events.New(events.CategoryCluster, events.SeverityWarn, events.CodeNodeRemoved,
-			fmt.Sprintf("Node %q removed from cluster", node.Hostname), nodeActorFromCtx(c)).
+			fmt.Sprintf("Node %q removed from cluster", node.Hostname), actorFromCtx(c)).
 			Cluster(node.ClusterID).Node(nid).Build())
 	}
 

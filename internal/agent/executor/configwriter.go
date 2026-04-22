@@ -62,11 +62,9 @@ func WriteConfig(params protocol.ConfigWriteParams, configPath string) (string, 
 
 // restartNetbox calls systemctl to restart both netbox and netbox-rq services.
 func restartNetbox() (string, error) {
-	for _, svc := range []string{"netbox", "netbox-rq"} {
-		cmd := exec.Command("systemctl", "restart", svc)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return string(out), fmt.Errorf("systemctl restart %s: %w", svc, err)
-		}
+	cmd := exec.Command("sudo", "/usr/bin/systemctl", "restart", "netbox", "netbox-rq")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return string(out), fmt.Errorf("systemctl restart netbox netbox-rq: %w", err)
 	}
 	return "restarted netbox and netbox-rq", nil
 }

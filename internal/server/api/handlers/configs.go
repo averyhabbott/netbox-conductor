@@ -631,14 +631,30 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 	var dbHost string
 	var allowedHosts []string
 
+	// Determine DB host based on cluster topology, not the node being rendered.
+	// app_tier_always_available=true: all nodes point at the current Patroni primary.
+	// Everything else (including active/standby with app_always_active=false and HA):
+	// each node connects to its local Postgres via loopback.
+	if cluster.Mode == "active_standby" && cluster.AppTierAlwaysAvailable {
+		for _, n := range allNodes {
+			if r := nodestate.ExtractPatroniRole(n.PatroniState); r == "primary" || r == "master" {
+				dbHost = stripCIDR(n.IPAddress)
+				break
+			}
+		}
+		if dbHost == "" && len(allNodes) > 0 {
+			dbHost = stripCIDR(allNodes[0].IPAddress)
+		}
+	} else {
+		dbHost = "127.0.0.1"
+	}
+
 	if nodeID != uuid.Nil {
 		node, err := nodes.GetByID(ctx, nodeID)
 		if err == nil {
-			dbHost = stripCIDR(node.IPAddress)
 			allowedHosts = []string{node.Hostname, stripCIDR(node.IPAddress)}
 		}
 	} else if len(allNodes) > 0 {
-		dbHost = stripCIDR(allNodes[0].IPAddress)
 		allowedHosts = []string{allNodes[0].Hostname, stripCIDR(allNodes[0].IPAddress)}
 	}
 

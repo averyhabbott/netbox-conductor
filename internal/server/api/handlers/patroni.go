@@ -419,6 +419,9 @@ func (h *PatroniHandler) History(c echo.Context) error {
 		"pgbackrest.catalog":         true,
 		"pgbackrest.restore":         true,
 		"pgbackrest.test_path":       true,
+		"config.redis_requirepass":   true,
+		"service.stop.netbox":        true,
+		"config.write":               true,
 	}
 
 	type historyRow struct {
