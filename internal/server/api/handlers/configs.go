@@ -426,8 +426,7 @@ func (h *ConfigHandler) ReadNodeConfig(c echo.Context) error {
 			"netbox_api_token_pepper":  parsed.APITokenPepper,
 			"netbox_db_user_username":  parsed.DBUser,
 			"netbox_db_user_password":  parsed.DBPassword,
-			"redis_tasks_password":     parsed.RedisTasksPassword,
-			"redis_caching_password":   parsed.RedisCachingPassword,
+			"redis_tasks_password": parsed.RedisTasksPassword,
 		},
 	})
 }
@@ -595,15 +594,10 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 		}
 	}
 
-	redisTasksPw, redisCachingPw := "", ""
+	redisPw := ""
 	if cred, err := creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
 		if pw, err := enc.Decrypt(cred.PasswordEnc); err == nil {
-			redisTasksPw = string(pw)
-		}
-	}
-	if cred, err := creds.GetByKind(ctx, clusterID, "redis_caching_password"); err == nil {
-		if pw, err := enc.Decrypt(cred.PasswordEnc); err == nil {
-			redisCachingPw = string(pw)
+			redisPw = string(pw)
 		}
 	}
 
@@ -664,8 +658,8 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 		RedisHost:            redisHost,
 		SentinelAddrs:        sentinelAddrs,
 		PatroniScope:         cluster.PatroniScope,
-		RedisTasksPassword:   redisTasksPw,
-		RedisCachingPassword: redisCachingPw,
+		RedisTasksPassword:   redisPw,
+		RedisCachingPassword: redisPw,
 		NetboxVersion:        cluster.NetboxVersion,
 	}, nil
 }

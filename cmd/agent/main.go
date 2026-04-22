@@ -496,6 +496,20 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskRedisSetRequirepass:
+		var params protocol.RedisRequirepassParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.SetRedisRequirepass(params)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
 	case protocol.TaskCreatePgRole:
 		var params protocol.CreatePgRoleParams
 		if err := json.Unmarshal(task.Params, &params); err != nil {

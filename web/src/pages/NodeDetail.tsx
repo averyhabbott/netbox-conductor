@@ -169,125 +169,6 @@ function AgentBadge({ status }: { status: string }) {
   )
 }
 
-// ── DB Restore modal ──────────────────────────────────────────────────────────
-
-function DBRestoreModal({
-  clusterId,
-  nodeId,
-  hostname,
-  onClose,
-}: {
-  clusterId: string
-  nodeId: string
-  hostname: string
-  onClose: () => void
-}) {
-  const [method, setMethod] = useState<'reinitialize' | 'pitr'>('reinitialize')
-  const [targetTime, setTargetTime] = useState('')
-  const [restoreCmd, setRestoreCmd] = useState('')
-  const [result, setResult] = useState<string | null>(null)
-
-  const restore = useMutation({
-    mutationFn: () =>
-      client
-        .post(`/clusters/${clusterId}/nodes/${nodeId}/db-restore`, {
-          method,
-          target_time: targetTime || undefined,
-          restore_cmd: restoreCmd || undefined,
-        })
-        .then((r) => r.data as { task_id: string }),
-    onSuccess: (data) => setResult(data.task_id),
-  })
-
-  return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md">
-        <h3 className="text-lg font-semibold text-red-400 mb-1">DB Restore / PITR</h3>
-        <p className="text-xs text-gray-400 mb-4">
-          Target: <span className="font-mono text-white">{hostname}</span>
-        </p>
-
-        {result ? (
-          <div className="space-y-4">
-            <div className="bg-emerald-900/30 border border-emerald-700 rounded px-3 py-2 text-sm text-emerald-300">
-              Restore dispatched — task <span className="font-mono">{result.slice(0, 8)}…</span>
-            </div>
-            <button
-              onClick={onClose}
-              className="w-full py-2 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg"
-            >
-              Close
-            </button>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">Method</label>
-              <select
-                value={method}
-                onChange={(e) => setMethod(e.target.value as 'reinitialize' | 'pitr')}
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-              >
-                <option value="reinitialize">Reinitialize (clone from primary)</option>
-                <option value="pitr">Point-in-Time Recovery (pgBackRest / custom)</option>
-              </select>
-            </div>
-
-            {method === 'pitr' && (
-              <>
-                <div>
-                  <label className="block text-xs text-gray-400 mb-1">
-                    Target time (RFC3339, e.g. 2024-01-15T14:30:00Z)
-                  </label>
-                  <input
-                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
-                    value={targetTime}
-                    onChange={(e) => setTargetTime(e.target.value)}
-                    placeholder="2024-01-15T14:30:00Z"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-gray-400 mb-1">
-                    Custom restore command (optional — overrides pgBackRest default)
-                  </label>
-                  <input
-                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500"
-                    value={restoreCmd}
-                    onChange={(e) => setRestoreCmd(e.target.value)}
-                    placeholder="pgbackrest --stanza=main restore …"
-                  />
-                </div>
-              </>
-            )}
-
-            {restore.isError && (
-              <p className="text-xs text-red-400">
-                {(restore.error as any)?.response?.data?.message ?? 'Restore failed'}
-              </p>
-            )}
-
-            <div className="flex gap-3 justify-end pt-2">
-              <button
-                onClick={onClose}
-                className="px-4 py-2 text-sm text-gray-400 hover:text-white"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => restore.mutate()}
-                disabled={restore.isPending || (method === 'pitr' && !targetTime)}
-                className="px-4 py-2 text-sm bg-red-700 hover:bg-red-600 disabled:opacity-40 rounded-lg"
-              >
-                {restore.isPending ? 'Dispatching…' : 'Run restore'}
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
 
 // ── RemoveNodeDialog ───────────────────────────────────────────────────────────
 
@@ -558,7 +439,6 @@ export default function NodeDetail() {
   const qc = useQueryClient()
   const userRole = useAuthStore((s) => s.user?.role)
   const [actionResult, setActionResult] = useState<{ success: boolean; message: string } | null>(null)
-  const [showDBRestore, setShowDBRestore] = useState(false)
   const [showRemoveNode, setShowRemoveNode] = useState(false)
   const [showNetboxMenu, setShowNetboxMenu] = useState(false)
   const netboxMenuRef = useRef<HTMLDivElement>(null)
@@ -760,14 +640,6 @@ export default function NodeDetail() {
               </div>
             )}
           </div>
-          {userRole === 'admin' && (
-            <button
-              onClick={() => setShowDBRestore(true)}
-              className="bg-amber-900/40 hover:bg-amber-900/70 border border-amber-800 text-amber-400 hover:text-amber-300 text-sm px-3 py-1.5 rounded-lg transition-colors"
-            >
-              DB Restore
-            </button>
-          )}
           {/* NetBox service actions dropdown */}
           <div className="relative" ref={netboxMenuRef}>
             <button
@@ -1001,14 +873,6 @@ export default function NodeDetail() {
         {id && nid && <NodeEventsCard clusterId={id} nodeId={nid} />}
       </div>
 
-      {showDBRestore && id && nid && node && (
-        <DBRestoreModal
-          clusterId={id}
-          nodeId={nid}
-          hostname={node.hostname}
-          onClose={() => setShowDBRestore(false)}
-        />
-      )}
 
       {envContent !== null && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">

@@ -358,7 +358,6 @@ const CRED_KINDS: CredentialKind[] = [
   'postgres_replication',
   'netbox_db_user',
   'redis_tasks_password',
-  'redis_caching_password',
   'netbox_secret_key',
   'netbox_api_token_pepper',
   'patroni_rest_password',
@@ -503,7 +502,6 @@ function ImportFromExistingModal({
     netbox_api_token_pepper: 'netbox_api_token_pepper',
     netbox_db_user_password: 'netbox_db_user',
     redis_tasks_password: 'redis_tasks_password',
-    redis_caching_password: 'redis_caching_password',
   }
 
   async function fetchConfig() {
@@ -555,8 +553,7 @@ function ImportFromExistingModal({
     netbox_secret_key: 'NetBox Secret Key',
     netbox_api_token_pepper: 'API Token Pepper',
     netbox_db_user_password: 'NetBox DB Password',
-    redis_tasks_password: 'Redis Password (Tasks)',
-    redis_caching_password: 'Redis Password (Caching)',
+    redis_tasks_password: 'Redis Password',
   }
 
   return (

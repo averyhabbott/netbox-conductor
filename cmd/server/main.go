@@ -64,6 +64,10 @@ func run(ctx context.Context) error {
 	serverBindIP := envOr("SERVER_BIND_IP", "")
 	serverURL := envOr("SERVER_URL", "")
 
+	if serverURL == "" && serverBindIP == "" {
+		return fmt.Errorf("SERVER_URL or SERVER_BIND_IP must be set — agents cannot connect without a reachable conductor address")
+	}
+
 	// Validate SERVER_BIND_IP — must be a parseable IP address, never a hostname,
 	// because it is written directly into Patroni configs as the witness Raft
 	// address that data nodes connect to.

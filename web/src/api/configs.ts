@@ -47,7 +47,6 @@ export interface ReadNodeConfigResult {
     netbox_db_user_username: string
     netbox_db_user_password: string
     redis_tasks_password: string
-    redis_caching_password: string
   }
 }
 

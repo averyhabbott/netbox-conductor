@@ -1088,7 +1088,6 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		{"postgres_replication", "replicator", nil},
 		{"patroni_rest_password", "patroni", nil},
 		{"redis_tasks_password", "", nil},
-		{"redis_caching_password", "", nil},
 	} {
 		if _, err := h.creds.GetByKind(ctx, clusterID, def.kind); err != nil {
 			raw, genErr := crypto.GenerateToken(32)
@@ -1406,6 +1405,20 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// dispatchRedisRequirepass sets requirepass on Redis for a node and persists it.
+	// Called for every HC/app node after Sentinel is stopped and before configuration.py
+	// is pushed, so Redis and configuration.py are consistent when services start.
+	dispatchRedisRequirepass := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) {
+		if redisPassword == "" {
+			return
+		}
+		p, _ := json.Marshal(protocol.RedisRequirepassParams{Password: redisPassword})
+		if _, err := d(node.ID, protocol.TaskRedisSetRequirepass, p, 30); err != nil {
+			slog.Warn("configure-failover: redis-requirepass dispatch failed", "node", node.Hostname, "error", err)
+			warnings = append(warnings, fmt.Sprintf("redis-requirepass dispatch failed for %s: %v", node.Hostname, err))
+		}
+	}
+
 	// dispatchStopSentinel stops and disables redis-sentinel on a node.
 	// For active/standby clusters Sentinel is not needed — each node uses a plain
 	// local Redis connection (or points directly at the primary's Redis IP).
@@ -1468,6 +1481,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	if cluster.Mode == "active_standby" {
 		for _, node := range nodes {
 			dispatchStopSentinel(dispatch, node)
+			dispatchRedisRequirepass(dispatch, node)
 		}
 	} else {
 		sentinelTasks = []taskRef{dispatchSentinelForNode(dispatch, *primaryNode)}
@@ -1564,6 +1578,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				dispatchPatroniForNode(bgDispatch, node)
 				if cluster.Mode == "active_standby" {
 					dispatchStopSentinel(bgDispatch, node)
+					dispatchRedisRequirepass(bgDispatch, node)
 				} else {
 					dispatchSentinelForNode(bgDispatch, node)
 				}

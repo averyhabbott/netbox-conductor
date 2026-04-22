@@ -30,8 +30,9 @@ type TaskType string
 
 const (
 	TaskWriteConfig       TaskType = "config.write"
-	TaskUpdateDBHost      TaskType = "config.update_db_host"
-	TaskUpdateRedisHost   TaskType = "config.update_redis_host"
+	TaskUpdateDBHost        TaskType = "config.update_db_host"
+	TaskUpdateRedisHost     TaskType = "config.update_redis_host"
+	TaskRedisSetRequirepass TaskType = "config.redis_requirepass"
 	TaskStartNetbox       TaskType = "service.start.netbox"
 	TaskStopNetbox        TaskType = "service.stop.netbox"
 	TaskRestartNetbox     TaskType = "service.restart.netbox"
@@ -234,6 +235,12 @@ type DBHostUpdateParams struct {
 type RedisHostUpdateParams struct {
 	Host         string `json:"host"`          // new Redis HOST value (bare IP, no CIDR)
 	RestartAfter bool   `json:"restart_after"` // restart netbox+netbox-rq after patching
+}
+
+// RedisRequirepassParams are the params for TaskRedisSetRequirepass.
+// The agent sets requirepass on the local Redis instance and persists it via CONFIG REWRITE.
+type RedisRequirepassParams struct {
+	Password string `json:"password"` // value for requirepass
 }
 
 // ConfigWriteParams are the params for TaskWriteConfig.

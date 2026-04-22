@@ -98,7 +98,6 @@ var autoGenDefaults = []struct {
 	{Kind: "postgres_replication", Username: "replicator"},
 	{Kind: "netbox_db_user", Username: "netbox", DBName: strPtr("netbox")},
 	{Kind: "redis_tasks_password", Username: ""},
-	{Kind: "redis_caching_password", Username: ""},
 	{Kind: "patroni_rest_password", Username: "patroni"},
 }
 
