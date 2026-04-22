@@ -10,8 +10,14 @@ netbox-agent ALL=(ALL) NOPASSWD: \
   /usr/bin/systemctl restart netbox netbox-rq, \
   /usr/bin/systemctl restart netbox-rq, \
   /usr/bin/systemctl restart patroni, \
+  /usr/bin/systemctl stop redis, \
+  /usr/bin/systemctl start redis, \
   /usr/bin/systemctl restart redis, \
+  /usr/bin/systemctl stop redis-sentinel, \
+  /usr/bin/systemctl start redis-sentinel, \
   /usr/bin/systemctl restart redis-sentinel, \
+  /usr/bin/systemctl disable redis-sentinel, \
+  /usr/bin/systemctl enable redis-sentinel, \
   /usr/bin/systemctl restart netbox-agent
 
 # Database backup: run pg_dump, psql, pgbackrest, and pg_ctl as the postgres OS user

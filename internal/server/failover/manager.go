@@ -26,7 +26,6 @@ import (
 
 	ev "github.com/averyhabbott/netbox-conductor/internal/server/events"
 
-	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
@@ -379,7 +378,7 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 	if switchoverTriggered && cluster.AppTierAlwaysAvailable {
 		candidateIP, _, _ := strings.Cut(candidate.IPAddress, "/")
 		m.dispatchDBHostUpdate(ctx, allNodes, candidateIP)
-		m.dispatchSentinelUpdate(ctx, cluster, allNodes, candidateIP)
+		m.dispatchRedisHostUpdate(ctx, allNodes, candidateIP)
 	}
 
 	if err := m.dispatchServiceTask(ctx, candidate, protocol.TaskStartNetbox); err != nil {
@@ -525,7 +524,7 @@ func (m *Manager) attemptFailbackAlwaysAvailable(
 			// primary reports its role, dispatching TaskUpdateDBHost{RestartAfter=true}
 			// to all nodes — this restarts running nodes and starts the reconnected one.
 			m.dispatchDBHostUpdate(ctx, nodes, reconnectedIP)
-			m.dispatchSentinelUpdate(ctx, cluster, nodes, reconnectedIP)
+			m.dispatchRedisHostUpdate(ctx, nodes, reconnectedIP)
 		}
 		m.emitHAEvent(ctx, haEventParams{
 			ClusterID:      cluster.ID,
@@ -557,6 +556,7 @@ func (m *Manager) attemptFailbackAlwaysAvailable(
 	if currentPrimary != nil {
 		primaryIP, _, _ := strings.Cut(currentPrimary.IPAddress, "/")
 		m.dispatchDBHostUpdate(ctx, []queries.Node{*reconnected}, primaryIP)
+		m.dispatchRedisHostUpdate(ctx, []queries.Node{*reconnected}, primaryIP)
 	}
 	if err := m.dispatchServiceTask(ctx, reconnected, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failback (always-available): start dispatch failed",
@@ -645,7 +645,7 @@ func (m *Manager) attemptFailbackActiveStandby(
 		// but guard for safety.
 		reconnectedIP, _, _ := strings.Cut(reconnected.IPAddress, "/")
 		m.dispatchDBHostUpdate(ctx, nodes, reconnectedIP)
-		m.dispatchSentinelUpdate(ctx, cluster, nodes, reconnectedIP)
+		m.dispatchRedisHostUpdate(ctx, nodes, reconnectedIP)
 	}
 
 	if err := m.dispatchServiceTask(ctx, currentActive, protocol.TaskStopNetbox); err != nil {
@@ -791,7 +791,7 @@ func (m *Manager) OnMaintenanceEnabled(nodeID, clusterID uuid.UUID) {
 	if switchoverTriggered && cluster.AppTierAlwaysAvailable {
 		candidateIP, _, _ := strings.Cut(candidate.IPAddress, "/")
 		m.dispatchDBHostUpdate(ctx, maintenanceNodes, candidateIP)
-		m.dispatchSentinelUpdate(ctx, cluster, maintenanceNodes, candidateIP)
+		m.dispatchRedisHostUpdate(ctx, maintenanceNodes, candidateIP)
 	}
 
 	if err := m.dispatchServiceTask(ctx, node, protocol.TaskStopNetbox); err != nil {
@@ -1023,50 +1023,33 @@ func (m *Manager) dispatchDBHostUpdate(ctx context.Context, nodes []queries.Node
 	}
 }
 
-// dispatchSentinelUpdate re-renders sentinel.conf on all connected cluster nodes
-// with newMasterIP as the monitored Redis master. Called after a Patroni switchover
-// when AppTierAlwaysAvailable=true so Redis Sentinel stays in sync with the active node.
-func (m *Manager) dispatchSentinelUpdate(ctx context.Context, cluster *queries.Cluster, nodes []queries.Node, newMasterIP string) {
-	if cluster.RedisSentinelMaster == "" {
-		return // sentinel not configured for this cluster
-	}
-	redisPassword := ""
-	if m.creds != nil && m.enc != nil {
-		if cred, err := m.creds.GetByKind(ctx, cluster.ID, "redis_tasks_password"); err == nil {
-			if pw, err := m.enc.Decrypt(cred.PasswordEnc); err == nil {
-				redisPassword = string(pw)
-			}
-		}
-	}
+// dispatchRedisHostUpdate patches the Redis HOST in configuration.py on all
+// connected, non-maintenance app-tier nodes to point at newMasterIP, then
+// restarts NetBox and RQ. Called after a Patroni switchover when
+// AppTierAlwaysAvailable=true so every app-tier node connects to the new
+// primary's Redis without a full config rewrite.
+//
+// Nodes in maintenance mode are skipped — their config will be corrected when
+// they come out of maintenance via the failback path.
+// db_only nodes are skipped — they don't run NetBox or RQ.
+func (m *Manager) dispatchRedisHostUpdate(ctx context.Context, nodes []queries.Node, newMasterIP string) {
+	params, _ := json.Marshal(protocol.RedisHostUpdateParams{Host: newMasterIP, RestartAfter: true})
 	for _, n := range nodes {
 		if !m.h.IsConnected(n.ID) {
 			continue
 		}
-		nodeIP, _, _ := strings.Cut(n.IPAddress, "/")
-		content, sha256hex, err := configgen.RenderSentinel(configgen.SentinelInput{
-			Scope:      cluster.RedisSentinelMaster,
-			MasterHost: newMasterIP,
-			BindAddr:   nodeIP,
-			Password:   redisPassword,
-		})
-		if err != nil {
-			slog.Warn("failover: sentinel config render failed", "node", n.Hostname, "error", err)
+		if n.MaintenanceMode || n.Role == "db_only" {
 			continue
 		}
-		params, _ := json.Marshal(protocol.SentinelConfigWriteParams{
-			Content:      content,
-			Sha256:       sha256hex,
-			RestartAfter: true,
-		})
 		taskID := uuid.New()
-		_ = m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskWriteSentinelConf), params)
+		_ = m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateRedisHost), params)
 		if err := m.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
 			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskWriteSentinelConf,
+			TaskType:    protocol.TaskUpdateRedisHost,
 			Params:      json.RawMessage(params),
 			TimeoutSecs: 30,
 		}); err != nil {
-			slog.Warn("failover: sentinel config dispatch failed", "node", n.Hostname, "error", err)
+			slog.Warn("failover: redis-host-update dispatch failed", "node", n.Hostname, "error", err)
 			continue
 		}
 		_ = m.tasks.SetSent(ctx, taskID)

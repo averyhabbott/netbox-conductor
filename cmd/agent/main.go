@@ -482,6 +482,20 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskUpdateRedisHost:
+		var params protocol.RedisHostUpdateParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+		} else {
+			out, err := executor.UpdateRedisHost(params, cfg.NetboxConfigPath)
+			output = out
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				success = true
+			}
+		}
+
 	case protocol.TaskCreatePgRole:
 		var params protocol.CreatePgRoleParams
 		if err := json.Unmarshal(task.Params, &params); err != nil {

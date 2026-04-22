@@ -25,11 +25,18 @@ type RenderInput struct {
 	// Network
 	AllowedHosts []string // hostname(s) and IP(s) for Django's ALLOWED_HOSTS
 
-	// Redis / Sentinel
-	SentinelAddrs        []string // "host:port" — defaults to ["127.0.0.1:26379"] if empty
+	// Redis
+	// RedisHost is the IP of the Redis server to use for tasks and caching.
+	// For active/standby clusters: primary node's IP when app_tier_always_available=true,
+	// otherwise "127.0.0.1". Defaults to "127.0.0.1" when empty.
+	RedisHost            string
 	RedisTasksPassword   string
 	RedisCachingPassword string
-	PatroniScope         string // sentinel service name — matches the Patroni scope
+
+	// Sentinel (kept for backward compatibility with stored templates that still use
+	// {{.SentinelsPy}} / {{.PatroniScope}}; not used in the default template).
+	SentinelAddrs []string // "host:port"
+	PatroniScope  string   // sentinel service name
 
 	// Meta
 	NetboxVersion string // "4.x" or "3.x"
@@ -44,6 +51,9 @@ func Render(tmplSrc string, in RenderInput) (content, sha256hex string, err erro
 
 	if in.DBPort == 0 {
 		in.DBPort = 5432
+	}
+	if in.RedisHost == "" {
+		in.RedisHost = "127.0.0.1"
 	}
 	if len(in.SentinelAddrs) == 0 {
 		in.SentinelAddrs = []string{"127.0.0.1:26379"}
@@ -107,6 +117,61 @@ func sentinelsPy(addrs []string) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
+// MigrateRedisToHost replaces a Sentinel-style REDIS block in a stored template
+// with the HOST/PORT format used for active/standby clusters. It is a no-op when
+// the template already uses HOST/PORT. This lets configure-failover produce correct
+// output even when the cluster's stored template pre-dates the Sentinel removal.
+func MigrateRedisToHost(tmplSrc string) string {
+	start, end := findRedisBlock(tmplSrc)
+	if start == -1 {
+		return tmplSrc
+	}
+	block := tmplSrc[start:end]
+	if !strings.Contains(block, "SENTINELS") && strings.Contains(block, "'HOST'") {
+		return tmplSrc // already HOST/PORT format
+	}
+	newBlock := `REDIS = {
+    'tasks': {
+        'HOST': '{{.RedisHost}}',
+        'PORT': 6379,
+        'PASSWORD': '{{.RedisTasksPassword}}',
+        'DATABASE': 0,
+        'SSL': False,
+    },
+    'caching': {
+        'HOST': '{{.RedisHost}}',
+        'PORT': 6379,
+        'PASSWORD': '{{.RedisCachingPassword}}',
+        'DATABASE': 1,
+        'SSL': False,
+    },
+}`
+	return tmplSrc[:start] + newBlock + tmplSrc[end:]
+}
+
+// findRedisBlock returns the [start, end) byte range of the REDIS = { ... } block
+// in src, using brace counting to handle nested dicts. Returns -1, -1 if not found.
+func findRedisBlock(src string) (start, end int) {
+	const marker = "REDIS = {"
+	idx := strings.Index(src, marker)
+	if idx == -1 {
+		return -1, -1
+	}
+	depth := 0
+	for i := idx; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return idx, i + 1
+			}
+		}
+	}
+	return -1, -1
+}
+
 // defaultConfigTemplate is the Go text/template source stored in new configs.
 // Variables: {{.SecretKey}}, {{.APITokenPepper}}, {{.DBHost}}, {{.DBPort}},
 //            {{.DBName}}, {{.DBUser}}, {{.DBPassword}},
@@ -144,20 +209,20 @@ DATABASE = {
 }
 
 ###########################################################
-# Redis / Sentinel
+# Redis
 ###########################################################
 
 REDIS = {
     'tasks': {
-        'SENTINELS': {{.SentinelsPy}},
-        'SENTINEL_SERVICE': '{{.PatroniScope}}',
+        'HOST': '{{.RedisHost}}',
+        'PORT': 6379,
         'PASSWORD': '{{.RedisTasksPassword}}',
         'DATABASE': 0,
         'SSL': False,
     },
     'caching': {
-        'SENTINELS': {{.SentinelsPy}},
-        'SENTINEL_SERVICE': '{{.PatroniScope}}',
+        'HOST': '{{.RedisHost}}',
+        'PORT': 6379,
         'PASSWORD': '{{.RedisCachingPassword}}',
         'DATABASE': 1,
         'SSL': False,

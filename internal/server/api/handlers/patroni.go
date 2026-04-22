@@ -1386,7 +1386,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		return refs
 	}
 
-	// dispatchSentinelForNode dispatches sentinel.write_config for one node.
+	// dispatchSentinelForNode dispatches sentinel.write_config for one node (HA clusters only).
 	dispatchSentinelForNode := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) taskRef {
 		nodeIP := stripCIDR(node.IPAddress)
 		content, sha256hex, err := configgen.RenderSentinel(configgen.SentinelInput{
@@ -1406,7 +1406,25 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// dispatchStopSentinel stops and disables redis-sentinel on a node.
+	// For active/standby clusters Sentinel is not needed — each node uses a plain
+	// local Redis connection (or points directly at the primary's Redis IP).
+	dispatchStopSentinel := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) {
+		for _, args := range [][]string{
+			{"/usr/bin/systemctl", "stop", "redis-sentinel"},
+			{"/usr/bin/systemctl", "disable", "redis-sentinel"},
+		} {
+			p, _ := json.Marshal(protocol.RunCommandParams{Command: "sudo", Args: args})
+			if _, err := d(node.ID, protocol.TaskRunCommand, p, 15); err != nil {
+				slog.Warn("configure-failover: stop-sentinel dispatch failed", "node", node.Hostname, "args", args, "error", err)
+			}
+		}
+	}
+
 	// dispatchConfigForNode dispatches config.write for one node.
+	// For active/standby clusters it migrates legacy Sentinel templates to the
+	// HOST/PORT Redis format and sets RedisHost to the primary's IP (when
+	// app_tier_always_available=true) or 127.0.0.1 (when false).
 	dispatchConfigForNode := func(useCtx context.Context, d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) taskRef {
 		if cfgFetchErr != nil {
 			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "skipped", Error: "no config template"}
@@ -1415,7 +1433,19 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		if err != nil {
 			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: err.Error()}
 		}
-		content, sha256hex, err := configgen.Render(latestCfg.ConfigTemplate, input)
+		tmpl := latestCfg.ConfigTemplate
+		if cluster.Mode == "active_standby" {
+			// Migrate legacy Sentinel template to HOST/PORT in-place for this render.
+			tmpl = configgen.MigrateRedisToHost(tmpl)
+			// Override RedisHost: renderInputFor auto-detects from PatroniState, but
+			// during configure-failover Patroni hasn't reported yet — use masterHost.
+			if req.AppTierAlwaysAvailable {
+				input.RedisHost = masterHost
+			} else {
+				input.RedisHost = "127.0.0.1"
+			}
+		}
+		content, sha256hex, err := configgen.Render(tmpl, input)
 		if err != nil {
 			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()}
 		}
@@ -1427,14 +1457,21 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
-	// Phase 1 (synchronous): Dispatch Patroni→Sentinel→config tasks to the primary only.
+	// Phase 1 (synchronous): Dispatch Patroni→config tasks to the primary only.
 	// Patroni tasks are dispatched in order: install → write_config → restart.
 	// The agent serializes tasks in a queue, so each step completes before the next begins.
 	patroniTasks := dispatchPatroniForNode(dispatch, *primaryNode)
 
-	// Push Sentinel config to the primary. sentinel.conf must match configuration.py
-	// (which always uses PatroniScope as the service name).
-	sentinelTasks := []taskRef{dispatchSentinelForNode(dispatch, *primaryNode)}
+	// For active/standby: stop and disable Sentinel on all nodes — it is not used.
+	// For HA (TBD): push Sentinel config to the primary.
+	var sentinelTasks []taskRef
+	if cluster.Mode == "active_standby" {
+		for _, node := range nodes {
+			dispatchStopSentinel(dispatch, node)
+		}
+	} else {
+		sentinelTasks = []taskRef{dispatchSentinelForNode(dispatch, *primaryNode)}
+	}
 
 	// For app_tier_always_available clusters, pre-set DATABASE.HOST on every node.
 	// RestartAfter=false here — the config push below restarts netbox/netbox-rq.
@@ -1525,7 +1562,11 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 
 			for _, node := range replicas {
 				dispatchPatroniForNode(bgDispatch, node)
-				dispatchSentinelForNode(bgDispatch, node)
+				if cluster.Mode == "active_standby" {
+					dispatchStopSentinel(bgDispatch, node)
+				} else {
+					dispatchSentinelForNode(bgDispatch, node)
+				}
 				dispatchConfigForNode(bgCtx, bgDispatch, node)
 			}
 		}(replicaNodes, masterHost, restUser, restPass)

@@ -14,6 +14,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
@@ -615,6 +616,24 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 		}
 	}
 
+	// Determine Redis host for active/standby clusters.
+	// app_always_active=true  → point all nodes at the Patroni primary's Redis
+	// app_always_active=false → each node uses its own local Redis
+	// HA                      → local for now (TBD when HA Redis is designed)
+	var redisHost string
+	if cluster.Mode == "active_standby" {
+		if cluster.AppTierAlwaysAvailable {
+			for _, n := range allNodes {
+				if r := nodestate.ExtractPatroniRole(n.PatroniState); r == "primary" || r == "master" {
+					redisHost = stripCIDR(n.IPAddress)
+					break
+				}
+			}
+		}
+		// app_always_active=false: leave empty → defaults to 127.0.0.1 in Render()
+	}
+	// HA: leave empty → defaults to 127.0.0.1
+
 	var dbHost string
 	var allowedHosts []string
 
@@ -642,6 +661,7 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 		DBUser:               dbUser,
 		DBPassword:           dbPassword,
 		AllowedHosts:         allowedHosts,
+		RedisHost:            redisHost,
 		SentinelAddrs:        sentinelAddrs,
 		PatroniScope:         cluster.PatroniScope,
 		RedisTasksPassword:   redisTasksPw,

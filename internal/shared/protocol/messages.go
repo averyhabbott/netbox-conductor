@@ -31,6 +31,7 @@ type TaskType string
 const (
 	TaskWriteConfig       TaskType = "config.write"
 	TaskUpdateDBHost      TaskType = "config.update_db_host"
+	TaskUpdateRedisHost   TaskType = "config.update_redis_host"
 	TaskStartNetbox       TaskType = "service.start.netbox"
 	TaskStopNetbox        TaskType = "service.stop.netbox"
 	TaskRestartNetbox     TaskType = "service.restart.netbox"
@@ -223,6 +224,15 @@ type MediaRequestPayload struct {
 // nodes running in app_tier_always_available mode need to reconnect to the new primary.
 type DBHostUpdateParams struct {
 	Host         string `json:"host"`          // new DATABASE.HOST value (bare IP, no CIDR)
+	RestartAfter bool   `json:"restart_after"` // restart netbox+netbox-rq after patching
+}
+
+// RedisHostUpdateParams are the params for TaskUpdateRedisHost.
+// The agent patches the Redis HOST lines in the REDIS dict in configuration.py.
+// Used for active/standby clusters when the Patroni primary changes and
+// app_tier_always_available=true, so all app-tier nodes point to the new primary's Redis.
+type RedisHostUpdateParams struct {
+	Host         string `json:"host"`          // new Redis HOST value (bare IP, no CIDR)
 	RestartAfter bool   `json:"restart_after"` // restart netbox+netbox-rq after patching
 }
 
