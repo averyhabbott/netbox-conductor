@@ -115,6 +115,36 @@ else
   echo "  WARNING: no supported package manager found — install patroni, redis-sentinel, and pgbackrest manually"
 fi
 
+# ── Normalize Redis service name ─────────────────────────────────────────────
+# The conductor always references Redis as 'redis'. On Debian/Ubuntu the package
+# installs as 'redis-server.service'. Create a systemd alias so both distro
+# families work without code changes. Fails loudly if Redis is not installed.
+if systemctl list-unit-files redis.service &>/dev/null; then
+  : # already named correctly (RHEL/Fedora/CentOS)
+elif systemctl list-unit-files redis-server.service &>/dev/null; then
+  echo "→ Creating systemd alias: redis.service → redis-server.service"
+  ln -sf /lib/systemd/system/redis-server.service \
+         /etc/systemd/system/redis.service
+  systemctl daemon-reload
+else
+  echo ""
+  echo "ERROR: Redis is not installed or is not using a recognized service name."
+  echo "The conductor agent requires Redis to be installed and running as either"
+  echo "  redis.service        (RHEL/Fedora/CentOS)"
+  echo "  redis-server.service (Debian/Ubuntu)"
+  echo ""
+  echo "To resolve:"
+  echo "  1. Install Redis:  apt-get install redis-server   (Debian/Ubuntu)"
+  echo "                  or  dnf install redis              (RHEL/Fedora)"
+  echo "  2. If your Redis runs under a custom service name, create the alias"
+  echo "     manually before re-running this script:"
+  echo "       ln -sf /path/to/your-redis.service \\"
+  echo "              /etc/systemd/system/redis.service"
+  echo "       systemctl daemon-reload"
+  echo ""
+  exit 1
+fi
+
 # Disable the stock postgresql service so it does not restart on reboot.
 # Do NOT stop it here — Configure Failover dispatches postgres.create_role tasks
 # before starting Patroni, so roles are created against the still-running stock
@@ -193,6 +223,9 @@ systemctl daemon-reload 2>/dev/null || true
 # postgres group for local socket access when creating PostgreSQL roles.
 if getent group redis >/dev/null 2>&1; then
   usermod -aG redis netbox-agent
+  # Grant group-write on redis.conf so the agent can update the bind address
+  # directly (no sudo required). File is redis:redis; agent is in redis group.
+  chmod 660 /etc/redis/redis.conf 2>/dev/null || true
 fi
 if getent group postgres >/dev/null 2>&1; then
   usermod -aG postgres netbox-agent

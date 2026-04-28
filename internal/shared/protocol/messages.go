@@ -33,6 +33,7 @@ const (
 	TaskUpdateDBHost        TaskType = "config.update_db_host"
 	TaskUpdateRedisHost     TaskType = "config.update_redis_host"
 	TaskRedisSetRequirepass TaskType = "config.redis_requirepass"
+	TaskRedisBindAll        TaskType = "config.redis_bind_all"
 	TaskStartNetbox       TaskType = "service.start.netbox"
 	TaskStopNetbox        TaskType = "service.stop.netbox"
 	TaskRestartNetbox     TaskType = "service.restart.netbox"

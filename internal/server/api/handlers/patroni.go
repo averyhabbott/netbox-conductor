@@ -1408,6 +1408,20 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 
+	// dispatchRedisBind opens Redis to all interfaces by updating redis.conf and
+	// restarting the service. Only dispatched when app_tier_always_available=true,
+	// because that mode routes all nodes' NetBox to the primary's Redis IP — which
+	// requires the primary's Redis to accept remote connections.
+	// Must run before dispatchRedisRequirepass so the restart happens before the
+	// password is set (fresh restart leaves Redis unauthenticated, which is what
+	// dispatchRedisRequirepass expects on first run).
+	dispatchRedisBind := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) {
+		if _, err := d(node.ID, protocol.TaskRedisBindAll, []byte("{}"), 30); err != nil {
+			slog.Warn("configure-failover: redis-bind-all dispatch failed", "node", node.Hostname, "error", err)
+			warnings = append(warnings, fmt.Sprintf("redis-bind-all dispatch failed for %s: %v", node.Hostname, err))
+		}
+	}
+
 	// dispatchRedisRequirepass sets requirepass on Redis for a node and persists it.
 	// Called for every HC/app node after Sentinel is stopped and before configuration.py
 	// is pushed, so Redis and configuration.py are consistent when services start.
@@ -1484,6 +1498,9 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	if cluster.Mode == "active_standby" {
 		for _, node := range nodes {
 			dispatchStopSentinel(dispatch, node)
+			if req.AppTierAlwaysAvailable {
+				dispatchRedisBind(dispatch, node)
+			}
 			dispatchRedisRequirepass(dispatch, node)
 		}
 	} else {
@@ -1524,8 +1541,17 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 	if len(replicaNodes) > 0 {
 		go func(replicas []queries.Node, primaryIP, restU, restP string) {
-			bgCtx := context.Background()
+			// Overall backstop: derived from poll ceilings (90s + 65s) plus buffer.
+			// Individual HTTP requests use patroniClient (10s timeout) so hung
+			// Patroni servers cannot block the goroutine indefinitely.
+			bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer bgCancel()
+
 			bgDispatch := mkDispatch(bgCtx)
+
+			// Per-request HTTP client with a short timeout so a hung Patroni server
+			// cannot stall the goroutine even when the deadline timer is running.
+			patroniClient := &http.Client{Timeout: 10 * time.Second}
 
 			// Poll GET /primary — returns 200 when this node is the Patroni leader.
 			deadline := time.Now().Add(90 * time.Second)
@@ -1534,7 +1560,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				req, err := http.NewRequestWithContext(bgCtx, http.MethodGet, url, nil)
 				if err == nil {
 					req.SetBasicAuth(restU, restP)
-					resp, err := http.DefaultClient.Do(req)
+					resp, err := patroniClient.Do(req)
 					if err == nil {
 						resp.Body.Close()
 						if resp.StatusCode == http.StatusOK {
@@ -1543,6 +1569,18 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					}
 				}
 				time.Sleep(5 * time.Second)
+			}
+
+			if bgCtx.Err() != nil {
+				slog.Error("configure-failover: background goroutine timed out waiting for primary election",
+					"cluster", clusterID, "primary", primaryIP)
+				h.emitter.Emit(events.New(events.CategoryHA, events.SeverityError,
+					"NBC-HA-REPLICA-CONFIGURE-TIMEOUT",
+					"replica Patroni configuration timed out waiting for primary election — replicas may need manual intervention",
+					events.ActorSystem).
+					Cluster(clusterID).
+					Build())
+				return
 			}
 
 			// Apply any pending PostgreSQL config changes (e.g. listen_addresses,
@@ -1555,7 +1593,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			if err == nil {
 				restartReq.Header.Set("Content-Type", "application/json")
 				restartReq.SetBasicAuth(restU, restP)
-				if restartResp, err := http.DefaultClient.Do(restartReq); err == nil {
+				if restartResp, err := patroniClient.Do(restartReq); err == nil {
 					restartResp.Body.Close()
 					// Give PostgreSQL time to stop then start, then wait for primary to be ready.
 					time.Sleep(5 * time.Second)
@@ -1565,7 +1603,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 							fmt.Sprintf("http://%s:8008/primary", primaryIP), nil)
 						if pollReq != nil {
 							pollReq.SetBasicAuth(restU, restP)
-							if pollResp, err := http.DefaultClient.Do(pollReq); err == nil {
+							if pollResp, err := patroniClient.Do(pollReq); err == nil {
 								pollResp.Body.Close()
 								if pollResp.StatusCode == http.StatusOK {
 									break
@@ -1581,6 +1619,9 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				dispatchPatroniForNode(bgDispatch, node)
 				if cluster.Mode == "active_standby" {
 					dispatchStopSentinel(bgDispatch, node)
+					if req.AppTierAlwaysAvailable {
+						dispatchRedisBind(bgDispatch, node)
+					}
 					dispatchRedisRequirepass(bgDispatch, node)
 				} else {
 					dispatchSentinelForNode(bgDispatch, node)

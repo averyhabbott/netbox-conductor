@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
+	"github.com/jackc/pgx/v5"
 )
 
 // CreatePgRole creates (or updates the password of) a PostgreSQL role.
@@ -22,6 +23,14 @@ func CreatePgRole(params protocol.CreatePgRoleParams) (string, error) {
 	}
 
 	opts := strings.Join(params.Options, " ")
+
+	// Safe quoting: pgx.Identifier.Sanitize() double-quotes the role name for use
+	// in DDL (CREATE/ALTER ROLE). strings.ReplaceAll escapes single quotes in the
+	// name and password for use in string literals, preventing SQL injection.
+	quotedName  := pgx.Identifier{params.RoleName}.Sanitize()
+	escapedName := strings.ReplaceAll(params.RoleName, "'", "''")
+	escapedPass := strings.ReplaceAll(params.Password, "'", "''")
+
 	// Idempotent: create if absent, otherwise update the password so re-running
 	// configure-failover always leaves the role in the correct state.
 	sql := fmt.Sprintf(`DO $$ BEGIN
@@ -31,9 +40,9 @@ func CreatePgRole(params protocol.CreatePgRoleParams) (string, error) {
     ALTER ROLE %s WITH %s PASSWORD '%s';
   END IF;
 END $$;`,
-		params.RoleName,
-		params.RoleName, opts, params.Password,
-		params.RoleName, opts, params.Password)
+		escapedName,
+		quotedName, opts, escapedPass,
+		quotedName, opts, escapedPass)
 
 	deadline := time.Now().Add(120 * time.Second)
 	for {
