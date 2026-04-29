@@ -94,16 +94,39 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 }
 
 // queryRedisRole calls the local redis-cli and returns "master", "slave", or "".
+// If Redis has requirepass set, the password is read from redis.conf and passed to
+// redis-cli so that the ROLE command succeeds after ConfigureFailover sets auth.
 func queryRedisRole() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "redis-cli", "-p", "6379", "ROLE").Output()
+	args := []string{"-p", "6379"}
+	if pass := redisPassword(); pass != "" {
+		args = append(args, "--no-auth-warning", "-a", pass)
+	}
+	args = append(args, "ROLE")
+	out, err := exec.CommandContext(ctx, "redis-cli", args...).Output()
 	if err != nil {
 		return ""
 	}
 	parts := strings.Fields(string(out))
 	if len(parts) > 0 {
 		return strings.ToLower(parts[0])
+	}
+	return ""
+}
+
+// redisPassword reads the requirepass value from redis.conf, returning "" if not set.
+// The agent is in the redis group and redis.conf is group-readable (640).
+func redisPassword() string {
+	data, err := os.ReadFile("/etc/redis/redis.conf")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "requirepass ") {
+			return strings.TrimPrefix(line, "requirepass ")
+		}
 	}
 	return ""
 }

@@ -291,7 +291,7 @@ func (h *ConfigHandler) Push(c echo.Context) error {
 			Content:        finalContent,
 			Sha256:         sha256hex,
 			BackupExisting: true,
-			RestartAfter:   req.RestartAfter,
+			RestartAfter:   req.RestartAfter && node.NetboxRunning != nil && *node.NetboxRunning,
 		})
 
 		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskWriteConfig), params)

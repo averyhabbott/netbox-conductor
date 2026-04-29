@@ -1511,17 +1511,16 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// The agent serializes tasks in a queue, so each step completes before the next begins.
 	patroniTasks := dispatchPatroniForNode(dispatch, *primaryNode)
 
-	// For active/standby: stop and disable Sentinel on all nodes — it is not used.
+	// For active/standby: stop and disable Sentinel on the primary only — replicas
+	// receive these tasks from the background goroutine after Patroni is running.
 	// For HA (TBD): push Sentinel config to the primary.
-	var sentinelTasks []taskRef
+	sentinelTasks := make([]taskRef, 0)
 	if cluster.Mode == "active_standby" {
-		for _, node := range nodes {
-			dispatchStopSentinel(dispatch, node)
-			if req.AppTierAlwaysAvailable {
-				dispatchRedisBind(dispatch, node)
-			}
-			dispatchRedisRequirepass(dispatch, node)
+		dispatchStopSentinel(dispatch, *primaryNode)
+		if req.AppTierAlwaysAvailable {
+			dispatchRedisBind(dispatch, *primaryNode)
 		}
+		dispatchRedisRequirepass(dispatch, *primaryNode)
 	} else {
 		sentinelTasks = []taskRef{dispatchSentinelForNode(dispatch, *primaryNode)}
 	}
@@ -1543,7 +1542,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 
 	// Push full configuration.py to the primary.
-	var configTasks []taskRef
+	configTasks := make([]taskRef, 0)
 	if cfgFetchErr == nil {
 		configTasks = []taskRef{dispatchConfigForNode(ctx, dispatch, *primaryNode, true)}
 	}
