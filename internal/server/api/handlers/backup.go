@@ -1024,7 +1024,7 @@ func renderPGBackRestConf(stanza string, targets []queries.BackupTarget, enc *cr
 }
 
 // bindCreateTarget parses a create-target request body and encrypts credentials.
-func (h *BackupHandler) bindCreateTarget(ctx context.Context, c echo.Context, clusterID uuid.UUID) (*queries.CreateBackupTargetParams, error) {
+func (h *BackupHandler) bindCreateTarget(_ context.Context, c echo.Context, clusterID uuid.UUID) (*queries.CreateBackupTargetParams, error) {
 	var req backupTargetRequest
 	if err := c.Bind(&req); err != nil || req.Label == "" || req.TargetType == "" {
 		return nil, echo.NewHTTPError(http.StatusBadRequest, "label and target_type are required")
@@ -1048,7 +1048,7 @@ func (h *BackupHandler) bindCreateTarget(ctx context.Context, c echo.Context, cl
 }
 
 // bindUpdateTarget parses an update-target request body and encrypts credentials.
-func (h *BackupHandler) bindUpdateTarget(ctx context.Context, c echo.Context, existing *queries.BackupTarget) (*queries.UpdateBackupTargetParams, error) {
+func (h *BackupHandler) bindUpdateTarget(_ context.Context, c echo.Context, existing *queries.BackupTarget) (*queries.UpdateBackupTargetParams, error) {
 	var req backupTargetRequest
 	if err := c.Bind(&req); err != nil {
 		return nil, echo.NewHTTPError(http.StatusBadRequest, "invalid request body")

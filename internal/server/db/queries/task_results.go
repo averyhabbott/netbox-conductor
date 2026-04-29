@@ -110,15 +110,16 @@ func (q *TaskResultQuerier) ListByNode(ctx context.Context, nodeID uuid.UUID, li
 	return results, rows.Err()
 }
 
-// TimeoutStale marks tasks that have been stuck in "sent" or "ack" status longer
-// than the given durations as "timeout". Returns the number of rows affected.
-func (q *TaskResultQuerier) TimeoutStale(ctx context.Context, sentTimeout, ackTimeout time.Duration) (int64, error) {
+// TimeoutStale marks tasks that have been stuck in "sent", "ack", or "queued"
+// status longer than the given durations as "timeout". Returns the number of rows affected.
+func (q *TaskResultQuerier) TimeoutStale(ctx context.Context, sentTimeout, ackTimeout, queuedTimeout time.Duration) (int64, error) {
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE task_results
 		SET status = 'timeout', completed_at = now()
-		WHERE (status = 'sent' AND queued_at < now() - $1::interval)
-		   OR (status = 'ack'  AND queued_at < now() - $2::interval)`,
-		sentTimeout.String(), ackTimeout.String())
+		WHERE (status = 'sent'   AND queued_at < now() - $1::interval)
+		   OR (status = 'ack'    AND queued_at < now() - $2::interval)
+		   OR (status = 'queued' AND queued_at < now() - $3::interval)`,
+		sentTimeout.String(), ackTimeout.String(), queuedTimeout.String())
 	if err != nil {
 		return 0, err
 	}

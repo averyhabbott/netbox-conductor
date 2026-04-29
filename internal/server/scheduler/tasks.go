@@ -14,6 +14,10 @@ const (
 	SentTimeout = 5 * time.Minute
 	// AckTimeout is how long a task can stay in "ack" (no result) before timing out.
 	AckTimeout = 10 * time.Minute
+	// QueuedTimeout is how long a task can stay in "queued" before timing out.
+	// Queued tasks are normally delivered when a node reconnects; this threshold
+	// reaps tasks that were stranded because the target agent never disconnected.
+	QueuedTimeout = 30 * time.Minute
 
 	sweepInterval = time.Minute
 )
@@ -37,7 +41,7 @@ func (s *TaskSweeper) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			n, err := s.tasks.TimeoutStale(ctx, SentTimeout, AckTimeout)
+			n, err := s.tasks.TimeoutStale(ctx, SentTimeout, AckTimeout, QueuedTimeout)
 			if err != nil {
 				slog.Warn("task sweeper error", "error", err)
 				continue
@@ -45,7 +49,8 @@ func (s *TaskSweeper) Run(ctx context.Context) {
 			if n > 0 {
 				slog.Info("timed out stale tasks", "count", n,
 					"sent_timeout", SentTimeout.String(),
-					"ack_timeout", AckTimeout.String())
+					"ack_timeout", AckTimeout.String(),
+					"queued_timeout", QueuedTimeout.String())
 			}
 		}
 	}

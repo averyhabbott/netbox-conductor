@@ -324,6 +324,25 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 		return
 	}
 
+	// If a higher-priority connected node is already running NetBox, the "failed"
+	// node was the standby — the stop was intentional (conductor-dispatched).
+	standbyNodes, listErr := m.nodes.ListByCluster(ctx, clusterID)
+	if listErr == nil {
+		for i := range standbyNodes {
+			n := &standbyNodes[i]
+			if n.ID == failedNodeID {
+				continue
+			}
+			if n.FailoverPriority > failedNode.FailoverPriority &&
+				m.h.IsConnected(n.ID) &&
+				n.NetboxRunning != nil && *n.NetboxRunning {
+				slog.Debug("failover: higher-priority node already running NetBox — failed node was standby, skipping",
+					"failed_node", failedNode.Hostname, "active_node", n.Hostname)
+				return
+			}
+		}
+	}
+
 	candidate, err := m.bestCandidate(ctx, clusterID, failedNodeID)
 	if err != nil {
 		slog.Warn("failover: error selecting candidate", "cluster", clusterID, "error", err)
@@ -1071,6 +1090,51 @@ func (m *Manager) dispatchServiceTask(ctx context.Context, node *queries.Node, t
 	}
 	_ = m.tasks.SetSent(ctx, taskID)
 	return nil
+}
+
+// CheckTopology inspects the current Patroni leader against node priorities and
+// triggers a switchover if a higher-priority connected node is not already primary.
+// Call this after ConfigureFailover confirms the primary election to catch the case
+// where a lower-priority node won the race due to a startup timing issue.
+func (m *Manager) CheckTopology(clusterID uuid.UUID) {
+	ctx := context.Background()
+	cluster, err := m.clusters.GetByID(ctx, clusterID)
+	if err != nil || !cluster.PatroniConfigured || cluster.Mode != "active_standby" {
+		return
+	}
+	nodes, err := m.nodes.ListByCluster(ctx, clusterID)
+	if err != nil || len(nodes) == 0 {
+		return
+	}
+	// Find current Patroni leader and highest-priority connected node.
+	var currentLeader, highestPriority *queries.Node
+	for i := range nodes {
+		n := &nodes[i]
+		role := nodestate.ExtractPatroniRole(n.PatroniState)
+		if role == "primary" || role == "master" {
+			currentLeader = n
+		}
+		if !m.h.IsConnected(n.ID) {
+			continue
+		}
+		if highestPriority == nil || n.FailoverPriority > highestPriority.FailoverPriority {
+			highestPriority = n
+		}
+	}
+	if currentLeader == nil || highestPriority == nil {
+		return
+	}
+	if currentLeader.ID == highestPriority.ID {
+		return // already optimal
+	}
+	slog.Info("failover: topology check found suboptimal leader — triggering switchover",
+		"current_leader", currentLeader.Hostname,
+		"preferred_leader", highestPriority.Hostname,
+		"cluster", clusterID)
+	_, err = m.triggerPatroniSwitchover(ctx, cluster, highestPriority, nodes, currentLeader.ID)
+	if err != nil {
+		slog.Warn("failover: topology-check switchover failed", "cluster", clusterID, "error", err)
+	}
 }
 
 // enqueueForReconnect writes a task to the DB in "queued" state without

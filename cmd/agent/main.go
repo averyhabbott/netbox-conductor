@@ -395,6 +395,16 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskStopPostgresql:
+		cmd := exec.Command("sudo", "systemctl", "stop", "postgresql")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
 	case protocol.TaskRestartPatroni:
 		// patroni is enabled at agent install time (install.sh), not here.
 		cmd := exec.Command("sudo", "systemctl", "restart", "patroni")

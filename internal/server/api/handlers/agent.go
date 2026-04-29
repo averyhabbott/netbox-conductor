@@ -530,7 +530,7 @@ func (h *AgentHandler) readPump(ctx context.Context, sess *hub.Session, conn *we
 
 // readPumpStaging reads inbound messages from a staging (unassigned) agent.
 // Only heartbeats are meaningful here; task messages are silently ignored.
-func (h *AgentHandler) readPumpStaging(ctx context.Context, sess *hub.Session, conn *websocket.Conn, agentLog *logging.AgentLog) {
+func (h *AgentHandler) readPumpStaging(ctx context.Context, sess *hub.Session, conn *websocket.Conn, _ *logging.AgentLog) {
 	for {
 		var env protocol.Envelope
 		if err := wsjson.Read(ctx, conn, &env); err != nil {
@@ -679,7 +679,7 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 	})
 }
 
-func (h *AgentHandler) handlePatroniState(ctx context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+func (h *AgentHandler) handlePatroniState(_ context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
 	var ps protocol.PatroniStatePayload
 	if err := json.Unmarshal(env.Payload, &ps); err != nil {
 		return
@@ -704,7 +704,7 @@ func (h *AgentHandler) handlePatroniState(ctx context.Context, sess *hub.Session
 	}
 }
 
-func (h *AgentHandler) handleServiceStateChange(ctx context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+func (h *AgentHandler) handleServiceStateChange(_ context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
 	var p protocol.ServiceStateChangePayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return
@@ -831,7 +831,7 @@ func (h *AgentHandler) dispatchDBHostUpdate(ctx context.Context, newPrimaryNodeI
 	}
 }
 
-func (h *AgentHandler) handleTaskAck(ctx context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+func (h *AgentHandler) handleTaskAck(ctx context.Context, _ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
 	var ack protocol.TaskAckPayload
 	if err := json.Unmarshal(env.Payload, &ack); err != nil {
 		return
@@ -894,7 +894,7 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 
 // handleMediaChunk receives a chunk from the source agent and:
 //  1. Writes it into the relay pipe so the relay goroutine forwards it to the target.
-func (h *AgentHandler) handleMediaChunk(ctx context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+func (h *AgentHandler) handleMediaChunk(_ context.Context, _ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
 	var chunk protocol.MediaChunkPayload
 	if err := json.Unmarshal(env.Payload, &chunk); err != nil {
 		logger.Warn("malformed media.chunk", "error", err)
@@ -949,7 +949,7 @@ func (h *AgentHandler) handleNetboxLog(_ context.Context, sess *hub.Session, env
 
 // handleMediaChunkAck receives a backpressure ack from the target agent.
 // Currently just logged; future: signal source agent to pace sends.
-func (h *AgentHandler) handleMediaChunkAck(_ context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
+func (h *AgentHandler) handleMediaChunkAck(_ context.Context, _ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
 	var ack protocol.MediaChunkAckPayload
 	if err := json.Unmarshal(env.Payload, &ack); err != nil {
 		return

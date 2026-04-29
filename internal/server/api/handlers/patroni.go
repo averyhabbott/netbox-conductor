@@ -22,6 +22,11 @@ import (
 )
 
 // PatroniHandler handles Patroni topology queries and config push.
+// PatroniFailoverManager is the subset of failover.Manager used by PatroniHandler.
+type PatroniFailoverManager interface {
+	CheckTopology(clusterID uuid.UUID)
+}
+
 type PatroniHandler struct {
 	clusters       *queries.ClusterQuerier
 	nodes          *queries.NodeQuerier
@@ -34,9 +39,12 @@ type PatroniHandler struct {
 	dispatcher     *hub.Dispatcher
 	witness        *patroni.WitnessManager
 	emitter        events.Emitter
+	failoverMgr    PatroniFailoverManager // optional; wired in after construction
 }
 
 func (h *PatroniHandler) SetEmitter(e events.Emitter) { h.emitter = e }
+
+func (h *PatroniHandler) SetFailoverManager(fm PatroniFailoverManager) { h.failoverMgr = fm }
 
 func NewPatroniHandler(
 	clusters *queries.ClusterQuerier,
@@ -213,6 +221,7 @@ func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
 			DBSuperPass:   superPass,
 			DBReplicaUser: replicaUser,
 			DBReplicaPass: replicaPass,
+			Priority:      node.FailoverPriority,
 		})
 		if err != nil {
 			results = append(results, nodeResult{
@@ -252,7 +261,7 @@ func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodePatroniConfigured,
-			fmt.Sprintf("Patroni config pushed to cluster"), actorFromCtx(c)).Cluster(clusterID).Build())
+			"Patroni config pushed to cluster", actorFromCtx(c)).Cluster(clusterID).Build())
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
@@ -1336,10 +1345,19 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		warnings = append(warnings, "no configuration template found — credentials saved but configuration.py not pushed; use Config Editor or Sync Config to apply")
 	}
 
-	// dispatchPatroniForNode renders and dispatches install→write_config→restart for one node.
+	// dispatchPatroniForNode renders and dispatches stop_postgresql→install→write_config→restart for one node.
 	dispatchPatroniForNode := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) []taskRef {
-		refs := make([]taskRef, 0, 3)
+		refs := make([]taskRef, 0, 4)
 		nodeIP := stripCIDR(node.IPAddress)
+
+		// Stop the systemd-managed postgres before Patroni takes over. Without this,
+		// Patroni can't start its own postgres process because the old one holds shared memory.
+		if tid, err := d(node.ID, protocol.TaskStopPostgresql, []byte("{}"), 30); err != nil {
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: "stop-postgresql: " + err.Error()})
+			return refs
+		} else {
+			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"})
+		}
 
 		installParams, _ := json.Marshal(protocol.PatroniInstallParams{})
 		tid, err := d(node.ID, protocol.TaskInstallPatroni, installParams, 300)
@@ -1368,6 +1386,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			DBSuperPass:   superPass,
 			DBReplicaUser: replicaUser,
 			DBReplicaPass: replicaPass,
+			Priority:      node.FailoverPriority,
 		})
 		if err != nil {
 			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()})
@@ -1455,7 +1474,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// For active/standby clusters it migrates legacy Sentinel templates to the
 	// HOST/PORT Redis format and sets RedisHost to the primary's IP (when
 	// app_tier_always_available=true) or 127.0.0.1 (when false).
-	dispatchConfigForNode := func(useCtx context.Context, d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) taskRef {
+	dispatchConfigForNode := func(useCtx context.Context, d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node, restartAfter bool) taskRef {
 		if cfgFetchErr != nil {
 			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "skipped", Error: "no config template"}
 		}
@@ -1479,7 +1498,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		if err != nil {
 			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()}
 		}
-		cfgParams, _ := json.Marshal(protocol.ConfigWriteParams{Content: content, Sha256: sha256hex, BackupExisting: true, RestartAfter: true})
+		cfgParams, _ := json.Marshal(protocol.ConfigWriteParams{Content: content, Sha256: sha256hex, BackupExisting: true, RestartAfter: restartAfter})
 		if tid, err := d(node.ID, protocol.TaskWriteConfig, cfgParams, 60); err != nil {
 			return taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "offline", Error: err.Error()}
 		} else {
@@ -1526,7 +1545,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// Push full configuration.py to the primary.
 	var configTasks []taskRef
 	if cfgFetchErr == nil {
-		configTasks = []taskRef{dispatchConfigForNode(ctx, dispatch, *primaryNode)}
+		configTasks = []taskRef{dispatchConfigForNode(ctx, dispatch, *primaryNode, true)}
 	}
 
 	// Phase 2 (background): Once the primary is confirmed as Patroni leader via its
@@ -1562,8 +1581,12 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					req.SetBasicAuth(restU, restP)
 					resp, err := patroniClient.Do(req)
 					if err == nil {
+						var patroniState struct {
+							State string `json:"state"`
+						}
+						_ = json.NewDecoder(resp.Body).Decode(&patroniState)
 						resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
+						if resp.StatusCode == http.StatusOK && patroniState.State == "running" {
 							break
 						}
 					}
@@ -1581,6 +1604,11 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					Cluster(clusterID).
 					Build())
 				return
+			}
+
+			// Correct any leader mismatch (e.g. wrong node won the initial race).
+			if h.failoverMgr != nil {
+				go h.failoverMgr.CheckTopology(clusterID)
 			}
 
 			// Apply any pending PostgreSQL config changes (e.g. listen_addresses,
@@ -1626,7 +1654,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				} else {
 					dispatchSentinelForNode(bgDispatch, node)
 				}
-				dispatchConfigForNode(bgCtx, bgDispatch, node)
+				dispatchConfigForNode(bgCtx, bgDispatch, node, req.AppTierAlwaysAvailable)
 			}
 		}(replicaNodes, masterHost, restUser, restPass)
 	}

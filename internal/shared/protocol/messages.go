@@ -38,6 +38,7 @@ const (
 	TaskStopNetbox        TaskType = "service.stop.netbox"
 	TaskRestartNetbox     TaskType = "service.restart.netbox"
 	TaskRestartRQ         TaskType = "service.restart.rq"
+	TaskStopPostgresql    TaskType = "service.stop.postgresql"
 	TaskInstallPatroni    TaskType = "patroni.install"
 	TaskCreatePgRole      TaskType = "postgres.create_role"
 	TaskWritePatroniConf  TaskType = "patroni.write_config"

@@ -249,6 +249,7 @@ func run(ctx context.Context) error {
 	configHandler.SetEmitter(emitter)
 	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, enc, dispatcher, witnessManager)
 	patroniHandler.SetEmitter(emitter)
+	patroniHandler.SetFailoverManager(failoverManager)
 	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, enc, dispatcher, h, credQ, witnessManager)
 	backupHandler.SetEmitter(emitter)
 	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, backupTargetQ, dispatcher, backupSyncMgr)
