@@ -42,6 +42,8 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
   const [resolving, setResolving] = useState(false)
   const [resolveError, setResolveError] = useState('')
 
+  const hostnameInvalid = form.hostname.length > 0 && /[^a-zA-Z0-9.\-]/.test(form.hostname)
+
   const resolveHostname = async () => {
     if (!form.hostname) return
     setResolving(true)
@@ -162,12 +164,15 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
                   <label className="block text-xs text-gray-400 mb-1">Hostname</label>
                   <input
                     autoFocus
-                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+                    className={`w-full bg-gray-800 border ${hostnameInvalid ? 'border-red-500' : 'border-gray-700'} rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500`}
                     placeholder="netbox.example.com"
                     value={form.hostname}
                     onChange={(e) => { setForm({ ...form, hostname: e.target.value }); setResolveError('') }}
                     required
                   />
+                  {hostnameInvalid && (
+                    <p className="text-xs text-red-400 mt-1">Only letters, digits, hyphens, and dots allowed</p>
+                  )}
                 </div>
                 <button
                   type="button"
@@ -236,7 +241,7 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
               <div className="flex gap-3 pt-2">
                 <button
                   type="submit"
-                  disabled={createNode.isPending}
+                  disabled={createNode.isPending || hostnameInvalid}
                   className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-medium transition-colors"
                 >
                   {createNode.isPending ? 'Creating…' : 'Create Node →'}

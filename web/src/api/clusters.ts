@@ -207,6 +207,13 @@ export interface BackupTaskRef {
   error?: string
 }
 
+export interface NodeTestResult {
+  node_id: string
+  hostname: string
+  task_id: string      // "" when skipped
+  skip_reason: string  // "" | "offline" | "maintenance"
+}
+
 export interface CreateBackupTargetBody {
   label: string
   target_type: BackupTargetType
@@ -347,7 +354,7 @@ export const clustersApi = {
 
   testBackupPath: (id: string, path: string) =>
     client
-      .post<{ task_id: string; node_id: string; hostname: string }>(`/clusters/${id}/backup-path/test`, { path })
+      .post<NodeTestResult[]>(`/clusters/${id}/backup-path/test`, { path })
       .then((r) => r.data),
 
   getTask: (taskId: string) =>

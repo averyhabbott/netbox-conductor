@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"strings"
@@ -464,21 +465,72 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		go func() {
 			bgCtx := context.Background()
 
-			// Poll DB until all Patroni restart tasks reach a terminal state.
+			// 1. Wait for all Patroni restart tasks to reach a terminal state.
 			for _, tid := range capturedPatroniIDs {
 				if ok := pollTaskSuccess(bgCtx, h.taskResults, tid, 5*time.Minute); !ok {
+					slog.Warn("enable-backups: Patroni restart task did not succeed", "task_id", tid)
 					return
 				}
 			}
 
-			// Now dispatch stanza-create to the primary.
+			// 2. Poll heartbeat data until the cluster reports a stable primary.
+			//    Heartbeat interval is 3s; poll every 5s to allow Patroni to
+			//    finish its election before we read the result.
+			var currentPrimary *queries.Node
+			deadline := time.Now().Add(2 * time.Minute)
+			for time.Now().Before(deadline) {
+				if fresh, err := h.nodes.ListByCluster(bgCtx, clusterID); err == nil {
+					if p := primaryDBNode(fresh); p != nil {
+						currentPrimary = p
+						break
+					}
+				}
+				time.Sleep(5 * time.Second)
+			}
+			if currentPrimary == nil {
+				slog.Warn("enable-backups: no Patroni primary found after restart, falling back to original",
+					"original", capturedPrimary.Hostname)
+				currentPrimary = capturedPrimary
+			}
+
+			// 3. Switchover to the intended primary if leadership drifted.
+			//    Intended = highest-priority connected DB node.
+			if fresh, err := h.nodes.ListByCluster(bgCtx, clusterID); err == nil {
+				if intended := intendedPrimaryNode(fresh); intended != nil && intended.ID != currentPrimary.ID {
+					slog.Info("enable-backups: primary drifted after restart, initiating switchover",
+						"current", currentPrimary.Hostname, "intended", intended.Hostname)
+					switchParams, _ := json.Marshal(protocol.PatroniSwitchoverParams{Candidate: intended.Hostname})
+					switchTaskID := uuid.New()
+					_ = h.taskResults.Create(bgCtx, currentPrimary.ID, switchTaskID,
+						string(protocol.TaskPatroniSwitchover), switchParams)
+					if dispErr := h.dispatcher.Dispatch(currentPrimary.ID, protocol.TaskDispatchPayload{
+						TaskID:      switchTaskID.String(),
+						TaskType:    protocol.TaskPatroniSwitchover,
+						Params:      json.RawMessage(switchParams),
+						TimeoutSecs: 60,
+					}); dispErr == nil {
+						_ = h.taskResults.SetSent(bgCtx, switchTaskID)
+						if ok := pollTaskSuccess(bgCtx, h.taskResults, switchTaskID, 2*time.Minute); ok {
+							currentPrimary = intended
+							slog.Info("enable-backups: switchover complete", "primary", currentPrimary.Hostname)
+						} else {
+							slog.Warn("enable-backups: switchover did not complete, proceeding with current primary",
+								"current", currentPrimary.Hostname)
+						}
+					}
+				}
+			}
+
+			// 4. Dispatch stanza-create to the confirmed primary.
 			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
-			if dispErr := h.dispatcher.Dispatch(capturedPrimary.ID, protocol.TaskDispatchPayload{
+			if dispErr := h.dispatcher.Dispatch(currentPrimary.ID, protocol.TaskDispatchPayload{
 				TaskID:      capturedStanzaID.String(),
 				TaskType:    protocol.TaskPGBackRestStanzaCreate,
 				Params:      json.RawMessage(stanzaParams),
 				TimeoutSecs: 120,
 			}); dispErr != nil {
+				slog.Warn("enable-backups: stanza-create dispatch failed",
+					"node", currentPrimary.Hostname, "error", dispErr)
 				return
 			}
 			_ = h.taskResults.SetSent(bgCtx, capturedStanzaID)
@@ -840,7 +892,15 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	})
 }
 
-// TestBackupPath dispatches a write test against a local disk path on the primary node.
+type nodeTestResult struct {
+	NodeID     string `json:"node_id"`
+	Hostname   string `json:"hostname"`
+	TaskID     string `json:"task_id"`     // "" when skipped
+	SkipReason string `json:"skip_reason"` // "" | "offline" | "maintenance"
+}
+
+// TestBackupPath dispatches a write test to all DB/HC nodes in the cluster.
+// Disconnected and maintenance-mode nodes are returned as skipped immediately.
 // POST /api/v1/clusters/:id/backup-path/test
 func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
@@ -859,29 +919,54 @@ func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
-	node := primaryDBNode(nodes)
-	if node == nil {
-		return echo.NewHTTPError(http.StatusConflict, "no connected node available to run the test")
-	}
 
 	params, _ := json.Marshal(protocol.PGBackRestTestPathParams{Path: req.Path})
-	taskID := uuid.New()
-	_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskPGBackRestTestPath), params)
-	if dispErr := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskPGBackRestTestPath,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 15,
-	}); dispErr != nil {
-		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+dispErr.Error())
-	}
-	_ = h.taskResults.SetSent(ctx, taskID)
+	results := make([]nodeTestResult, 0)
 
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"task_id":  taskID.String(),
-		"node_id":  node.ID.String(),
-		"hostname": node.Hostname,
-	})
+	for _, node := range nodes {
+		if node.Role != "db_only" && node.Role != "hyperconverged" {
+			continue
+		}
+		if node.MaintenanceMode {
+			results = append(results, nodeTestResult{
+				NodeID:     node.ID.String(),
+				Hostname:   node.Hostname,
+				SkipReason: "maintenance",
+			})
+			continue
+		}
+		if node.AgentStatus != "connected" {
+			results = append(results, nodeTestResult{
+				NodeID:     node.ID.String(),
+				Hostname:   node.Hostname,
+				SkipReason: "offline",
+			})
+			continue
+		}
+		taskID := uuid.New()
+		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskPGBackRestTestPath), params)
+		if dispErr := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
+			TaskID:      taskID.String(),
+			TaskType:    protocol.TaskPGBackRestTestPath,
+			Params:      json.RawMessage(params),
+			TimeoutSecs: 15,
+		}); dispErr != nil {
+			results = append(results, nodeTestResult{
+				NodeID:     node.ID.String(),
+				Hostname:   node.Hostname,
+				SkipReason: "offline",
+			})
+			continue
+		}
+		_ = h.taskResults.SetSent(ctx, taskID)
+		results = append(results, nodeTestResult{
+			NodeID:   node.ID.String(),
+			Hostname: node.Hostname,
+			TaskID:   taskID.String(),
+		})
+	}
+
+	return c.JSON(http.StatusAccepted, results)
 }
 
 // GetBackupRuns returns backup run history for a cluster.
@@ -913,6 +998,25 @@ func dbRoleNodes(nodes []queries.Node) []queries.Node {
 		}
 	}
 	return out
+}
+
+// intendedPrimaryNode returns the connected DB node with the highest failover
+// priority — the node that should be Patroni leader after a stable restart.
+func intendedPrimaryNode(nodes []queries.Node) *queries.Node {
+	var best *queries.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if n.Role != "hyperconverged" && n.Role != "db_only" {
+			continue
+		}
+		if n.AgentStatus != "connected" {
+			continue
+		}
+		if best == nil || n.FailoverPriority > best.FailoverPriority {
+			best = n
+		}
+	}
+	return best
 }
 
 func primaryDBNode(nodes []queries.Node) *queries.Node {

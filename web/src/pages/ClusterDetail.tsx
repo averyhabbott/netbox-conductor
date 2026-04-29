@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
-import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, BackupTarget, BackupTargetType, CreateBackupTargetBody } from '../api/clusters'
+import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, BackupTarget, BackupTargetType, CreateBackupTargetBody, NodeTestResult } from '../api/clusters'
 import { nodesApi } from '../api/nodes'
 import type { Node, EditNodeBody } from '../api/nodes'
 import { credentialsApi, credentialLabels, secretOnlyKinds } from '../api/credentials'
@@ -133,6 +133,8 @@ function EditNodeModal({
     },
   })
 
+  const hostnameInvalid = (form.hostname ?? '').length > 0 && /[^a-zA-Z0-9.\-]/.test(form.hostname ?? '')
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
@@ -167,11 +169,14 @@ function EditNodeModal({
             <label className={labelCls}>Hostname</label>
             <input
               autoFocus
-              className={inputCls}
+              className={`${inputCls} ${hostnameInvalid ? '!border-red-500' : ''}`}
               value={form.hostname ?? ''}
               onChange={(e) => setForm((f) => ({ ...f, hostname: e.target.value }))}
               required
             />
+            {hostnameInvalid && (
+              <p className="text-xs text-red-400 mt-1">Only letters, digits, hyphens, and dots allowed</p>
+            )}
           </div>
 
           <div>
@@ -224,7 +229,7 @@ function EditNodeModal({
             </button>
             <button
               type="submit"
-              disabled={save.isPending}
+              disabled={save.isPending || hostnameInvalid}
               className="text-sm px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg transition-colors"
             >
               {save.isPending ? 'Saving…' : 'Save'}
@@ -2392,22 +2397,14 @@ function AddStorageModal({
   const [syncToNodes, setSyncToNodes] = useState<string[]>(existing?.sync_to_nodes ?? [])
   const [error, setError] = useState('')
 
-  const [testStatus, setTestStatus] = useState<'idle' | 'running' | 'ok' | 'fail'>('idle')
   const [showScriptModal, setShowScriptModal] = useState(false)
-  const [errorPopup, setErrorPopup] = useState<string | null>(null)
-  const pollAbortRef = useRef<AbortController | null>(null)
-
-  useEffect(() => () => { pollAbortRef.current?.abort() }, [])
+  const [showTestModal, setShowTestModal] = useState(false)
+  const [nodeTestResults, setNodeTestResults] = useState<NodeTestRowState[]>([])
 
   const pollTask = async (taskId: string): Promise<{ ok: boolean; message: string }> => {
-    const ac = new AbortController()
-    pollAbortRef.current?.abort()
-    pollAbortRef.current = ac
     const deadline = Date.now() + 30_000
     while (Date.now() < deadline) {
-      if (ac.signal.aborted) return { ok: false, message: 'cancelled' }
       await new Promise<void>((r) => setTimeout(r, 1500))
-      if (ac.signal.aborted) return { ok: false, message: 'cancelled' }
       try {
         const t = await clustersApi.getTask(taskId)
         if (t.Status === 'success') return { ok: true, message: '' }
@@ -2423,17 +2420,35 @@ function AddStorageModal({
 
   const handleTestPath = async () => {
     const effectivePath = posixPath || '/var/lib/postgresql/backups'
-    setTestStatus('running')
+    let rows: NodeTestRowState[] = []
     try {
-      const { task_id } = await clustersApi.testBackupPath(clusterId, effectivePath)
-      const result = await pollTask(task_id)
-      setTestStatus(result.ok ? 'ok' : 'fail')
-      if (!result.ok) setErrorPopup(result.message)
-    } catch (e: any) {
-      setTestStatus('fail')
-      const rawMsg: string = e?.response?.data?.message ?? e?.message ?? 'Request failed'
-      setErrorPopup(e?.response?.status === 409 ? 'Node unreachable — the agent may be temporarily disconnected.' : rawMsg)
-    }
+      const dispatched = await clustersApi.testBackupPath(clusterId, effectivePath)
+      rows = dispatched.map((n: NodeTestResult) => ({
+        node_id: n.node_id,
+        hostname: n.hostname,
+        task_id: n.task_id,
+        status: n.skip_reason ? 'skipped' : 'pending',
+        skipReason: (n.skip_reason as 'offline' | 'maintenance') || undefined,
+      }))
+    } catch { /* rows stays [] — modal shows "no nodes" message */ }
+    setNodeTestResults(rows)
+    setShowTestModal(true)
+
+    rows.forEach(async (row, i) => {
+      if (row.status !== 'pending') return
+      try {
+        const result = await pollTask(row.task_id)
+        setNodeTestResults((prev) =>
+          prev.map((r, j) =>
+            j === i ? { ...r, status: result.ok ? 'ok' : 'fail', message: result.ok ? undefined : result.message } : r,
+          ),
+        )
+      } catch {
+        setNodeTestResults((prev) =>
+          prev.map((r, j) => (j === i ? { ...r, status: 'fail', message: 'Polling failed' } : r)),
+        )
+      }
+    })
   }
 
   const save = useMutation({
@@ -2518,26 +2533,21 @@ function AddStorageModal({
             <div className="space-y-2">
               {field('Path', inp(posixPath, setPosixPath, '/var/lib/postgresql/backups'))}
               <p className="text-xs text-gray-500 -mt-1">The <span className="font-mono text-gray-400">postgres</span> user and group must have write access to this path (<span className="font-mono text-gray-400">chown postgres:postgres</span>, <span className="font-mono text-gray-400">chmod 770</span>).</p>
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <button
-                    type="button"
-                    onClick={handleTestPath}
-                    disabled={testStatus === 'running'}
-                    className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white disabled:opacity-50"
-                  >
-                    {testStatus === 'running' ? 'Testing…' : 'Test path'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowScriptModal(true)}
-                    className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white"
-                  >
-                    Setup script
-                  </button>
-                </div>
-                {testStatus === 'ok' && <p className="text-xs text-emerald-400">✓ Path is writable</p>}
-                {testStatus === 'fail' && <p className="text-xs text-red-400">✗ Path test failed — run the setup script on each node</p>}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={handleTestPath}
+                  className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white"
+                >
+                  Test path
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowScriptModal(true)}
+                  className="text-xs px-2.5 py-1 border border-gray-700 hover:border-gray-500 rounded text-gray-400 hover:text-white"
+                >
+                  Setup script
+                </button>
               </div>
               {dbNodes.length > 1 && (
                 <div className="border-t border-gray-800 pt-3 space-y-2">
@@ -2656,16 +2666,44 @@ function AddStorageModal({
     {showScriptModal && (
       <ProvisionScriptModal path={posixPath} onClose={() => setShowScriptModal(false)} />
     )}
-    {errorPopup && (
-      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[70] p-4">
-        <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-sm p-6 space-y-4">
-          <p className="text-sm text-red-400 whitespace-pre-wrap">{errorPopup}</p>
+    {showTestModal && (
+      <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60">
+        <div className="bg-gray-900 border border-gray-700 rounded-lg w-full max-w-md p-6 space-y-4">
+          <h2 className="text-sm font-semibold text-white">
+            Path test — {posixPath || '/var/lib/postgresql/backups'}
+          </h2>
+          <div className="space-y-2">
+            {nodeTestResults.length === 0 && (
+              <p className="text-xs text-gray-500">No DB or HC nodes found in this cluster.</p>
+            )}
+            {nodeTestResults.map((row) => (
+              <div key={row.node_id} className="flex items-center justify-between text-xs">
+                <span className="text-gray-300 font-mono">{row.hostname}</span>
+                <span>
+                  {row.status === 'pending' && <span className="text-gray-400">Testing…</span>}
+                  {row.status === 'ok' && <span className="text-emerald-400">✓ Writable</span>}
+                  {row.status === 'fail' && <span className="text-red-400">✗ Failed</span>}
+                  {row.status === 'skipped' && row.skipReason === 'maintenance' && (
+                    <span className="text-yellow-600">— Skipped (maintenance)</span>
+                  )}
+                  {row.status === 'skipped' && row.skipReason !== 'maintenance' && (
+                    <span className="text-gray-500">— Skipped (offline)</span>
+                  )}
+                </span>
+              </div>
+            ))}
+            {nodeTestResults.filter((r) => r.status === 'fail' && r.message).map((row) => (
+              <p key={row.node_id + '_msg'} className="text-xs text-red-400/80 font-mono break-all">
+                {row.hostname}: {row.message}
+              </p>
+            ))}
+          </div>
           <div className="flex justify-end">
             <button
-              onClick={() => setErrorPopup(null)}
-              className="px-4 py-2 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg"
+              onClick={() => setShowTestModal(false)}
+              className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white"
             >
-              OK
+              Close
             </button>
           </div>
         </div>
@@ -3190,6 +3228,15 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
 // ── Tab / sub-tab type definitions ────────────────────────────────────────────
 
 type Tab = 'overview' | 'settings' | 'history'
+
+interface NodeTestRowState {
+  node_id: string
+  hostname: string
+  task_id: string
+  status: 'pending' | 'ok' | 'fail' | 'skipped'
+  skipReason?: 'offline' | 'maintenance'
+  message?: string
+}
 
 const SETTINGS_TABS = [
   { id: 'general', label: 'General' },

@@ -68,17 +68,17 @@ if [[ "${1:-}" == "--agents" ]]; then
       sudo systemctl is-active netbox-agent
     "
 
-    echo "  → $NODE: pgBackRest prerequisites"
-    ssh "$NODE" '
-      sudo mkdir -p /var/lib/pgbackrest /var/log/pgbackrest /etc/pgbackrest
-      sudo chown postgres:postgres /var/lib/pgbackrest /var/log/pgbackrest
-      sudo chmod 750 /var/lib/pgbackrest
-      sudo chmod 770 /var/log/pgbackrest
-      sudo chown netbox-agent:postgres /etc/pgbackrest
-      sudo chmod 755 /etc/pgbackrest
-      PG_CTL=$(find /usr/lib/postgresql -name pg_ctl -type f 2>/dev/null | sort -V | tail -1)
-      [ -n "$PG_CTL" ] && sudo ln -sf "$PG_CTL" /usr/local/bin/pg_ctl && echo "  pg_ctl → $PG_CTL"
-    '
+    # echo "  → $NODE: pgBackRest prerequisites"
+    # ssh "$NODE" '
+    #   sudo mkdir -p /var/lib/pgbackrest /var/log/pgbackrest /etc/pgbackrest
+    #   sudo chown postgres:postgres /var/lib/pgbackrest /var/log/pgbackrest
+    #   sudo chmod 750 /var/lib/pgbackrest
+    #   sudo chmod 770 /var/log/pgbackrest
+    #   sudo chown netbox-agent:postgres /etc/pgbackrest
+    #   sudo chmod 755 /etc/pgbackrest
+    #   PG_CTL=$(find /usr/lib/postgresql -name pg_ctl -type f 2>/dev/null | sort -V | tail -1)
+    #   [ -n "$PG_CTL" ] && sudo ln -sf "$PG_CTL" /usr/local/bin/pg_ctl && echo "  pg_ctl → $PG_CTL"
+    # '
 
     echo "  ✓ $NODE updated"
   done

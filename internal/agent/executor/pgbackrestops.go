@@ -156,16 +156,19 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 
 // RunPGBackRestTestPath verifies that the given path is writable by the postgres
 // OS user, which is the user pgBackRest uses for posix repo operations.
-// It creates a temp file, verifies it exists, then removes it.
+// Uses psql COPY (already in sudoers) rather than /bin/sh, which sudo-rs blocks.
 func RunPGBackRestTestPath(params protocol.PGBackRestTestPathParams) (string, error) {
 	if params.Path == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	// Run as postgres (same user pgBackRest uses) so the test reflects actual access.
+	if strings.Contains(params.Path, "'") {
+		return "", fmt.Errorf("path contains invalid character: single quote")
+	}
 	testFile := params.Path + "/.conductor_pgbackrest_test"
-	args := []string{"-u", "postgres", "/bin/sh", "-c",
-		`touch "$1" && rm -f "$1" && echo ok`, "--", testFile}
-	out, err := exec.Command("sudo", args...).CombinedOutput()
+	out, err := exec.Command("sudo", "-u", "postgres",
+		"/usr/bin/psql", "-c",
+		fmt.Sprintf("COPY (SELECT 1) TO '%s'", testFile),
+	).CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("path not writable by postgres: %w — %s", err, strings.TrimSpace(string(out)))
 	}

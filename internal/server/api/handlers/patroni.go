@@ -1459,14 +1459,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// For active/standby clusters Sentinel is not needed — each node uses a plain
 	// local Redis connection (or points directly at the primary's Redis IP).
 	dispatchStopSentinel := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) {
-		for _, args := range [][]string{
-			{"/usr/bin/systemctl", "stop", "redis-sentinel"},
-			{"/usr/bin/systemctl", "disable", "redis-sentinel"},
-		} {
-			p, _ := json.Marshal(protocol.RunCommandParams{Command: "sudo", Args: args})
-			if _, err := d(node.ID, protocol.TaskRunCommand, p, 15); err != nil {
-				slog.Warn("configure-failover: stop-sentinel dispatch failed", "node", node.Hostname, "args", args, "error", err)
-			}
+		if _, err := d(node.ID, protocol.TaskStopSentinel, nil, 15); err != nil {
+			slog.Warn("configure-failover: stop-sentinel dispatch failed", "node", node.Hostname, "error", err)
 		}
 	}
 

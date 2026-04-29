@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -395,6 +396,17 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			}
 		}
 
+	case protocol.TaskStopSentinel:
+		for _, args := range [][]string{
+			{"systemctl", "stop", "redis-sentinel"},
+			{"systemctl", "disable", "redis-sentinel"},
+		} {
+			cmd := exec.Command("sudo", args...)
+			out, _ := cmd.CombinedOutput()
+			output += string(out)
+		}
+		success = true
+
 	case protocol.TaskStopPostgresql:
 		cmd := exec.Command("sudo", "systemctl", "stop", "postgresql")
 		out, err := cmd.CombinedOutput()
@@ -408,6 +420,31 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 	case protocol.TaskRestartPatroni:
 		// patroni is enabled at agent install time (install.sh), not here.
 		cmd := exec.Command("sudo", "systemctl", "restart", "patroni")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
+	case protocol.TaskPatroniSwitchover:
+		var params protocol.PatroniSwitchoverParams
+		if err := json.Unmarshal(task.Params, &params); err != nil {
+			errMsg = "bad params: " + err.Error()
+			break
+		}
+		if params.Candidate == "" {
+			errMsg = "candidate hostname is required"
+			break
+		}
+		clusterName := readPatroniClusterName()
+		if clusterName == "" {
+			errMsg = "could not read Patroni cluster name from /etc/patroni/patroni.yml"
+			break
+		}
+		cmd := exec.Command("patronictl", "-c", "/etc/patroni/patroni.yml",
+			"switchover", "--force", clusterName, "--candidate", params.Candidate)
 		out, err := cmd.CombinedOutput()
 		output = string(out)
 		if err != nil {
@@ -755,6 +792,21 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 	}
 
 	sendResult(client, task.TaskID, success, output, errMsg, time.Since(start).Milliseconds())
+}
+
+// readPatroniClusterName parses the 'name:' field from /etc/patroni/patroni.yml.
+func readPatroniClusterName() string {
+	data, err := os.ReadFile("/etc/patroni/patroni.yml")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "name:") {
+			return strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "name:")), `"'`)
+		}
+	}
+	return ""
 }
 
 func sendResult(client *ws.Client, taskID string, success bool, output, errMsg string, durationMs int64) {

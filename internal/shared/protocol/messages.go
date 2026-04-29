@@ -43,8 +43,10 @@ const (
 	TaskCreatePgRole      TaskType = "postgres.create_role"
 	TaskWritePatroniConf  TaskType = "patroni.write_config"
 	TaskRestartPatroni    TaskType = "service.restart.patroni"
+	TaskPatroniSwitchover TaskType = "patroni.switchover"
 	TaskRestartRedis      TaskType = "service.restart.redis"
 	TaskRestartSentinel   TaskType = "service.restart.redis-sentinel"
+	TaskStopSentinel      TaskType = "service.stop.sentinel"
 	TaskWriteSentinelConf TaskType = "sentinel.write_config"
 	TaskMediaSync         TaskType = "media.sync"
 	TaskDBRestore         TaskType = "db.restore"     // reinitialize a replica or restore from backup
@@ -251,6 +253,11 @@ type ConfigWriteParams struct {
 	Sha256         string `json:"sha256"`
 	BackupExisting bool   `json:"backup_existing"`
 	RestartAfter   bool   `json:"restart_after"`
+}
+
+// PatroniSwitchoverParams are the params for TaskPatroniSwitchover.
+type PatroniSwitchoverParams struct {
+	Candidate string `json:"candidate"` // hostname of the node that should become primary
 }
 
 // PatroniConfigWriteParams are the params for TaskWritePatroniConf.

@@ -125,7 +125,7 @@ func redisPassword() string {
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "requirepass ") {
-			return strings.TrimPrefix(line, "requirepass ")
+			return strings.Trim(strings.TrimPrefix(line, "requirepass "), `"`)
 		}
 	}
 	return ""
