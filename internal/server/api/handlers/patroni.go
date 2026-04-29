@@ -1645,6 +1645,65 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 
 			for _, node := range replicas {
 				dispatchPatroniForNode(bgDispatch, node)
+
+				replicaIP := stripCIDR(node.IPAddress)
+
+				// Wait for Patroni to come up on the replica before triggering reinitialize.
+				reinitDeadline := time.Now().Add(60 * time.Second)
+				for time.Now().Before(reinitDeadline) {
+					if bgCtx.Err() != nil {
+						break
+					}
+					pollReq, _ := http.NewRequestWithContext(bgCtx, http.MethodGet,
+						fmt.Sprintf("http://%s:8008/", replicaIP), nil)
+					if pollReq != nil {
+						pollReq.SetBasicAuth(restU, restP)
+						if resp, err := patroniClient.Do(pollReq); err == nil {
+							resp.Body.Close()
+							break
+						}
+					}
+					time.Sleep(3 * time.Second)
+				}
+
+				// POST /reinitialize forces a clean pg_basebackup from the primary.
+				// Patroni handles the file operations itself, so no agent permissions needed.
+				if bgCtx.Err() == nil {
+					reinitReq, _ := http.NewRequestWithContext(bgCtx, http.MethodPost,
+						fmt.Sprintf("http://%s:8008/reinitialize", replicaIP), nil)
+					if reinitReq != nil {
+						reinitReq.SetBasicAuth(restU, restP)
+						if resp, err := patroniClient.Do(reinitReq); err == nil {
+							resp.Body.Close()
+							slog.Info("configure-failover: triggered replica reinitialize",
+								"replica", node.Hostname)
+						} else {
+							slog.Warn("configure-failover: reinitialize request failed",
+								"replica", node.Hostname, "error", err)
+						}
+					}
+				}
+
+				// Wait for replica to finish pg_basebackup and enter streaming state.
+				replicaReadyDeadline := time.Now().Add(120 * time.Second)
+				for time.Now().Before(replicaReadyDeadline) {
+					if bgCtx.Err() != nil {
+						break
+					}
+					pollReq, _ := http.NewRequestWithContext(bgCtx, http.MethodGet,
+						fmt.Sprintf("http://%s:8008/replica", replicaIP), nil)
+					if pollReq != nil {
+						pollReq.SetBasicAuth(restU, restP)
+						if resp, err := patroniClient.Do(pollReq); err == nil {
+							resp.Body.Close()
+							if resp.StatusCode == http.StatusOK {
+								break
+							}
+						}
+					}
+					time.Sleep(5 * time.Second)
+				}
+
 				if cluster.Mode == "active_standby" {
 					dispatchStopSentinel(bgDispatch, node)
 					if req.AppTierAlwaysAvailable {
