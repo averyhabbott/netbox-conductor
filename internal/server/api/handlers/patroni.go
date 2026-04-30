@@ -420,14 +420,18 @@ func (h *PatroniHandler) History(c echo.Context) error {
 	patroniTypes := map[string]bool{
 		"patroni.write_config":       true,
 		"patroni.install":            true,
+		"patroni.pause":              true,
+		"patroni.resume":             true,
 		"service.restart.patroni":    true,
 		"exec.run":                   true, // switchover uses exec.run
+		"postgres.stop":              true,
 		"pgbackrest.configure":       true,
 		"pgbackrest.stanza-create":   true,
 		"pgbackrest.backup":          true,
 		"pgbackrest.catalog":         true,
 		"pgbackrest.restore":         true,
 		"pgbackrest.test_path":       true,
+		"db.restore":                 true,
 		"config.redis_requirepass":   true,
 		"service.stop.netbox":        true,
 		"config.write":               true,

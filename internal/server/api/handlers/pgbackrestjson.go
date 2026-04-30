@@ -33,7 +33,8 @@ func parsePGBackRestInfo(raw string) (oldest, newest *time.Time, backups []pgbBa
 		for _, b := range s.Backup {
 			b := b // capture
 			backups = append(backups, b)
-			t := time.Unix(b.Timestamp.Start, 0).UTC()
+			// Oldest valid restore target must be strictly after the backup stop time.
+			t := time.Unix(b.Timestamp.Stop+1, 0).UTC()
 			if oldest == nil || t.Before(*oldest) {
 				oldest = &t
 			}

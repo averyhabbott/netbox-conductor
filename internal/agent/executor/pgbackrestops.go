@@ -2,7 +2,9 @@ package executor
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,7 +25,7 @@ func RunPGBackRestStanzaCreate(params protocol.PGBackRestStanzaCreateParams) (st
 	// before promoting. pg_isready passes during that window, but pgbackrest
 	// stanza-create requires a primary and will fail with "all clusters in
 	// recovery" if it runs too early.
-	if err := waitForPromotion(postgresDataDir(), 2*time.Minute); err != nil {
+	if err := waitForPromotion(PostgresDataDir(), 2*time.Minute); err != nil {
 		return "", fmt.Errorf("PostgreSQL not ready as primary: %w", err)
 	}
 
@@ -78,16 +80,15 @@ func RunPGBackRestCatalog(params protocol.PGBackRestCatalogParams) (string, erro
 }
 
 // RunPGBackRestRestore orchestrates a full point-in-time restore on this node.
-// The conductor is responsible for stopping Patroni on all cluster members
-// before dispatching this task. After this task completes successfully, the
-// conductor reinitializes replica nodes.
+// The conductor pauses Patroni automation (patronictl pause) and stops PostgreSQL
+// on replica nodes before dispatching this task. After this task completes
+// successfully, the conductor resumes Patroni and reinitializes replicas.
 //
 // Sequence:
-//  1. Stop Patroni (should already be stopped by conductor, but ensure it)
-//  2. Run pgbackrest restore with the target time
-//  3. Start PostgreSQL in recovery mode
+//  1. Stop PostgreSQL locally (Patroni is paused — it will not restart it)
+//  2. Run pgbackrest restore with the target time (as postgres user, with --delta)
+//  3. Start PostgreSQL in recovery mode (distro-portable)
 //  4. Poll pg_is_in_recovery() until the instance promotes
-//  5. Start Patroni to take over cluster management
 func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, error) {
 	if params.Stanza == "" {
 		return "", fmt.Errorf("stanza is required")
@@ -101,41 +102,51 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 
 	dataDir := params.DataDir
 	if dataDir == "" {
-		dataDir = postgresDataDir()
+		dataDir = PostgresDataDir()
 	}
 
 	var log strings.Builder
 
-	// Step 1: Ensure Patroni is stopped.
-	if out, err := runSystemctl("stop", "patroni"); err != nil {
-		// Log the error but continue — the conductor may have already stopped it.
-		log.WriteString(fmt.Sprintf("patroni stop (may already be stopped): %v\n%s\n", err, out))
+	// Step 1: Stop PostgreSQL — Patroni is paused so it will not restart it.
+	if stopOut, err := stopPostgresql(dataDir); err != nil {
+		// Log and continue — may already be stopped.
+		log.WriteString(fmt.Sprintf("postgres stop (may already be stopped): %v\n%s\n", err, stopOut))
 	} else {
-		log.WriteString("patroni stopped\n")
+		log.WriteString("postgres stopped\n")
 	}
 
-	// Step 2: Run pgBackRest restore.
-	restoreCmd := params.RestoreCmd
-	if restoreCmd == "" {
-		restoreCmd = fmt.Sprintf(
-			"pgbackrest --stanza=%s --type=time --target=%q --target-action=promote restore",
-			params.Stanza, params.TargetTime,
-		)
+	// Step 2: Run pgBackRest restore as the postgres OS user.
+	// pgbackrest requires YYYY-MM-DD HH:MM:SS+00, not RFC3339 (T/Z).
+	pgbackrestTime := strings.NewReplacer("T", " ", "Z", "+00").Replace(params.TargetTime)
+
+	var restoreArgs []string
+	if params.RestoreCmd != "" {
+		restoreArgs = strings.Fields(params.RestoreCmd) //nolint:gosec — operator-supplied command
+	} else {
+		restoreArgs = []string{
+			"pgbackrest",
+			"--stanza=" + params.Stanza,
+			"--type=time",
+			"--target=" + pgbackrestTime,
+			"--target-action=promote",
+			"--delta",
+			"restore",
+		}
 	}
-	parts := strings.Fields(restoreCmd)
-	if len(parts) == 0 {
+	if len(restoreArgs) == 0 {
 		return log.String(), fmt.Errorf("empty restore command")
 	}
-	restoreOut, err := exec.Command(parts[0], parts[1:]...).CombinedOutput() //nolint:gosec
+	sudoArgs := append([]string{"-u", "postgres"}, restoreArgs...)
+	restoreOut, err := exec.Command("sudo", sudoArgs...).CombinedOutput() //nolint:gosec
 	if err != nil {
 		return log.String() + string(restoreOut), fmt.Errorf("pgbackrest restore failed: %w", err)
 	}
 	log.WriteString(fmt.Sprintf("pgbackrest restore complete\n%s\n", restoreOut))
 
 	// Step 3: Start PostgreSQL in recovery mode.
-	pgctlOut, err := exec.Command("sudo", "-u", "postgres", "pg_ctl", "start", "-D", dataDir, "-w").CombinedOutput()
+	pgctlOut, err := startPostgresql(dataDir)
 	if err != nil {
-		return log.String() + string(pgctlOut), fmt.Errorf("postgres start failed: %w\n%s", err, pgctlOut)
+		return log.String() + pgctlOut, fmt.Errorf("postgres start failed: %w\n%s", err, pgctlOut)
 	}
 	log.WriteString(fmt.Sprintf("postgres started\n%s\n", pgctlOut))
 
@@ -145,12 +156,7 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 	}
 	log.WriteString("postgres promoted (no longer in recovery)\n")
 
-	// Step 5: Start Patroni to resume cluster management.
-	if patroniOut, err := runSystemctl("start", "patroni"); err != nil {
-		return log.String() + patroniOut, fmt.Errorf("patroni start failed: %w\n%s", err, patroniOut)
-	}
-	log.WriteString("patroni started\n")
-
+	// Patroni resume is dispatched by the conductor after this task succeeds.
 	return log.String(), nil
 }
 
@@ -183,10 +189,44 @@ func pgbackrest(stanza string, subcommand string, extraArgs ...string) (string, 
 	return string(out), err
 }
 
-// runSystemctl runs a systemctl command and returns output and error.
-func runSystemctl(action, unit string) (string, error) {
-	out, err := exec.Command("systemctl", action, unit).CombinedOutput()
+// stopPostgresql stops the PostgreSQL process via pg_ctl (cross-distro).
+// postmaster.pid lives in the data dir regardless of which process started PostgreSQL,
+// so this works whether Patroni or systemd started the server.
+func stopPostgresql(dataDir string) (string, error) {
+	out, err := exec.Command("sudo", "-u", "postgres",
+		"pg_ctl", "stop", "-D", dataDir, "-m", "fast", "-w").CombinedOutput()
 	return string(out), err
+}
+
+// startPostgresql starts PostgreSQL in a distro-portable way.
+// On RHEL/Arch, postgresql.conf lives inside the data dir — plain pg_ctl works.
+// On Debian/Ubuntu, it lives in /etc/postgresql/<ver>/<cluster>/ and must be
+// passed via -o "-c config_file=...".
+func startPostgresql(dataDir string) (string, error) {
+	args := []string{"-u", "postgres", "pg_ctl", "start", "-D", dataDir, "-w", "-t", "120"}
+	if _, err := os.Stat(filepath.Join(dataDir, "postgresql.conf")); os.IsNotExist(err) {
+		if confFile := findDebianConfFile(dataDir); confFile != "" {
+			args = append(args, "-o", "-c config_file="+confFile)
+		}
+	}
+	out, err := exec.Command("sudo", args...).CombinedOutput()
+	return string(out), err
+}
+
+// findDebianConfFile uses pg_lsclusters to locate postgresql.conf for a given
+// data directory. Returns "" on non-Debian systems or if not found.
+func findDebianConfFile(dataDir string) string {
+	out, err := exec.Command("pg_lsclusters", "-h").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 6 && fields[5] == dataDir {
+			return fmt.Sprintf("/etc/postgresql/%s/%s/postgresql.conf", fields[0], fields[1])
+		}
+	}
+	return ""
 }
 
 // waitForPromotion polls pg_is_in_recovery() until it returns false,
@@ -207,9 +247,9 @@ func waitForPromotion(_ string, timeout time.Duration) error {
 	return fmt.Errorf("timed out after %s waiting for PostgreSQL to promote", timeout)
 }
 
-// postgresDataDir attempts to detect the PostgreSQL data directory from
+// PostgresDataDir attempts to detect the PostgreSQL data directory from
 // pg_lsclusters (Debian/Ubuntu). Falls back to the standard path.
-func postgresDataDir() string {
+func PostgresDataDir() string {
 	out, err := exec.Command("pg_lsclusters", "-h").Output()
 	if err != nil {
 		return "/var/lib/postgresql/data"
@@ -223,10 +263,4 @@ func postgresDataDir() string {
 		return fields[5]
 	}
 	return "/var/lib/postgresql/data"
-}
-
-// pgSocketDir returns the Unix socket directory for a given data dir.
-// PostgreSQL typically uses /var/run/postgresql for peer-auth connections.
-func pgSocketDir(_ string) string {
-	return "/var/run/postgresql"
 }

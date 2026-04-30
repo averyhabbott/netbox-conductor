@@ -428,6 +428,38 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 			success = true
 		}
 
+	case protocol.TaskPausePatroni:
+		cmd := exec.Command("patronictl", "-c", "/etc/patroni/patroni.yml", "pause", "--wait")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
+	case protocol.TaskResumePatroni:
+		cmd := exec.Command("patronictl", "-c", "/etc/patroni/patroni.yml", "resume", "--wait")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
+	case protocol.TaskStopPostgres:
+		dataDir := executor.PostgresDataDir()
+		cmd := exec.Command("sudo", "-u", "postgres",
+			"pg_ctl", "stop", "-D", dataDir, "-m", "fast", "-w")
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			success = true
+		}
+
 	case protocol.TaskPatroniSwitchover:
 		var params protocol.PatroniSwitchoverParams
 		if err := json.Unmarshal(task.Params, &params); err != nil {

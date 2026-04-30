@@ -807,16 +807,43 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		Error    string `json:"error,omitempty"`
 	}
 
-	// Stop Patroni on all db nodes before restoring.
-	stopTasks := make([]taskRef, 0, len(dbNodes))
+	stanzaStr := ""
+	if schedule.StanzaName != nil {
+		stanzaStr = *schedule.StanzaName
+	}
+
+	// Step 1: Pause Patroni automation on the restore node.
+	// patronictl pause writes a flag to DCS — all cluster members pick it up automatically.
+	emptyParams := json.RawMessage(`{}`)
+	pauseTaskID := uuid.New()
+	_ = h.taskResults.Create(ctx, restoreNode.ID, pauseTaskID, string(protocol.TaskPausePatroni), emptyParams)
+	var pauseTask taskRef
+	if dispErr := h.dispatcher.Dispatch(restoreNode.ID, protocol.TaskDispatchPayload{
+		TaskID:      pauseTaskID.String(),
+		TaskType:    protocol.TaskPausePatroni,
+		Params:      emptyParams,
+		TimeoutSecs: 30,
+	}); dispErr != nil {
+		pauseTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, Status: "offline", Error: dispErr.Error()}
+	} else {
+		_ = h.taskResults.SetSent(ctx, pauseTaskID)
+		pauseTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: pauseTaskID.String(), Status: "dispatched"}
+	}
+
+	// Step 2: Stop the PostgreSQL process on each replica.
+	// Patroni is paused so it will not restart them. The restore task handles the local stop.
+	stopTasks := make([]taskRef, 0)
+	stopIDs := make([]uuid.UUID, 0)
 	for _, n := range dbNodes {
-		stopParams, _ := json.Marshal(protocol.RunCommandParams{Command: "systemctl stop patroni"})
+		if n.ID == restoreNode.ID {
+			continue
+		}
 		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, taskID, string(protocol.TaskRunCommand), stopParams)
+		_ = h.taskResults.Create(ctx, n.ID, taskID, string(protocol.TaskStopPostgres), emptyParams)
 		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
 			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskRunCommand,
-			Params:      json.RawMessage(stopParams),
+			TaskType:    protocol.TaskStopPostgres,
+			Params:      emptyParams,
 			TimeoutSecs: 30,
 		}); dispErr != nil {
 			stopTasks = append(stopTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
@@ -824,17 +851,20 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		}
 		_ = h.taskResults.SetSent(ctx, taskID)
 		stopTasks = append(stopTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: taskID.String(), Status: "dispatched"})
+		stopIDs = append(stopIDs, taskID)
 	}
 
-	// Dispatch restore to primary node.
+	// Step 3: Dispatch restore to the restore node.
+	// RunPGBackRestRestore stops local postgres, runs pgbackrest, starts postgres, and waits for promotion.
 	restoreParams, _ := json.Marshal(protocol.PGBackRestRestoreParams{
-		Stanza:     *schedule.StanzaName,
+		Stanza:     stanzaStr,
 		TargetTime: req.TargetTime,
 		RestoreCmd: req.RestoreCmd,
 	})
 	restoreTaskID := uuid.New()
 	_ = h.taskResults.Create(ctx, restoreNode.ID, restoreTaskID, string(protocol.TaskPGBackRestRestore), restoreParams)
 	var restoreTask taskRef
+	restoreDispatched := false
 	if dispErr := h.dispatcher.Dispatch(restoreNode.ID, protocol.TaskDispatchPayload{
 		TaskID:      restoreTaskID.String(),
 		TaskType:    protocol.TaskPGBackRestRestore,
@@ -846,35 +876,76 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	} else {
 		_ = h.taskResults.SetSent(ctx, restoreTaskID)
 		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: restoreTaskID.String(), Status: "dispatched"}
+		restoreDispatched = true
 	}
 
-	// Dispatch db.restore (reinitialize) to each replica.
-	replicaTasks := make([]taskRef, 0)
+	// Capture state for the background goroutine before responding.
+	capturedPauseID := pauseTaskID
+	capturedStopIDs := stopIDs
+	capturedRestoreID := restoreTaskID
+	capturedRestoreNode := *restoreNode
+	capturedReplicas := make([]queries.Node, 0, len(dbNodes)-1)
 	for _, n := range dbNodes {
-		if n.ID == restoreNode.ID {
-			continue
+		if n.ID != restoreNode.ID {
+			capturedReplicas = append(capturedReplicas, n)
 		}
-		stanzaStr := ""
-		if schedule.StanzaName != nil {
-			stanzaStr = *schedule.StanzaName
-		}
-		replicaParams, _ := json.Marshal(protocol.DBRestoreParams{
-			Method:       "reinitialize",
-			PatroniScope: stanzaStr,
-		})
-		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, taskID, string(protocol.TaskDBRestore), replicaParams)
-		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskDBRestore,
-			Params:      json.RawMessage(replicaParams),
-			TimeoutSecs: 3600,
-		}); dispErr != nil {
-			replicaTasks = append(replicaTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
-			continue
-		}
-		_ = h.taskResults.SetSent(ctx, taskID)
-		replicaTasks = append(replicaTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: taskID.String(), Status: "dispatched"})
+	}
+
+	if restoreDispatched {
+		go func() {
+			bgCtx := context.Background()
+
+			// Wait for pause to complete.
+			pollTaskSuccess(bgCtx, h.taskResults, capturedPauseID, 2*time.Minute)
+
+			// Wait for each replica's postgres stop.
+			for _, tid := range capturedStopIDs {
+				pollTaskSuccess(bgCtx, h.taskResults, tid, 2*time.Minute)
+			}
+
+			// Wait for restore + promotion (up to 30 min).
+			if ok := pollTaskSuccess(bgCtx, h.taskResults, capturedRestoreID, 30*time.Minute); !ok {
+				_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
+				return
+			}
+
+			// Resume Patroni — it adopts the promoted primary.
+			resumeID := uuid.New()
+			_ = h.taskResults.Create(bgCtx, capturedRestoreNode.ID, resumeID,
+				string(protocol.TaskResumePatroni), json.RawMessage(`{}`))
+			if dispErr := h.dispatcher.Dispatch(capturedRestoreNode.ID, protocol.TaskDispatchPayload{
+				TaskID:      resumeID.String(),
+				TaskType:    protocol.TaskResumePatroni,
+				Params:      json.RawMessage(`{}`),
+				TimeoutSecs: 30,
+			}); dispErr == nil {
+				_ = h.taskResults.SetSent(bgCtx, resumeID)
+				pollTaskSuccess(bgCtx, h.taskResults, resumeID, 1*time.Minute)
+			}
+
+			// Reinitialize each replica through Patroni.
+			for _, replica := range capturedReplicas {
+				replicaParams, _ := json.Marshal(protocol.DBRestoreParams{
+					Method:       "reinitialize",
+					PatroniScope: stanzaStr,
+				})
+				reinitID := uuid.New()
+				_ = h.taskResults.Create(bgCtx, replica.ID, reinitID,
+					string(protocol.TaskDBRestore), json.RawMessage(replicaParams))
+				if dispErr := h.dispatcher.Dispatch(replica.ID, protocol.TaskDispatchPayload{
+					TaskID:      reinitID.String(),
+					TaskType:    protocol.TaskDBRestore,
+					Params:      json.RawMessage(replicaParams),
+					TimeoutSecs: 3600,
+				}); dispErr != nil {
+					continue
+				}
+				_ = h.taskResults.SetSent(bgCtx, reinitID)
+				pollTaskSuccess(bgCtx, h.taskResults, reinitID, 15*time.Minute)
+			}
+
+			_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
+		}()
 	}
 
 	if h.emitter != nil {
@@ -884,11 +955,11 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusAccepted, map[string]any{
-		"cluster_id":    clusterID.String(),
-		"target_time":   req.TargetTime,
-		"restore_node":  restoreTask,
-		"stop_tasks":    stopTasks,
-		"replica_tasks": replicaTasks,
+		"cluster_id":   clusterID.String(),
+		"target_time":  req.TargetTime,
+		"restore_node": restoreTask,
+		"pause_task":   pauseTask,
+		"stop_tasks":   stopTasks,
 	})
 }
 
