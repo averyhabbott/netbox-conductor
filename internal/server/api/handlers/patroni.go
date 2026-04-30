@@ -420,8 +420,6 @@ func (h *PatroniHandler) History(c echo.Context) error {
 	patroniTypes := map[string]bool{
 		"patroni.write_config":       true,
 		"patroni.install":            true,
-		"patroni.pause":              true,
-		"patroni.resume":             true,
 		"service.restart.patroni":    true,
 		"exec.run":                   true, // switchover uses exec.run
 		"postgres.stop":              true,
@@ -452,6 +450,9 @@ func (h *PatroniHandler) History(c echo.Context) error {
 	rows := make([]historyRow, 0)
 	for _, t := range tasks {
 		if !patroniTypes[t.TaskType] {
+			continue
+		}
+		if t.TaskType == string(protocol.TaskPGBackRestCatalog) && t.Status == "success" {
 			continue
 		}
 		row := historyRow{

@@ -43,8 +43,6 @@ const (
 	TaskCreatePgRole      TaskType = "postgres.create_role"
 	TaskWritePatroniConf  TaskType = "patroni.write_config"
 	TaskRestartPatroni    TaskType = "service.restart.patroni"
-	TaskPausePatroni      TaskType = "patroni.pause"
-	TaskResumePatroni     TaskType = "patroni.resume"
 	TaskStopPostgres      TaskType = "postgres.stop"
 	TaskPatroniSwitchover TaskType = "patroni.switchover"
 	TaskRestartRedis      TaskType = "service.restart.redis"

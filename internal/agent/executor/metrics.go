@@ -136,7 +136,7 @@ func redisPassword() string {
 func isPostgresReady() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, "pg_isready", "-q").Run() == nil
+	return exec.CommandContext(ctx, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres").Run() == nil
 }
 
 // isServiceActive checks if a systemd service is active.

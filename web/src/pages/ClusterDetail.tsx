@@ -13,6 +13,7 @@ import { patroniApi } from '../api/patroni'
 import type { PushResult } from '../api/patroni'
 import { alertsApi } from '../api/alerts'
 import { eventsApi } from '../api/events'
+import { useSSE } from '../hooks/useSSE'
 import type { Event } from '../api/events'
 import EventsTable from '../components/EventsTable'
 import client from '../api/client'
@@ -2922,14 +2923,73 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
   })
 
+  const [backupInProgress, setBackupInProgress] = useState(false)
+  const [backupToast, setBackupToast] = useState(false)
+  const [backupTaskId, setBackupTaskId] = useState<string | null>(null)
+
+  const [catalogFetching, setCatalogFetching] = useState(false)
+  const [catalogTaskId, setCatalogTaskId] = useState<string | null>(null)
+
+  // Belt: SSE fires instantly when the agent reports success or failure.
+  useSSE((event) => {
+    if (event.type !== 'task.complete') return
+    const taskId = event.payload.task_id as string | undefined
+    if (!taskId) return
+    if (taskId === backupTaskId) {
+      setBackupInProgress(false)
+      setBackupTaskId(null)
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+    }
+    if (taskId === catalogTaskId) {
+      setCatalogFetching(false)
+      setCatalogTaskId(null)
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+    }
+  })
+
+  // Suspenders: poll task_results every 5s to catch sweeper-detected timeouts.
+  const anyTaskInFlight = backupInProgress || catalogFetching
+  const activeTaskId = backupInProgress ? backupTaskId : catalogFetching ? catalogTaskId : null
+
+  const { data: inflightTaskData } = useQuery({
+    queryKey: ['task', activeTaskId],
+    queryFn: () => clustersApi.getTask(activeTaskId!),
+    refetchInterval: anyTaskInFlight ? 5_000 : false,
+    enabled: anyTaskInFlight && activeTaskId !== null,
+  })
+
+  useEffect(() => {
+    if (!inflightTaskData) return
+    const s = inflightTaskData.Status
+    if (s !== 'success' && s !== 'failure' && s !== 'timeout') return
+    if (inflightTaskData.TaskID === backupTaskId) {
+      setBackupInProgress(false)
+      setBackupTaskId(null)
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+    }
+    if (inflightTaskData.TaskID === catalogTaskId) {
+      setCatalogFetching(false)
+      setCatalogTaskId(null)
+      qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
+    }
+  }, [inflightTaskData])
+
   const runBackup = useMutation({
     mutationFn: () => clustersApi.runBackup(clusterId, 'full'),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+    onSuccess: (data) => {
+      setBackupInProgress(true)
+      setBackupTaskId(data.task_id)
+      setBackupToast(true)
+      setTimeout(() => setBackupToast(false), 3_000)
+    },
   })
 
   const refreshCatalog = useMutation({
     mutationFn: () => clustersApi.getBackupCatalog(clusterId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+    onSuccess: (data) => {
+      setCatalogFetching(true)
+      setCatalogTaskId(data.task_id)
+    },
   })
 
   useEffect(() => {
@@ -3136,24 +3196,27 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
       <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between">
           <h3 className="font-medium text-sm">Backup History</h3>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
+            {backupToast && (
+              <span className="text-xs text-emerald-400">Backup job requested</span>
+            )}
             <button
               onClick={() => refreshCatalog.mutate()}
-              disabled={!stanzaReady || refreshCatalog.isPending}
+              disabled={!stanzaReady || refreshCatalog.isPending || catalogFetching}
               className="text-xs text-gray-500 hover:text-white disabled:opacity-40"
             >
-              {refreshCatalog.isPending ? 'Refreshing…' : 'Refresh'}
+              {catalogFetching ? 'Fetching…' : 'Refresh'}
             </button>
             <button
               onClick={() => runBackup.mutate()}
-              disabled={!stanzaReady || runBackup.isPending}
+              disabled={!stanzaReady || runBackup.isPending || backupInProgress}
               className="text-xs px-3 py-1.5 border border-gray-700 hover:border-gray-500 rounded-lg text-gray-400 hover:text-white disabled:opacity-40"
             >
-              {runBackup.isPending ? 'Starting…' : 'Run full backup now'}
+              {backupInProgress ? 'Backup running…' : 'Run full backup now'}
             </button>
             <button
               onClick={() => setShowRestoreModal(true)}
-              disabled={!oldest || !newest}
+              disabled={!oldest || !newest || backupInProgress}
               className="text-xs px-3 py-1.5 bg-red-900/60 hover:bg-red-900 border border-red-800 rounded-lg text-red-300 disabled:opacity-40"
             >
               Restore to a previous point

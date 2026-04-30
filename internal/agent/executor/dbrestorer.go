@@ -2,7 +2,6 @@ package executor
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -11,43 +10,14 @@ import (
 )
 
 // RunDBRestore executes a database restore operation.
-// "reinitialize" — runs `patronictl reinitialize <scope> <member>` on the local node.
-// "pitr"         — runs a configurable restore command targeting a specific recovery time.
+// "pitr" — runs a configurable restore command targeting a specific recovery time.
 func RunDBRestore(params protocol.DBRestoreParams) (string, error) {
 	switch params.Method {
-	case "reinitialize":
-		hostname, _ := os.Hostname()
-		return runPatroniReinit(params.PatroniScope, hostname)
 	case "pitr":
 		return runPITR(params)
 	default:
-		return "", fmt.Errorf("unknown restore method: %q (must be 'reinitialize' or 'pitr')", params.Method)
+		return "", fmt.Errorf("unknown restore method: %q (must be 'pitr')", params.Method)
 	}
-}
-
-// runPatroniReinit triggers Patroni to reinitialize this replica by cloning from the primary.
-// It is equivalent to running: patronictl -c /etc/patroni/patroni.yml reinitialize <scope> <member> --force
-func runPatroniReinit(scope, member string) (string, error) {
-	if scope == "" {
-		return "", fmt.Errorf("patroni_scope is required for reinitialize")
-	}
-	if member == "" {
-		return "", fmt.Errorf("hostname is required for reinitialize")
-	}
-
-	cmd := exec.Command(
-		"patronictl",
-		"-c", "/etc/patroni/patroni.yml",
-		"reinitialize", scope, member,
-		"--force",
-	)
-	cmd.Env = append(cmd.Environ(), "PATRONI_CTL_INSECURE=1")
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("patronictl reinitialize failed: %w\n%s", err, out)
-	}
-	return string(out), nil
 }
 
 // runPITR executes a point-in-time recovery.

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,11 +108,14 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 
 	var log strings.Builder
 
+	slog.Info("restore: step 1 — stopping postgres", "data_dir", dataDir)
 	// Step 1: Stop PostgreSQL — Patroni is paused so it will not restart it.
 	if stopOut, err := stopPostgresql(dataDir); err != nil {
 		// Log and continue — may already be stopped.
+		slog.Warn("restore: postgres stop error (continuing)", "err", err, "out", stopOut)
 		log.WriteString(fmt.Sprintf("postgres stop (may already be stopped): %v\n%s\n", err, stopOut))
 	} else {
+		slog.Info("restore: postgres stopped")
 		log.WriteString("postgres stopped\n")
 	}
 
@@ -136,24 +140,33 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 	if len(restoreArgs) == 0 {
 		return log.String(), fmt.Errorf("empty restore command")
 	}
+	slog.Info("restore: step 2 — running pgbackrest", "args", restoreArgs)
 	sudoArgs := append([]string{"-u", "postgres"}, restoreArgs...)
 	restoreOut, err := exec.Command("sudo", sudoArgs...).CombinedOutput() //nolint:gosec
 	if err != nil {
+		slog.Error("restore: pgbackrest failed", "err", err, "out", string(restoreOut))
 		return log.String() + string(restoreOut), fmt.Errorf("pgbackrest restore failed: %w", err)
 	}
+	slog.Info("restore: pgbackrest complete", "out", string(restoreOut))
 	log.WriteString(fmt.Sprintf("pgbackrest restore complete\n%s\n", restoreOut))
 
 	// Step 3: Start PostgreSQL in recovery mode.
+	slog.Info("restore: step 3 — starting postgres", "data_dir", dataDir)
 	pgctlOut, err := startPostgresql(dataDir)
 	if err != nil {
+		slog.Error("restore: postgres start failed", "err", err, "out", pgctlOut)
 		return log.String() + pgctlOut, fmt.Errorf("postgres start failed: %w\n%s", err, pgctlOut)
 	}
+	slog.Info("restore: postgres started", "out", pgctlOut)
 	log.WriteString(fmt.Sprintf("postgres started\n%s\n", pgctlOut))
 
 	// Step 4: Poll until PostgreSQL has promoted out of recovery.
+	slog.Info("restore: step 4 — waiting for promotion")
 	if err := waitForPromotion(dataDir, 10*time.Minute); err != nil {
+		slog.Error("restore: promotion timed out", "err", err)
 		return log.String(), fmt.Errorf("waiting for promotion: %w", err)
 	}
+	slog.Info("restore: postgres promoted")
 	log.WriteString("postgres promoted (no longer in recovery)\n")
 
 	// Patroni resume is dispatched by the conductor after this task succeeds.
@@ -204,7 +217,7 @@ func stopPostgresql(dataDir string) (string, error) {
 // passed via -o "-c config_file=...".
 func startPostgresql(dataDir string) (string, error) {
 	args := []string{"-u", "postgres", "pg_ctl", "start", "-D", dataDir, "-w", "-t", "120"}
-	if _, err := os.Stat(filepath.Join(dataDir, "postgresql.conf")); os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dataDir, "postgresql.conf")); err != nil {
 		if confFile := findDebianConfFile(dataDir); confFile != "" {
 			args = append(args, "-o", "-c config_file="+confFile)
 		}
@@ -239,7 +252,9 @@ func waitForPromotion(_ string, timeout time.Duration) error {
 		out, err := exec.Command(
 			"sudo", "-u", "postgres", "psql", "-Atc", "SELECT pg_is_in_recovery()", "postgres",
 		).CombinedOutput()
-		if err == nil && strings.TrimSpace(string(out)) == "f" {
+		result := strings.TrimSpace(string(out))
+		slog.Info("waitForPromotion: poll", "result", result, "err", err)
+		if err == nil && result == "f" {
 			return nil
 		}
 		time.Sleep(3 * time.Second)

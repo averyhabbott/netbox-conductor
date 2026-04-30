@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -799,6 +801,31 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	// Mark restore in progress.
 	_ = h.schedules.SetRestoreInProgress(ctx, clusterID, true)
 
+	stanzaStr := ""
+	if schedule.StanzaName != nil {
+		stanzaStr = *schedule.StanzaName
+	}
+
+	// Fetch Patroni REST credentials once — used for pause, resume, and reinitialize.
+	var restUser, restPass string
+	if cred, credErr := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); credErr == nil {
+		restUser = cred.Username
+		if pw, decErr := h.enc.Decrypt(cred.PasswordEnc); decErr == nil {
+			restPass = string(pw)
+		}
+	}
+
+	// Step 1: Pause Patroni automation via REST API.
+	// The pause flag propagates via DCS to all cluster members automatically.
+	restoreIP := stripCIDR(restoreNode.IPAddress)
+	if _, status, err := patroniREST(ctx, http.MethodPatch, restoreIP, "/config", restUser, restPass, []byte(`{"pause": true}`)); err != nil || status >= 300 {
+		_ = h.schedules.SetRestoreInProgress(ctx, clusterID, false)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadGateway, "patroni pause failed: "+err.Error())
+		}
+		return echo.NewHTTPError(http.StatusBadGateway, fmt.Sprintf("patroni pause returned HTTP %d", status))
+	}
+
 	type taskRef struct {
 		NodeID   string `json:"node_id"`
 		Hostname string `json:"hostname"`
@@ -807,31 +834,9 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		Error    string `json:"error,omitempty"`
 	}
 
-	stanzaStr := ""
-	if schedule.StanzaName != nil {
-		stanzaStr = *schedule.StanzaName
-	}
-
-	// Step 1: Pause Patroni automation on the restore node.
-	// patronictl pause writes a flag to DCS — all cluster members pick it up automatically.
-	emptyParams := json.RawMessage(`{}`)
-	pauseTaskID := uuid.New()
-	_ = h.taskResults.Create(ctx, restoreNode.ID, pauseTaskID, string(protocol.TaskPausePatroni), emptyParams)
-	var pauseTask taskRef
-	if dispErr := h.dispatcher.Dispatch(restoreNode.ID, protocol.TaskDispatchPayload{
-		TaskID:      pauseTaskID.String(),
-		TaskType:    protocol.TaskPausePatroni,
-		Params:      emptyParams,
-		TimeoutSecs: 30,
-	}); dispErr != nil {
-		pauseTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, Status: "offline", Error: dispErr.Error()}
-	} else {
-		_ = h.taskResults.SetSent(ctx, pauseTaskID)
-		pauseTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: pauseTaskID.String(), Status: "dispatched"}
-	}
-
 	// Step 2: Stop the PostgreSQL process on each replica.
 	// Patroni is paused so it will not restart them. The restore task handles the local stop.
+	emptyParams := json.RawMessage(`{}`)
 	stopTasks := make([]taskRef, 0)
 	stopIDs := make([]uuid.UUID, 0)
 	for _, n := range dbNodes {
@@ -864,7 +869,6 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	restoreTaskID := uuid.New()
 	_ = h.taskResults.Create(ctx, restoreNode.ID, restoreTaskID, string(protocol.TaskPGBackRestRestore), restoreParams)
 	var restoreTask taskRef
-	restoreDispatched := false
 	if dispErr := h.dispatcher.Dispatch(restoreNode.ID, protocol.TaskDispatchPayload{
 		TaskID:      restoreTaskID.String(),
 		TaskType:    protocol.TaskPGBackRestRestore,
@@ -876,74 +880,56 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	} else {
 		_ = h.taskResults.SetSent(ctx, restoreTaskID)
 		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: restoreTaskID.String(), Status: "dispatched"}
-		restoreDispatched = true
-	}
 
-	// Capture state for the background goroutine before responding.
-	capturedPauseID := pauseTaskID
-	capturedStopIDs := stopIDs
-	capturedRestoreID := restoreTaskID
-	capturedRestoreNode := *restoreNode
-	capturedReplicas := make([]queries.Node, 0, len(dbNodes)-1)
-	for _, n := range dbNodes {
-		if n.ID != restoreNode.ID {
-			capturedReplicas = append(capturedReplicas, n)
+		// Capture state for background goroutine before returning 202.
+		capturedStopIDs := stopIDs
+		capturedRestoreID := restoreTaskID
+		capturedRestoreNode := *restoreNode
+		capturedRestoreIP := restoreIP
+		capturedReplicas := make([]queries.Node, 0, len(dbNodes)-1)
+		for _, n := range dbNodes {
+			if n.ID != restoreNode.ID {
+				capturedReplicas = append(capturedReplicas, n)
+			}
 		}
-	}
 
-	if restoreDispatched {
 		go func() {
 			bgCtx := context.Background()
 
-			// Wait for pause to complete.
-			pollTaskSuccess(bgCtx, h.taskResults, capturedPauseID, 2*time.Minute)
-
 			// Wait for each replica's postgres stop.
 			for _, tid := range capturedStopIDs {
-				pollTaskSuccess(bgCtx, h.taskResults, tid, 2*time.Minute)
+				slog.Info("restore goroutine: waiting for postgres stop", "task_id", tid)
+				ok := pollTaskSuccess(bgCtx, h.taskResults, tid, 2*time.Minute)
+				slog.Info("restore goroutine: postgres stop result", "task_id", tid, "success", ok)
 			}
 
 			// Wait for restore + promotion (up to 30 min).
+			slog.Info("restore goroutine: waiting for pgbackrest.restore task", "task_id", capturedRestoreID)
 			if ok := pollTaskSuccess(bgCtx, h.taskResults, capturedRestoreID, 30*time.Minute); !ok {
+				slog.Error("restore goroutine: pgbackrest.restore task did not succeed", "task_id", capturedRestoreID)
 				_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
 				return
 			}
+			slog.Info("restore goroutine: pgbackrest.restore succeeded, resuming Patroni")
 
-			// Resume Patroni — it adopts the promoted primary.
-			resumeID := uuid.New()
-			_ = h.taskResults.Create(bgCtx, capturedRestoreNode.ID, resumeID,
-				string(protocol.TaskResumePatroni), json.RawMessage(`{}`))
-			if dispErr := h.dispatcher.Dispatch(capturedRestoreNode.ID, protocol.TaskDispatchPayload{
-				TaskID:      resumeID.String(),
-				TaskType:    protocol.TaskResumePatroni,
-				Params:      json.RawMessage(`{}`),
-				TimeoutSecs: 30,
-			}); dispErr == nil {
-				_ = h.taskResults.SetSent(bgCtx, resumeID)
-				pollTaskSuccess(bgCtx, h.taskResults, resumeID, 1*time.Minute)
+			// Resume Patroni via REST API — it adopts the promoted primary.
+			body, status, err := patroniREST(bgCtx, http.MethodPatch, capturedRestoreIP, "/config", restUser, restPass, []byte(`{"pause": null}`))
+			slog.Info("restore goroutine: patroni resume", "node", capturedRestoreNode.Hostname, "status", status, "body", string(body), "err", err)
+			if err != nil {
+				slog.Error("patroni resume failed", "node", capturedRestoreNode.Hostname, "error", err)
 			}
 
-			// Reinitialize each replica through Patroni.
+			// Reinitialize each replica via REST API.
 			for _, replica := range capturedReplicas {
-				replicaParams, _ := json.Marshal(protocol.DBRestoreParams{
-					Method:       "reinitialize",
-					PatroniScope: stanzaStr,
-				})
-				reinitID := uuid.New()
-				_ = h.taskResults.Create(bgCtx, replica.ID, reinitID,
-					string(protocol.TaskDBRestore), json.RawMessage(replicaParams))
-				if dispErr := h.dispatcher.Dispatch(replica.ID, protocol.TaskDispatchPayload{
-					TaskID:      reinitID.String(),
-					TaskType:    protocol.TaskDBRestore,
-					Params:      json.RawMessage(replicaParams),
-					TimeoutSecs: 3600,
-				}); dispErr != nil {
-					continue
+				replicaIP := stripCIDR(replica.IPAddress)
+				body, status, err := patroniREST(bgCtx, http.MethodPost, replicaIP, "/reinitialize", restUser, restPass, []byte(`{}`))
+				slog.Info("restore goroutine: patroni reinitialize", "node", replica.Hostname, "status", status, "body", string(body), "err", err)
+				if err != nil {
+					slog.Error("patroni reinitialize failed", "node", replica.Hostname, "error", err)
 				}
-				_ = h.taskResults.SetSent(bgCtx, reinitID)
-				pollTaskSuccess(bgCtx, h.taskResults, reinitID, 15*time.Minute)
 			}
 
+			slog.Info("restore goroutine: complete, clearing restore_in_progress")
 			_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
 		}()
 	}
@@ -958,9 +944,28 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		"cluster_id":   clusterID.String(),
 		"target_time":  req.TargetTime,
 		"restore_node": restoreTask,
-		"pause_task":   pauseTask,
 		"stop_tasks":   stopTasks,
 	})
+}
+
+// patroniREST makes an authenticated request to the Patroni REST API on a given node.
+func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, body []byte) ([]byte, int, error) {
+	url := fmt.Sprintf("http://%s:8008%s", nodeIP, path)
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if user != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return b, resp.StatusCode, nil
 }
 
 type nodeTestResult struct {
