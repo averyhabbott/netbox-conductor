@@ -648,6 +648,10 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 		}
 	}
 
+	if hb.PatroniRole != "" {
+		h.hub.NotifyPatroniRole(sess.NodeID, hb.PatroniRole)
+	}
+
 	// Heartbeats are Debug — they fire every 15s and would flood Info logs.
 	logger.Debug("heartbeat",
 		"load", hb.LoadAvg1,
@@ -686,6 +690,7 @@ func (h *AgentHandler) handlePatroniState(_ context.Context, sess *hub.Session, 
 	}
 	logger.Info("patroni role change", "prev_role", ps.PrevRole, "role", ps.Role)
 	slog.Info("patroni role change", "node", sess.NodeID, "prev_role", ps.PrevRole, "role", ps.Role)
+	h.hub.NotifyPatroniRole(sess.NodeID, ps.Role)
 	h.broker.Publish(sse.Event{
 		Type:   sse.EventPatroniState,
 		NodeID: sess.NodeID,
@@ -867,7 +872,10 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 			"error":       result.ErrorMsg,
 			"duration_ms": result.DurationMs,
 		})
-		_ = h.taskResults.Complete(ctx, taskID, result.Success, responseJSON)
+		slog.Info("DEBUG handleTaskResult: persisting result", "task_id", taskID, "success", result.Success) // DEBUG
+		if err := h.taskResults.Complete(ctx, taskID, result.Success, responseJSON); err != nil {
+			logger.Error("DEBUG handleTaskResult: failed to persist task result", "task_id", taskID, "error", err) // DEBUG
+		}
 		h.hub.NotifyTaskResult(taskID, result)
 
 		if result.Success && h.catalog != nil {

@@ -18,6 +18,14 @@ type Hub struct {
 
 	taskWaitersMu sync.Mutex
 	taskWaiters   map[uuid.UUID]chan protocol.TaskResultPayload
+
+	roleWaitersMu sync.Mutex
+	roleWaiters   map[roleWatchKey][]chan struct{}
+}
+
+type roleWatchKey struct {
+	NodeID uuid.UUID
+	Role   string
 }
 
 // New creates an empty Hub.
@@ -26,6 +34,7 @@ func New() *Hub {
 		sessions:        make(map[uuid.UUID]*Session),
 		stagingSessions: make(map[uuid.UUID]*Session),
 		taskWaiters:     make(map[uuid.UUID]chan protocol.TaskResultPayload),
+		roleWaiters:     make(map[roleWatchKey][]chan struct{}),
 	}
 }
 
@@ -221,6 +230,37 @@ func (h *Hub) NotifyTaskResult(taskID uuid.UUID, result protocol.TaskResultPaylo
 	if ok {
 		select {
 		case ch <- result:
+		default:
+		}
+	}
+}
+
+// ── Patroni role watchers ─────────────────────────────────────────────────────
+
+// WatchPatroniRole returns a channel that receives one signal when nodeID
+// reports the given Patroni role via heartbeat or PatroniState message.
+// Register before dispatching the work that triggers the role change to avoid
+// missing a signal that arrives before the select is reached.
+func (h *Hub) WatchPatroniRole(nodeID uuid.UUID, role string) <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	key := roleWatchKey{NodeID: nodeID, Role: role}
+	h.roleWaitersMu.Lock()
+	h.roleWaiters[key] = append(h.roleWaiters[key], ch)
+	h.roleWaitersMu.Unlock()
+	return ch
+}
+
+// NotifyPatroniRole signals all watchers registered for (nodeID, role).
+// Called by handleHeartbeat and handlePatroniState whenever a role is observed.
+func (h *Hub) NotifyPatroniRole(nodeID uuid.UUID, role string) {
+	key := roleWatchKey{NodeID: nodeID, Role: role}
+	h.roleWaitersMu.Lock()
+	watchers := h.roleWaiters[key]
+	delete(h.roleWaiters, key)
+	h.roleWaitersMu.Unlock()
+	for _, ch := range watchers {
+		select {
+		case ch <- struct{}{}:
 		default:
 		}
 	}

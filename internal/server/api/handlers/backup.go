@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
@@ -333,7 +334,38 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		Error    string `json:"error,omitempty"`
 	}
 
+	// Identify primary before dispatching — needed for Patroni pause.
 	var primaryNode *queries.Node
+	for i := range dbNodes {
+		if dbNodes[i].PatroniState != nil {
+			var ps map[string]any
+			if json.Unmarshal(dbNodes[i].PatroniState, &ps) == nil && ps["role"] == "primary" {
+				primaryNode = &dbNodes[i]
+				break
+			}
+		}
+	}
+	if primaryNode == nil {
+		for i := range dbNodes {
+			if h.hub.IsConnected(dbNodes[i].ID) {
+				primaryNode = &dbNodes[i]
+				break
+			}
+		}
+	}
+
+	// Pause Patroni before restarting so no replica can be promoted during the restart window.
+	// The pause flag is stored in the DCS and survives Patroni process restart.
+	if primaryNode != nil {
+		primaryIP, _, _ := strings.Cut(primaryNode.IPAddress, "/")
+		if _, pauseStatus, pauseErr := patroniREST(ctx, http.MethodPatch, primaryIP, "/config",
+			restUser, restPass, []byte(`{"pause": true}`)); pauseErr != nil || pauseStatus >= 300 {
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				"failed to pause Patroni cluster before restart")
+		}
+		slog.Info("enable-backups: Patroni cluster paused", "node", primaryNode.Hostname)
+	}
+
 	pgbTasks := make([]taskRef, 0, len(dbNodes))
 	patroniTaskIDs := make([]uuid.UUID, 0, len(dbNodes))
 	patroniTasks := make([]taskRef, 0, len(dbNodes))
@@ -341,14 +373,6 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	for i := range dbNodes {
 		n := &dbNodes[i]
 		nodeIP, _, _ := strings.Cut(n.IPAddress, "/")
-
-		// Identify primary from Patroni state.
-		if n.PatroniState != nil {
-			var ps map[string]any
-			if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
-				primaryNode = n
-			}
-		}
 
 		// 1. Dispatch pgbackrest.configure.
 		pgbParams, _ := json.Marshal(protocol.PGBackRestConfigParams{Config: pgbConf})
@@ -427,28 +451,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		}
 	}
 
-	// Fall back to any connected node if primary is unknown.
-	if primaryNode == nil {
-		for i := range dbNodes {
-			if h.hub.IsConnected(dbNodes[i].ID) {
-				primaryNode = &dbNodes[i]
-				break
-			}
-		}
-	}
-
 	var stanzaTask *taskRef
-	var stanzaTaskID uuid.UUID
-	if primaryNode != nil {
-		stanzaTaskID = uuid.New()
-		stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
-		// Register the waiter before dispatching to avoid a race.
-		_ = h.taskResults.Create(ctx, primaryNode.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams)
-		ref := taskRef{NodeID: primaryNode.ID.String(), Hostname: primaryNode.Hostname, TaskID: stanzaTaskID.String(), Status: "pending"}
-		// Stanza-create is dispatched in the background goroutine after Patroni
-		// config tasks finish — only pre-register the task here.
-		stanzaTask = &ref
-	}
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodePatroniConfigured,
@@ -463,9 +466,27 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	if primaryNode != nil {
 		capturedPrimary := primaryNode
 		capturedPatroniIDs := patroniTaskIDs
-		capturedStanzaID := stanzaTaskID
 		go func() {
 			bgCtx := context.Background()
+
+			primaryIP, _, _ := strings.Cut(capturedPrimary.IPAddress, "/")
+			var once sync.Once
+			resumePatroni := func() {
+				once.Do(func() {
+					if _, status, err := patroniREST(bgCtx, http.MethodPatch, primaryIP, "/config",
+						restUser, restPass, []byte(`{"pause": false}`)); err != nil || status >= 300 {
+						slog.Warn("enable-backups: failed to resume Patroni cluster",
+							"node", capturedPrimary.Hostname, "status", status)
+					} else {
+						slog.Info("enable-backups: Patroni cluster resumed", "node", capturedPrimary.Hostname)
+					}
+				})
+			}
+			defer resumePatroni()
+
+			// Register the role watcher before step 1 so a fast Patroni restart
+			// cannot fire the heartbeat before we reach the select below.
+			roleCh := h.hub.WatchPatroniRole(capturedPrimary.ID, "primary")
 
 			// 1. Wait for all Patroni restart tasks to reach a terminal state.
 			for _, tid := range capturedPatroniIDs {
@@ -475,69 +496,36 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 				}
 			}
 
-			// 2. Poll heartbeat data until the cluster reports a stable primary.
-			//    Heartbeat interval is 3s; poll every 5s to allow Patroni to
-			//    finish its election before we read the result.
-			var currentPrimary *queries.Node
-			deadline := time.Now().Add(2 * time.Minute)
-			for time.Now().Before(deadline) {
-				if fresh, err := h.nodes.ListByCluster(bgCtx, clusterID); err == nil {
-					if p := primaryDBNode(fresh); p != nil {
-						currentPrimary = p
-						break
-					}
-				}
-				time.Sleep(5 * time.Second)
-			}
-			if currentPrimary == nil {
-				slog.Warn("enable-backups: no Patroni primary found after restart, falling back to original",
-					"original", capturedPrimary.Hostname)
-				currentPrimary = capturedPrimary
+			// 2. Wait for the intended primary to confirm role=primary via a fresh
+			//    heartbeat or PatroniState message — authoritative, not stale DB data.
+			select {
+			case <-roleCh:
+				slog.Info("enable-backups: primary confirmed via heartbeat", "node", capturedPrimary.Hostname)
+			case <-time.After(2 * time.Minute):
+				slog.Warn("enable-backups: timed out waiting for primary heartbeat",
+					"node", capturedPrimary.Hostname)
 			}
 
-			// 3. Switchover to the intended primary if leadership drifted.
-			//    Intended = highest-priority connected DB node.
-			if fresh, err := h.nodes.ListByCluster(bgCtx, clusterID); err == nil {
-				if intended := intendedPrimaryNode(fresh); intended != nil && intended.ID != currentPrimary.ID {
-					slog.Info("enable-backups: primary drifted after restart, initiating switchover",
-						"current", currentPrimary.Hostname, "intended", intended.Hostname)
-					switchParams, _ := json.Marshal(protocol.PatroniSwitchoverParams{Candidate: intended.Hostname})
-					switchTaskID := uuid.New()
-					_ = h.taskResults.Create(bgCtx, currentPrimary.ID, switchTaskID,
-						string(protocol.TaskPatroniSwitchover), switchParams)
-					if dispErr := h.dispatcher.Dispatch(currentPrimary.ID, protocol.TaskDispatchPayload{
-						TaskID:      switchTaskID.String(),
-						TaskType:    protocol.TaskPatroniSwitchover,
-						Params:      json.RawMessage(switchParams),
-						TimeoutSecs: 60,
-					}); dispErr == nil {
-						_ = h.taskResults.SetSent(bgCtx, switchTaskID)
-						if ok := pollTaskSuccess(bgCtx, h.taskResults, switchTaskID, 2*time.Minute); ok {
-							currentPrimary = intended
-							slog.Info("enable-backups: switchover complete", "primary", currentPrimary.Hostname)
-						} else {
-							slog.Warn("enable-backups: switchover did not complete, proceeding with current primary",
-								"current", currentPrimary.Hostname)
-						}
-					}
-				}
-			}
+			// 3. Resume Patroni — primary is confirmed back in role.
+			resumePatroni()
 
-			// 4. Dispatch stanza-create to the confirmed primary.
+			// 4. Create and dispatch stanza-create to the confirmed primary.
 			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
-			if dispErr := h.dispatcher.Dispatch(currentPrimary.ID, protocol.TaskDispatchPayload{
-				TaskID:      capturedStanzaID.String(),
+			stanzaTaskID := uuid.New()
+			_ = h.taskResults.Create(bgCtx, capturedPrimary.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams)
+			if dispErr := h.dispatcher.Dispatch(capturedPrimary.ID, protocol.TaskDispatchPayload{
+				TaskID:      stanzaTaskID.String(),
 				TaskType:    protocol.TaskPGBackRestStanzaCreate,
 				Params:      json.RawMessage(stanzaParams),
 				TimeoutSecs: 120,
 			}); dispErr != nil {
 				slog.Warn("enable-backups: stanza-create dispatch failed",
-					"node", currentPrimary.Hostname, "error", dispErr)
+					"node", capturedPrimary.Hostname, "error", dispErr)
 				return
 			}
-			_ = h.taskResults.SetSent(bgCtx, capturedStanzaID)
+			_ = h.taskResults.SetSent(bgCtx, stanzaTaskID)
 
-			if ok := pollTaskSuccess(bgCtx, h.taskResults, capturedStanzaID, 5*time.Minute); !ok {
+			if ok := pollTaskSuccess(bgCtx, h.taskResults, stanzaTaskID, 5*time.Minute); !ok {
 				return
 			}
 
@@ -818,7 +806,8 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	// Step 1: Pause Patroni automation via REST API.
 	// The pause flag propagates via DCS to all cluster members automatically.
 	restoreIP := stripCIDR(restoreNode.IPAddress)
-	if _, status, err := patroniREST(ctx, http.MethodPatch, restoreIP, "/config", restUser, restPass, []byte(`{"pause": true}`)); err != nil || status >= 300 {
+	if pauseBody, status, err := patroniREST(ctx, http.MethodPatch, restoreIP, "/config", restUser, restPass, []byte(`{"pause": true}`)); err != nil || status >= 300 {
+		slog.Info("DEBUG restore: patroni pause failed", "status", status, "body", string(pauseBody), "err", err) // DEBUG
 		_ = h.schedules.SetRestoreInProgress(ctx, clusterID, false)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadGateway, "patroni pause failed: "+err.Error())
@@ -951,8 +940,10 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 // patroniREST makes an authenticated request to the Patroni REST API on a given node.
 func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, body []byte) ([]byte, int, error) {
 	url := fmt.Sprintf("http://%s:8008%s", nodeIP, path)
+	slog.Info("DEBUG patroniREST →", "method", method, "url", url, "body", string(body)) // DEBUG
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
+		slog.Info("DEBUG patroniREST ✗ build request", "method", method, "url", url, "err", err) // DEBUG
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -961,10 +952,12 @@ func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, b
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		slog.Info("DEBUG patroniREST ✗ do request", "method", method, "url", url, "err", err) // DEBUG
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
+	slog.Info("DEBUG patroniREST ←", "method", method, "url", url, "status", resp.StatusCode, "body", string(b)) // DEBUG
 	return b, resp.StatusCode, nil
 }
 
@@ -1558,7 +1551,10 @@ func pollTaskSuccess(ctx context.Context, q *queries.TaskResultQuerier, taskID u
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		t, err := q.GetByTaskID(ctx, taskID)
-		if err == nil {
+		if err != nil {
+			slog.Info("DEBUG pollTaskSuccess: db error", "task_id", taskID, "error", err) // DEBUG
+		} else {
+			slog.Info("DEBUG pollTaskSuccess: poll", "task_id", taskID, "status", t.Status) // DEBUG
 			switch t.Status {
 			case "success":
 				return true
