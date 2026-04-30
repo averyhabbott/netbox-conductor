@@ -3257,7 +3257,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
                           {b.type === 'full' ? 'Full backup' : b.type === 'diff' ? 'Daily snapshot' : 'Log snapshot'}
                         </span>
                       </div>
-                      <span className="text-gray-500">{new Date(b.started_at).toLocaleString()}</span>
+                      <span className="text-gray-500">{new Date(b.finished_at).toLocaleString()}</span>
                     </div>
                   ))}
                 </div>
