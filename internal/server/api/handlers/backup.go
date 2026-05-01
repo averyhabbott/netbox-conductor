@@ -806,8 +806,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	// Step 1: Pause Patroni automation via REST API.
 	// The pause flag propagates via DCS to all cluster members automatically.
 	restoreIP := stripCIDR(restoreNode.IPAddress)
-	if pauseBody, status, err := patroniREST(ctx, http.MethodPatch, restoreIP, "/config", restUser, restPass, []byte(`{"pause": true}`)); err != nil || status >= 300 {
-		slog.Info("DEBUG restore: patroni pause failed", "status", status, "body", string(pauseBody), "err", err) // DEBUG
+	if _, status, err := patroniREST(ctx, http.MethodPatch, restoreIP, "/config", restUser, restPass, []byte(`{"pause": true}`)); err != nil || status >= 300 {
 		_ = h.schedules.SetRestoreInProgress(ctx, clusterID, false)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadGateway, "patroni pause failed: "+err.Error())
@@ -940,10 +939,8 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 // patroniREST makes an authenticated request to the Patroni REST API on a given node.
 func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, body []byte) ([]byte, int, error) {
 	url := fmt.Sprintf("http://%s:8008%s", nodeIP, path)
-	slog.Info("DEBUG patroniREST →", "method", method, "url", url, "body", string(body)) // DEBUG
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
-		slog.Info("DEBUG patroniREST ✗ build request", "method", method, "url", url, "err", err) // DEBUG
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -952,12 +949,10 @@ func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, b
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		slog.Info("DEBUG patroniREST ✗ do request", "method", method, "url", url, "err", err) // DEBUG
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	slog.Info("DEBUG patroniREST ←", "method", method, "url", url, "status", resp.StatusCode, "body", string(b)) // DEBUG
 	return b, resp.StatusCode, nil
 }
 
@@ -1551,10 +1546,7 @@ func pollTaskSuccess(ctx context.Context, q *queries.TaskResultQuerier, taskID u
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		t, err := q.GetByTaskID(ctx, taskID)
-		if err != nil {
-			slog.Info("DEBUG pollTaskSuccess: db error", "task_id", taskID, "error", err) // DEBUG
-		} else {
-			slog.Info("DEBUG pollTaskSuccess: poll", "task_id", taskID, "status", t.Status) // DEBUG
+		if err == nil {
 			switch t.Status {
 			case "success":
 				return true

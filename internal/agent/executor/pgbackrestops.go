@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -222,8 +223,22 @@ func startPostgresql(dataDir string) (string, error) {
 			args = append(args, "-o", "-c config_file="+confFile)
 		}
 	}
-	out, err := exec.Command("sudo", args...).CombinedOutput()
-	return string(out), err
+	// CombinedOutput() creates a pipe; postgres (a daemon) inherits the write end
+	// from pg_ctl and holds it open, so cmd.Wait() never returns. A real *os.File
+	// avoids creating a pipe — the fd is inherited by postgres harmlessly.
+	tmp, err := os.CreateTemp("", "pg_ctl_start_*.log")
+	if err != nil {
+		return "", fmt.Errorf("pg_ctl start: create temp log: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	cmd := exec.Command("sudo", args...)
+	cmd.Stdout = tmp
+	cmd.Stderr = tmp
+	runErr := cmd.Run()
+	_, _ = tmp.Seek(0, io.SeekStart)
+	out, _ := io.ReadAll(tmp)
+	return string(out), runErr
 }
 
 // findDebianConfFile uses pg_lsclusters to locate postgresql.conf for a given

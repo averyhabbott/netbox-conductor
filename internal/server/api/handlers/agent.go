@@ -872,9 +872,8 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 			"error":       result.ErrorMsg,
 			"duration_ms": result.DurationMs,
 		})
-		slog.Info("DEBUG handleTaskResult: persisting result", "task_id", taskID, "success", result.Success) // DEBUG
 		if err := h.taskResults.Complete(ctx, taskID, result.Success, responseJSON); err != nil {
-			logger.Error("DEBUG handleTaskResult: failed to persist task result", "task_id", taskID, "error", err) // DEBUG
+			logger.Error("handleTaskResult: failed to persist task result", "task_id", taskID, "error", err)
 		}
 		h.hub.NotifyTaskResult(taskID, result)
 

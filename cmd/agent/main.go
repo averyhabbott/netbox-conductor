@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"log/syslog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -280,22 +279,9 @@ func main() {
 // setupLogging configures the default slog logger and routes the stdlib log
 // package through it. Writes to stderr (journald) and the local syslog socket.
 func setupLogging(level slog.Level) {
-	writers := []io.Writer{os.Stderr}
-
-	// Best-effort syslog — skip silently if the socket is unavailable (e.g. in
-	// containers or non-Linux environments).
-	if sw, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "netbox-agent"); err == nil {
-		writers = append(writers, sw)
-	}
-
-	h := slog.NewTextHandler(
-		io.MultiWriter(writers...),
-		&slog.HandlerOptions{Level: level},
-	)
-	logger := slog.New(h)
-	slog.SetDefault(logger)
-	// Route stdlib log.Printf calls through slog at Info level.
-	log.SetOutput(io.Discard) // slog.SetDefault already redirects; silence duplicate output
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(h))
+	log.SetOutput(io.Discard)
 }
 
 // handleTaskDispatch routes an inbound task to the appropriate executor.
