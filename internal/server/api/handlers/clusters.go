@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/middleware"
@@ -131,12 +132,12 @@ func (h *ClusterHandler) List(c echo.Context) error {
 	return c.JSON(http.StatusOK, resp)
 }
 
+var validClusterName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{0,62}$`)
+
 type createClusterRequest struct {
-	Name          string `json:"name"`
-	Description   string `json:"description"`
-	Mode          string `json:"mode"`
-	PatroniScope  string `json:"patroni_scope"`
-	NetboxVersion string `json:"netbox_version"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Mode        string `json:"mode"`
 }
 
 // Create godoc
@@ -146,25 +147,20 @@ func (h *ClusterHandler) Create(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	if req.Name == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
+	if !validClusterName.MatchString(req.Name) {
+		return echo.NewHTTPError(http.StatusBadRequest,
+			"cluster name must start with a letter and contain only letters, numbers, hyphens, or underscores (max 63 chars)")
 	}
 	if req.Mode != "active_standby" && req.Mode != "ha" {
 		return echo.NewHTTPError(http.StatusBadRequest, "mode must be active_standby or ha")
-	}
-	if req.PatroniScope == "" {
-		req.PatroniScope = req.Name
-	}
-	if req.NetboxVersion == "" {
-		req.NetboxVersion = "4.x"
 	}
 
 	cluster, err := h.clusters.Create(c.Request().Context(), queries.CreateClusterParams{
 		Name:          req.Name,
 		Description:   req.Description,
 		Mode:          req.Mode,
-		PatroniScope:  req.PatroniScope,
-		NetboxVersion: req.NetboxVersion,
+		PatroniScope:  req.Name,
+		NetboxVersion: "4.x",
 	})
 	if err != nil {
 		return echo.NewHTTPError(http.StatusConflict, "cluster name already exists")

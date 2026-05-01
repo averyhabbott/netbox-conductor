@@ -74,8 +74,6 @@ export interface CreateClusterBody {
   name: string
   description?: string
   mode: 'active_standby' | 'ha'
-  patroni_scope?: string
-  netbox_version?: string
 }
 
 export interface ClusterStatus {

@@ -509,6 +509,23 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			// 3. Resume Patroni — primary is confirmed back in role.
 			resumePatroni()
 
+			// 3b. Restart PostgreSQL via Patroni REST API to apply archive_mode = on.
+			// The Patroni process restart (step 1) does not restart PostgreSQL when it
+			// was already running — Patroni marks pending_restart but won't apply it
+			// while paused. POST /restart is synchronous: HTTP 200 means PostgreSQL is
+			// back up with the new config active. It is honored even when paused (the
+			// pause guard only blocks scheduled restarts, not immediate ones).
+			restartCtx, restartCancel := context.WithTimeout(bgCtx, 3*time.Minute)
+			defer restartCancel()
+			if _, restartStatus, restartErr := patroniREST(restartCtx, http.MethodPost, primaryIP,
+				"/restart", restUser, restPass, []byte(`{}`)); restartErr != nil || restartStatus >= 300 {
+				slog.Warn("enable-backups: Patroni postgres restart failed — stanza-create may fail",
+					"node", capturedPrimary.Hostname, "status", restartStatus, "err", restartErr)
+			} else {
+				slog.Info("enable-backups: postgres restarted, archive_mode active",
+					"node", capturedPrimary.Hostname)
+			}
+
 			// 4. Create and dispatch stanza-create to the confirmed primary.
 			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
 			stanzaTaskID := uuid.New()

@@ -123,6 +123,9 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 	// Step 2: Run pgBackRest restore as the postgres OS user.
 	// pgbackrest requires YYYY-MM-DD HH:MM:SS+00, not RFC3339 (T/Z).
 	pgbackrestTime := strings.NewReplacer("T", " ", "Z", "+00").Replace(params.TargetTime)
+	if dot := strings.IndexByte(pgbackrestTime, '.'); dot != -1 {
+		pgbackrestTime = pgbackrestTime[:dot] + pgbackrestTime[strings.IndexByte(pgbackrestTime, '+'):]
+	}
 
 	var restoreArgs []string
 	if params.RestoreCmd != "" {

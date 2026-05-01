@@ -28,8 +28,6 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
     name: '',
     description: '',
     mode: 'active_standby',
-    patroni_scope: '',
-    netbox_version: '',
   })
   const [error, setError] = useState('')
 
@@ -51,10 +49,7 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
         <form
           onSubmit={(e) => {
             e.preventDefault()
-            create.mutate({
-              ...form,
-              patroni_scope: form.patroni_scope || form.name,
-            })
+            create.mutate(form)
           }}
           className="space-y-4"
         >
@@ -66,8 +61,11 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
               placeholder="prod-cluster-a"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
+              maxLength={63}
+              pattern="[a-zA-Z][a-zA-Z0-9_\-]{0,62}"
               required
             />
+            <p className="text-xs text-gray-500 mt-1">Letters, numbers, hyphens, and underscores only. Must start with a letter. Max 63 chars.</p>
           </div>
           <div>
             <label className="block text-sm text-gray-400 mb-1">
@@ -93,29 +91,6 @@ function CreateClusterModal({ onClose }: CreateClusterModalProps) {
               <option value="active_standby">Active / Standby</option>
               <option value="ha">HA (3+ nodes)</option>
             </select>
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">
-              Patroni Scope{' '}
-              <span className="text-gray-600">(defaults to cluster name)</span>
-            </label>
-            <input
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-              placeholder={form.name || 'prod-cluster-a'}
-              value={form.patroni_scope}
-              onChange={(e) => setForm({ ...form, patroni_scope: e.target.value })}
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">
-              NetBox Version <span className="text-gray-600">(updated automatically from agent heartbeat)</span>
-            </label>
-            <input
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-              placeholder="e.g. v4.5.7"
-              value={form.netbox_version}
-              onChange={(e) => setForm({ ...form, netbox_version: e.target.value })}
-            />
           </div>
           {error && <p className="text-sm text-red-400">{error}</p>}
           <div className="flex gap-3 pt-2">

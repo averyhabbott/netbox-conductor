@@ -45,7 +45,7 @@ const DefaultFailbackMultiplier = 3
 // startupSuppressWindow is how long after the manager starts during which
 // disconnect events do NOT arm failover timers. This prevents a conductor
 // restart from triggering mass failovers as all agents reconnect.
-const startupSuppressWindow = 90 * time.Second
+const startupSuppressWindow = 30 * time.Second
 
 // Manager watches for node disconnections and orchestrates failover and
 // failback for active_standby clusters.
@@ -167,9 +167,10 @@ func (m *Manager) emitHAEvent(_ context.Context, p haEventParams) {
 func (m *Manager) OnNodeDisconnect(nodeID, clusterID uuid.UUID) {
 	// Suppress failover timers during the startup window to avoid mass-triggering
 	// when all agents reconnect after a conductor restart.
-	if time.Since(m.startedAt) < startupSuppressWindow {
-		slog.Debug("failover: startup suppression window active — not arming timer",
-			"node", nodeID, "elapsed", time.Since(m.startedAt).Round(time.Second))
+	if elapsed := time.Since(m.startedAt); elapsed < startupSuppressWindow {
+		slog.Info("failover: startup suppression window active — not arming timer",
+			"node", nodeID, "elapsed", elapsed.Round(time.Second),
+			"remaining", (startupSuppressWindow - elapsed).Round(time.Second))
 		return
 	}
 
