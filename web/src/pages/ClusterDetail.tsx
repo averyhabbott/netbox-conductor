@@ -3748,6 +3748,17 @@ export default function ClusterDetail() {
   )
 }
 
+function sortedJSON(value: unknown): string {
+  const sort = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(sort)
+    if (v !== null && typeof v === 'object') {
+      return Object.fromEntries(Object.keys(v as object).sort().map(k => [k, sort((v as Record<string, unknown>)[k])]))
+    }
+    return v
+  }
+  return JSON.stringify(sort(value), null, 2)
+}
+
 // ── PatroniConfigModal ────────────────────────────────────────────────────────
 
 function PatroniConfigModal({
@@ -3778,7 +3789,7 @@ function PatroniConfigModal({
     ])
       .then(([cfg, snaps]) => {
         if (cancelled) return
-        const pretty = JSON.stringify(cfg, null, 2)
+        const pretty = sortedJSON(cfg)
         setCurrentConfig(pretty)
         setEditorValue(pretty)
         setSnapshots(snaps)
@@ -3798,7 +3809,7 @@ function PatroniConfigModal({
       setEditorValue(currentConfig)
     } else {
       const snap = snapshots.find((s) => s.id === id)
-      if (snap) setEditorValue(JSON.stringify(snap.config, null, 2))
+      if (snap) setEditorValue(sortedJSON(snap.config))
     }
   }
 
