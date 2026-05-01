@@ -10,7 +10,7 @@ import type { Credential, CredentialKind, GeneratedCredential } from '../api/cre
 import { configsApi } from '../api/configs'
 import type { ReadNodeConfigResult } from '../api/configs'
 import { patroniApi } from '../api/patroni'
-import type { PushResult } from '../api/patroni'
+import type { PatroniConfigSnapshot, PushResult } from '../api/patroni'
 import { alertsApi } from '../api/alerts'
 import { eventsApi } from '../api/events'
 import { useSSE } from '../hooks/useSSE'
@@ -1057,7 +1057,7 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
   })
   const hasConfigTemplate = !!configData && !configData.config?.is_default
 
-  const [patroniPushResult, setPatroniPushResult] = useState<PushResult[] | null>(null)
+  const [editPatroniOpen, setEditPatroniOpen] = useState(false)
   const [sentinelPushResult, setSentinelPushResult] = useState<PushResult[] | null>(null)
   const [sentinelRestart, setSentinelRestart] = useState(false)
 
@@ -1098,11 +1098,6 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
       setShowWarning(false)
       setResult(data)
     },
-  })
-
-  const pushPatroni = useMutation({
-    mutationFn: () => patroniApi.pushPatroniConfig(cluster.id),
-    onSuccess: (data) => setPatroniPushResult(data.nodes),
   })
 
   const pushSentinel = useMutation({
@@ -1301,20 +1296,12 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
 
 
         {/* Push results */}
-        {(patroniPushResult || sentinelPushResult) && (
+        {sentinelPushResult && (
           <div className="mt-3 space-y-3">
-            {patroniPushResult && (
-              <div>
-                <p className="text-xs text-gray-500 mb-1">Patroni config push</p>
-                <PushResultList results={patroniPushResult} />
-              </div>
-            )}
-            {sentinelPushResult && (
-              <div>
-                <p className="text-xs text-gray-500 mb-1">Sentinel config push</p>
-                <PushResultList results={sentinelPushResult} />
-              </div>
-            )}
+            <div>
+              <p className="text-xs text-gray-500 mb-1">Sentinel config push</p>
+              <PushResultList results={sentinelPushResult} />
+            </div>
           </div>
         )}
 
@@ -1329,11 +1316,12 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
           </div>
           <div className="flex flex-wrap items-center gap-2 ml-auto">
             <button
-              onClick={() => pushPatroni.mutate()}
-              disabled={pushPatroni.isPending}
-              className="text-sm bg-gray-700 hover:bg-gray-600 disabled:opacity-40 px-4 py-1.5 rounded-lg transition-colors"
+              onClick={() => setEditPatroniOpen(true)}
+              disabled={!cluster.patroni_configured}
+              title={!cluster.patroni_configured ? 'Run Configure Failover first' : undefined}
+              className="text-sm bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-1.5 rounded-lg transition-colors"
             >
-              {pushPatroni.isPending ? 'Pushing…' : 'Push Patroni Config'}
+              Edit Patroni Config
             </button>
             <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer select-none">
               <input
@@ -1473,6 +1461,15 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
             </div>
           </div>
         </div>
+      )}
+      {editPatroniOpen && (
+        <PatroniConfigModal
+          clusterId={cluster.id}
+          primaryHostname={
+            nodes?.find((n) => n.patroni_role === 'primary' || n.patroni_role === 'master')?.hostname ?? 'primary'
+          }
+          onClose={() => setEditPatroniOpen(false)}
+        />
       )}
     </div>
   )
@@ -3748,5 +3745,191 @@ export default function ClusterDetail() {
         />
       )}
     </Layout>
+  )
+}
+
+// ── PatroniConfigModal ────────────────────────────────────────────────────────
+
+function PatroniConfigModal({
+  clusterId,
+  primaryHostname,
+  onClose,
+}: {
+  clusterId: string
+  primaryHostname: string
+  onClose: () => void
+}) {
+  const [editorValue, setEditorValue] = useState('')
+  const [currentConfig, setCurrentConfig] = useState('')
+  const [snapshots, setSnapshots] = useState<PatroniConfigSnapshot[]>([])
+  const [selectedSnapshot, setSelectedSnapshot] = useState('current')
+  const [loadState, setLoadState] = useState<'loading' | 'loaded' | 'error'>('loading')
+  const [loadError, setLoadError] = useState('')
+  const [validationError, setValidationError] = useState('')
+  const [showDeployResult, setShowDeployResult] = useState(false)
+  const [deployStatus, setDeployStatus] = useState<'pending' | 'ok' | 'fail'>('pending')
+  const [deployError, setDeployError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([
+      patroniApi.getPatroniConfig(clusterId),
+      patroniApi.getPatroniSnapshots(clusterId),
+    ])
+      .then(([cfg, snaps]) => {
+        if (cancelled) return
+        const pretty = JSON.stringify(cfg, null, 2)
+        setCurrentConfig(pretty)
+        setEditorValue(pretty)
+        setSnapshots(snaps)
+        setLoadState('loaded')
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setLoadError(err instanceof Error ? err.message : String(err))
+        setLoadState('error')
+      })
+    return () => { cancelled = true }
+  }, [clusterId])
+
+  function handleSnapshotChange(id: string) {
+    setSelectedSnapshot(id)
+    if (id === 'current') {
+      setEditorValue(currentConfig)
+    } else {
+      const snap = snapshots.find((s) => s.id === id)
+      if (snap) setEditorValue(JSON.stringify(snap.config, null, 2))
+    }
+  }
+
+  async function handleDeploy() {
+    setValidationError('')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(editorValue)
+    } catch {
+      setValidationError('Invalid JSON — fix the syntax before deploying.')
+      return
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      setValidationError('Config must be a JSON object.')
+      return
+    }
+    setDeployStatus('pending')
+    setDeployError('')
+    setShowDeployResult(true)
+    try {
+      await patroniApi.patchPatroniConfig(clusterId, parsed)
+      setDeployStatus('ok')
+    } catch (err: unknown) {
+      setDeployStatus('fail')
+      setDeployError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60">
+      <div className="bg-gray-900 border border-gray-700 rounded-lg w-full max-w-2xl p-6 space-y-4">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-white">Edit Patroni Config</h2>
+          {loadState === 'loaded' && snapshots.length > 0 && (
+            <select
+              value={selectedSnapshot}
+              onChange={(e) => handleSnapshotChange(e.target.value)}
+              className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-300"
+            >
+              <option value="current">Current</option>
+              {snapshots.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {new Date(s.captured_at).toLocaleString()} — {s.source}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        {/* Body */}
+        {loadState === 'loading' && (
+          <div className="space-y-2">
+            <p className="text-xs text-gray-400">Fetching config…</p>
+            <div className="flex items-center justify-center h-40 border border-gray-700 rounded bg-gray-950">
+              <svg className="animate-spin h-6 w-6 text-gray-500" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+              </svg>
+            </div>
+          </div>
+        )}
+        {loadState === 'error' && (
+          <div className="space-y-3">
+            <p className="text-xs text-red-400">Failed to load config: {loadError}</p>
+            <div className="flex justify-end">
+              <button onClick={onClose} className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white">
+                Close
+              </button>
+            </div>
+          </div>
+        )}
+        {loadState === 'loaded' && (
+          <>
+            <textarea
+              value={editorValue}
+              onChange={(e) => setEditorValue(e.target.value)}
+              rows={20}
+              spellCheck={false}
+              className="w-full font-mono text-xs bg-gray-950 border border-gray-700 rounded p-3 text-gray-200 resize-none focus:outline-none focus:border-gray-500"
+            />
+            {validationError && (
+              <p className="text-xs text-red-400">{validationError}</p>
+            )}
+            <p className="text-xs text-gray-500">
+              Conductor-managed keys (reset on next Configure Failover / Enable Backups):{' '}
+              <span className="font-mono">ttl, loop_wait, retry_timeout, maximum_lag_on_failover, failsafe_mode, use_pg_rewind, use_slots, wal_level, hot_standby, max_wal_senders, max_replication_slots, wal_log_hints, archive_mode, archive_command</span>
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={onClose}
+                className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeploy}
+                className="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-white"
+              >
+                Deploy
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Deploy result popup */}
+      {showDeployResult && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 border border-gray-700 rounded-lg w-full max-w-md p-6 space-y-4">
+            <h2 className="text-sm font-semibold text-white">Deploying to {primaryHostname}</h2>
+            <div className="text-xs">
+              {deployStatus === 'pending' && <span className="text-gray-400">Deploying…</span>}
+              {deployStatus === 'ok'      && <span className="text-emerald-400">✓ Applied</span>}
+              {deployStatus === 'fail'    && <span className="text-red-400">✗ Failed</span>}
+            </div>
+            {deployStatus === 'fail' && deployError && (
+              <p className="text-xs text-red-400/80 font-mono break-all">{deployError}</p>
+            )}
+            <div className="flex justify-end">
+              <button
+                disabled={deployStatus === 'pending'}
+                onClick={() => setShowDeployResult(false)}
+                className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white disabled:opacity-40"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }

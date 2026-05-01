@@ -396,6 +396,15 @@ func (q *BackupScheduleQuerier) SetStanzaInitialized(ctx context.Context, cluste
 	return err
 }
 
+func (q *BackupScheduleQuerier) ClearStanzaInitialized(ctx context.Context, clusterID uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE backup_schedules
+		SET stanza_initialized = FALSE, updated_at = now()
+		WHERE cluster_id = $1
+	`, clusterID)
+	return err
+}
+
 func (q *BackupScheduleQuerier) SetFirstBackupRun(ctx context.Context, clusterID uuid.UUID) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE backup_schedules SET first_backup_run = TRUE, updated_at = now() WHERE cluster_id = $1

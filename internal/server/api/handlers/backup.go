@@ -1,17 +1,13 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
@@ -34,6 +30,7 @@ type BackupHandler struct {
 	runs        *queries.BackupRunQuerier
 	catalog     *queries.BackupCatalogQuerier
 	taskResults *queries.TaskResultQuerier
+	snapshots   *queries.PatroniSnapshotQuerier
 	enc         *crypto.Encryptor
 	dispatcher  *hub.Dispatcher
 	hub         *hub.Hub
@@ -52,6 +49,7 @@ func NewBackupHandler(
 	runs *queries.BackupRunQuerier,
 	catalog *queries.BackupCatalogQuerier,
 	taskResults *queries.TaskResultQuerier,
+	snapshots *queries.PatroniSnapshotQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	h *hub.Hub,
@@ -66,6 +64,7 @@ func NewBackupHandler(
 		runs:        runs,
 		catalog:     catalog,
 		taskResults: taskResults,
+		snapshots:   snapshots,
 		enc:         enc,
 		dispatcher:  dispatcher,
 		hub:         h,
@@ -209,6 +208,7 @@ func (h *BackupHandler) UpdateBackupTarget(c echo.Context) error {
 }
 
 // DeleteBackupTarget removes a backup storage location.
+// If the deleted target was the last one, archiving is automatically disabled in the DCS.
 // DELETE /api/v1/clusters/:id/backup-targets/:tid
 func (h *BackupHandler) DeleteBackupTarget(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
@@ -230,14 +230,93 @@ func (h *BackupHandler) DeleteBackupTarget(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete backup target")
 	}
 
+	// If no targets remain, disable archiving in the background.
+	remaining, _ := h.targets.ListByCluster(ctx, clusterID)
+	if len(remaining) == 0 {
+		nodes, _ := h.nodes.ListByCluster(ctx, clusterID)
+		if primary := primaryDBNode(nodes); primary != nil {
+			capturedPrimary := *primary
+			capturedSnapshots := h.snapshots
+			go func() {
+				bgCtx := context.Background()
+				h.disableArchiving(bgCtx, clusterID, capturedPrimary, capturedSnapshots)
+			}()
+		}
+	}
+
 	return c.JSON(http.StatusOK, map[string]any{"deleted": tid.String()})
+}
+
+// DisableBackups removes archive settings from the Patroni DCS config and clears
+// the stanza_initialized flag. Does not restart PostgreSQL — archive_mode=off takes
+// effect on the next Patroni-managed restart.
+// POST /api/v1/clusters/:id/backup-config/disable
+func (h *BackupHandler) DisableBackups(c echo.Context) error {
+	clusterID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
+	}
+	ctx := c.Request().Context()
+
+	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
+	}
+	primary := primaryDBNode(nodes)
+	if primary == nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "no connected primary node found")
+	}
+
+	if err := h.disableArchiving(ctx, clusterID, *primary, h.snapshots); err != nil {
+		return echo.NewHTTPError(http.StatusBadGateway, "failed to disable archiving: "+err.Error())
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{"cluster_id": clusterID.String(), "status": "archiving disabled"})
+}
+
+// disableArchiving snapshots the current Patroni config, then PATCHes archive_mode and
+// archive_command to null (removes them from DCS). Also clears stanza_initialized.
+func (h *BackupHandler) disableArchiving(ctx context.Context, clusterID uuid.UUID, primary queries.Node, snaps *queries.PatroniSnapshotQuerier) error {
+	restUser, restPass := "patroni", ""
+	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+		restUser = cred.Username
+		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
+			restPass = string(pw)
+		}
+	}
+	primaryIP := stripCIDR(primary.IPAddress)
+
+	if snaps != nil {
+		snapshotPatroniConfig(ctx, snaps, clusterID, primaryIP, restUser, restPass, "configure-backups")
+	}
+
+	disablePatch, _ := json.Marshal(map[string]any{
+		"postgresql": map[string]any{
+			"parameters": map[string]any{
+				"archive_mode":    nil,
+				"archive_command": nil,
+			},
+		},
+	})
+	patchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, status, err := patroniREST(patchCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, disablePatch)
+	if err != nil {
+		return err
+	}
+	if status >= 300 {
+		return fmt.Errorf("PATCH /config returned HTTP %d", status)
+	}
+
+	slog.Info("disable-archiving: archive settings removed from DCS", "node", primary.Hostname)
+	_ = h.schedules.ClearStanzaInitialized(ctx, clusterID)
+	return nil
 }
 
 // EnableBackups runs the full backup bootstrap sequence for a cluster:
 //  1. Push pgbackrest.conf to all DB nodes.
-//  2. Push Patroni config with archive_mode/archive_command to all DB nodes (requires restart).
-//  3. Background: wait for Patroni config tasks → dispatch stanza-create to primary →
-//     wait for success → set stanza_initialized=true.
+//  2. Background: PATCH Patroni DCS config with archive settings → restart PostgreSQL
+//     if archive_mode not already active → dispatch stanza-create if not yet initialized.
 //
 // POST /api/v1/clusters/:id/backup-config/enable
 func (h *BackupHandler) EnableBackups(c echo.Context) error {
@@ -270,8 +349,6 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	stanzaName := cluster.PatroniScope
 
 	// Ensure a schedule row exists so SetStanzaInitialized has a row to UPDATE.
-	// If the user hasn't saved a schedule yet, create one with defaults.
-	// If one already exists, leave its values untouched.
 	if existing, _ := h.schedules.Get(ctx, clusterID); existing == nil {
 		if _, err := h.schedules.Upsert(ctx, queries.UpsertBackupScheduleParams{
 			ClusterID:             clusterID,
@@ -284,40 +361,13 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		}
 	}
 
-	// Fetch cluster credentials for Patroni config rendering.
-	superUser, superPass := "postgres", ""
-	replicaUser, replicaPass := "replicator", ""
+	// Fetch Patroni REST credentials.
 	restUser, restPass := "patroni", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_superuser"); err == nil {
-		superUser = cred.Username
-		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
-			superPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_replication"); err == nil {
-		replicaUser = cred.Username
-		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
-			replicaPass = string(pw)
-		}
-	}
 	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
 		restUser = cred.Username
 		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
 			restPass = string(pw)
 		}
-	}
-
-	// Witness address (empty for HA 3+ node clusters).
-	witnessAddr := ""
-	if h.witness != nil {
-		witnessAddr = h.witness.Addr(clusterID)
-	}
-
-	// Build Raft peer list.
-	raftPeers := make([]string, 0, len(dbNodes))
-	for _, n := range dbNodes {
-		nodeIP, _, _ := strings.Cut(n.IPAddress, "/")
-		raftPeers = append(raftPeers, nodeIP+":5433")
 	}
 
 	// Render pgbackrest.conf.
@@ -334,47 +384,13 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		Error    string `json:"error,omitempty"`
 	}
 
-	// Identify primary before dispatching — needed for Patroni pause.
-	var primaryNode *queries.Node
-	for i := range dbNodes {
-		if dbNodes[i].PatroniState != nil {
-			var ps map[string]any
-			if json.Unmarshal(dbNodes[i].PatroniState, &ps) == nil && ps["role"] == "primary" {
-				primaryNode = &dbNodes[i]
-				break
-			}
-		}
-	}
-	if primaryNode == nil {
-		for i := range dbNodes {
-			if h.hub.IsConnected(dbNodes[i].ID) {
-				primaryNode = &dbNodes[i]
-				break
-			}
-		}
-	}
+	// Identify primary for background work.
+	primaryNode := primaryDBNode(nodes)
 
-	// Pause Patroni before restarting so no replica can be promoted during the restart window.
-	// The pause flag is stored in the DCS and survives Patroni process restart.
-	if primaryNode != nil {
-		primaryIP, _, _ := strings.Cut(primaryNode.IPAddress, "/")
-		if _, pauseStatus, pauseErr := patroniREST(ctx, http.MethodPatch, primaryIP, "/config",
-			restUser, restPass, []byte(`{"pause": true}`)); pauseErr != nil || pauseStatus >= 300 {
-			return echo.NewHTTPError(http.StatusInternalServerError,
-				"failed to pause Patroni cluster before restart")
-		}
-		slog.Info("enable-backups: Patroni cluster paused", "node", primaryNode.Hostname)
-	}
-
+	// Dispatch pgbackrest.configure to all DB nodes.
 	pgbTasks := make([]taskRef, 0, len(dbNodes))
-	patroniTaskIDs := make([]uuid.UUID, 0, len(dbNodes))
-	patroniTasks := make([]taskRef, 0, len(dbNodes))
-
 	for i := range dbNodes {
 		n := &dbNodes[i]
-		nodeIP, _, _ := strings.Cut(n.IPAddress, "/")
-
-		// 1. Dispatch pgbackrest.configure.
 		pgbParams, _ := json.Marshal(protocol.PGBackRestConfigParams{Config: pgbConf})
 		pgbTaskID := uuid.New()
 		_ = h.taskResults.Create(ctx, n.ID, pgbTaskID, string(protocol.TaskPGBackRestConfigure), pgbParams)
@@ -389,69 +405,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			_ = h.taskResults.SetSent(ctx, pgbTaskID)
 			pgbTasks = append(pgbTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: pgbTaskID.String(), Status: "dispatched"})
 		}
-
-		// 2a. Dispatch patroni.write_config with archive settings.
-		partners := make([]string, 0, len(raftPeers)-1)
-		for _, p := range raftPeers {
-			if !strings.HasPrefix(p, nodeIP+":") {
-				partners = append(partners, p)
-			}
-		}
-		patroniContent, renderErr := configgen.RenderPatroni(configgen.PatroniInput{
-			Scope:         stanzaName,
-			NodeName:      n.Hostname,
-			NodeAddr:      nodeIP,
-			RaftSelfAddr:  nodeIP + ":5433",
-			RaftPartners:  partners,
-			WitnessAddr:   witnessAddr,
-			RESTUsername:  restUser,
-			RESTPassword:  restPass,
-			DBSuperUser:   superUser,
-			DBSuperPass:   superPass,
-			DBReplicaUser: replicaUser,
-			DBReplicaPass: replicaPass,
-			ArchiveEnabled: true,
-			ArchiveStanza:  stanzaName,
-		})
-		if renderErr != nil {
-			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "error", Error: renderErr.Error()})
-			continue
-		}
-		writeParams, _ := json.Marshal(protocol.PatroniConfigWriteParams{Content: patroniContent})
-		writeTaskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, writeTaskID, string(protocol.TaskWritePatroniConf), writeParams)
-		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      writeTaskID.String(),
-			TaskType:    protocol.TaskWritePatroniConf,
-			Params:      json.RawMessage(writeParams),
-			TimeoutSecs: 30,
-		}); dispErr != nil {
-			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
-			continue
-		}
-		_ = h.taskResults.SetSent(ctx, writeTaskID)
-		patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: writeTaskID.String(), Status: "dispatched"})
-
-		// 2b. Dispatch service.restart.patroni — agent processes tasks in order
-		// so this runs after the config write completes on that node.
-		restartParams, _ := json.Marshal(struct{}{})
-		restartTaskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, restartTaskID, string(protocol.TaskRestartPatroni), restartParams)
-		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      restartTaskID.String(),
-			TaskType:    protocol.TaskRestartPatroni,
-			Params:      json.RawMessage(restartParams),
-			TimeoutSecs: 60,
-		}); dispErr != nil {
-			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: "restart: " + dispErr.Error()})
-		} else {
-			_ = h.taskResults.SetSent(ctx, restartTaskID)
-			patroniTaskIDs = append(patroniTaskIDs, restartTaskID) // wait on restart, not write
-			patroniTasks = append(patroniTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: restartTaskID.String(), Status: "dispatched"})
-		}
 	}
-
-	var stanzaTask *taskRef
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodePatroniConfigured,
@@ -459,74 +413,200 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			actorFromCtx(c)).Cluster(clusterID).Build())
 	}
 
-	// Background goroutine: poll DB for Patroni restart tasks to complete, then
-	// dispatch stanza-create and poll for its success before marking stanza_initialized.
-	// DB polling avoids the WaitForTask race condition where tasks complete before
-	// the waiter is registered.
+	// Background: pause Patroni, confirm/enable archive_mode on all nodes, resume, run stanza-create.
 	if primaryNode != nil {
-		capturedPrimary := primaryNode
-		capturedPatroniIDs := patroniTaskIDs
+		capturedPrimary := *primaryNode
+		capturedSnapshots := h.snapshots
+		capturedEmitter := h.emitter
+
+		// Collect replica nodes (DB nodes that are not the primary).
+		capturedReplicas := make([]queries.Node, 0)
+		for _, n := range dbNodes {
+			if n.ID != capturedPrimary.ID {
+				capturedReplicas = append(capturedReplicas, n)
+			}
+		}
+
 		go func() {
 			bgCtx := context.Background()
+			primaryIP := stripCIDR(capturedPrimary.IPAddress)
 
-			primaryIP, _, _ := strings.Cut(capturedPrimary.IPAddress, "/")
-			var once sync.Once
-			resumePatroni := func() {
-				once.Do(func() {
-					if _, status, err := patroniREST(bgCtx, http.MethodPatch, primaryIP, "/config",
-						restUser, restPass, []byte(`{"pause": false}`)); err != nil || status >= 300 {
-						slog.Warn("enable-backups: failed to resume Patroni cluster",
-							"node", capturedPrimary.Hostname, "status", status)
-					} else {
-						slog.Info("enable-backups: Patroni cluster resumed", "node", capturedPrimary.Hostname)
-					}
-				})
-			}
-			defer resumePatroni()
-
-			// Register the role watcher before step 1 so a fast Patroni restart
-			// cannot fire the heartbeat before we reach the select below.
-			roleCh := h.hub.WatchPatroniRole(capturedPrimary.ID, "primary")
-
-			// 1. Wait for all Patroni restart tasks to reach a terminal state.
-			for _, tid := range capturedPatroniIDs {
-				if ok := pollTaskSuccess(bgCtx, h.taskResults, tid, 5*time.Minute); !ok {
-					slog.Warn("enable-backups: Patroni restart task did not succeed", "task_id", tid)
-					return
+			emit := func(severity, code, msg string) {
+				if capturedEmitter != nil {
+					capturedEmitter.Emit(events.New(events.CategoryConfig, severity, code, msg,
+						events.ActorSystem).Cluster(clusterID).Build())
 				}
 			}
 
-			// 2. Wait for the intended primary to confirm role=primary via a fresh
-			//    heartbeat or PatroniState message — authoritative, not stale DB data.
-			select {
-			case <-roleCh:
-				slog.Info("enable-backups: primary confirmed via heartbeat", "node", capturedPrimary.Hostname)
-			case <-time.After(2 * time.Minute):
-				slog.Warn("enable-backups: timed out waiting for primary heartbeat",
-					"node", capturedPrimary.Hostname)
+			// 1. Snapshot current config before any changes.
+			if capturedSnapshots != nil {
+				snapshotPatroniConfig(bgCtx, capturedSnapshots, clusterID, primaryIP, restUser, restPass, "configure-backups")
 			}
 
-			// 3. Resume Patroni — primary is confirmed back in role.
-			resumePatroni()
+			archivePatch, _ := json.Marshal(map[string]any{
+				"postgresql": map[string]any{
+					"parameters": map[string]any{
+						"archive_mode":    "on",
+						"archive_command": "pgbackrest --stanza=" + stanzaName + " archive-push %p",
+					},
+				},
+			})
 
-			// 3b. Restart PostgreSQL via Patroni REST API to apply archive_mode = on.
-			// The Patroni process restart (step 1) does not restart PostgreSQL when it
-			// was already running — Patroni marks pending_restart but won't apply it
-			// while paused. POST /restart is synchronous: HTTP 200 means PostgreSQL is
-			// back up with the new config active. It is honored even when paused (the
-			// pause guard only blocks scheduled restarts, not immediate ones).
-			restartCtx, restartCancel := context.WithTimeout(bgCtx, 3*time.Minute)
-			defer restartCancel()
-			if _, restartStatus, restartErr := patroniREST(restartCtx, http.MethodPost, primaryIP,
-				"/restart", restUser, restPass, []byte(`{}`)); restartErr != nil || restartStatus >= 300 {
-				slog.Warn("enable-backups: Patroni postgres restart failed — stanza-create may fail",
-					"node", capturedPrimary.Hostname, "status", restartStatus, "err", restartErr)
+			// 2. Pause Patroni on the cluster to suppress automatic failover during restarts.
+			pauseCtx, pauseCancel := context.WithTimeout(bgCtx, 10*time.Second)
+			if _, pauseStatus, pauseErr := patroniREST(pauseCtx, http.MethodPost, primaryIP,
+				"/pause", restUser, restPass, nil); pauseErr != nil || pauseStatus >= 300 {
+				slog.Warn("enable-backups: Patroni pause failed — continuing anyway",
+					"status", pauseStatus, "err", pauseErr)
 			} else {
-				slog.Info("enable-backups: postgres restarted, archive_mode active",
-					"node", capturedPrimary.Hostname)
+				slog.Info("enable-backups: Patroni paused")
+			}
+			pauseCancel()
+
+			// Always resume Patroni when the goroutine exits.
+			defer func() {
+				resumeCtx, resumeCancel := context.WithTimeout(bgCtx, 10*time.Second)
+				if _, resumeStatus, resumeErr := patroniREST(resumeCtx, http.MethodPost, primaryIP,
+					"/resume", restUser, restPass, nil); resumeErr != nil || resumeStatus >= 300 {
+					slog.Warn("enable-backups: Patroni resume failed",
+						"status", resumeStatus, "err", resumeErr)
+				} else {
+					slog.Info("enable-backups: Patroni resumed")
+				}
+				resumeCancel()
+			}()
+
+			// archiveOK checks whether a node has archive_mode active in the DCS and no
+			// pending PostgreSQL restart. For replicas, pass checkDCS=false (DCS propagates
+			// automatically; only pending_restart matters).
+			archiveOK := func(nodeIP string, checkDCS bool) bool {
+				if checkDCS {
+					cfgCtx, cfgCancel := context.WithTimeout(bgCtx, 10*time.Second)
+					body, status, err := patroniREST(cfgCtx, http.MethodGet, nodeIP, "/config", restUser, restPass, nil)
+					cfgCancel()
+					if err != nil || status != http.StatusOK {
+						return false
+					}
+					var cfg struct {
+						Postgresql struct {
+							Parameters map[string]any `json:"parameters"`
+						} `json:"postgresql"`
+					}
+					if json.Unmarshal(body, &cfg) != nil {
+						return false
+					}
+					if v, ok := cfg.Postgresql.Parameters["archive_mode"]; !ok || v != "on" {
+						return false
+					}
+				}
+				healthCtx, healthCancel := context.WithTimeout(bgCtx, 10*time.Second)
+				body, status, err := patroniREST(healthCtx, http.MethodGet, nodeIP, "/", restUser, restPass, nil)
+				healthCancel()
+				if err != nil || status != http.StatusOK {
+					return false
+				}
+				var health struct {
+					PendingRestart bool `json:"pending_restart"`
+				}
+				_ = json.Unmarshal(body, &health)
+				return !health.PendingRestart
 			}
 
-			// 4. Create and dispatch stanza-create to the confirmed primary.
+			// 3. Primary: confirm archive_mode in DCS and no pending restart.
+			//    If not satisfied, PATCH DCS config and restart. Max 3 attempts.
+			const maxAttempts = 3
+			primaryActive := false
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				if archiveOK(primaryIP, true) {
+					slog.Info("enable-backups: archive_mode confirmed active on primary",
+						"node", capturedPrimary.Hostname, "attempt", attempt+1)
+					primaryActive = true
+					break
+				}
+				slog.Info("enable-backups: archive_mode not yet active on primary — patching and restarting",
+					"node", capturedPrimary.Hostname, "attempt", attempt+1)
+
+				patchCtx, patchCancel := context.WithTimeout(bgCtx, 30*time.Second)
+				_, patchStatus, patchErr := patroniREST(patchCtx, http.MethodPatch, primaryIP,
+					"/config", restUser, restPass, archivePatch)
+				patchCancel()
+				if patchErr != nil || patchStatus >= 300 {
+					slog.Warn("enable-backups: PATCH /config failed",
+						"node", capturedPrimary.Hostname, "attempt", attempt+1, "status", patchStatus, "err", patchErr)
+					emit(events.SeverityWarn, events.CodeBackupsEnabled,
+						"Failed to write archive settings to Patroni DCS on "+capturedPrimary.Hostname)
+					return
+				}
+
+				restartCtx, restartCancel := context.WithTimeout(bgCtx, 3*time.Minute)
+				_, restartStatus, restartErr := patroniREST(restartCtx, http.MethodPost, primaryIP,
+					"/restart", restUser, restPass, []byte(`{}`))
+				restartCancel()
+				if restartErr != nil || restartStatus >= 300 {
+					slog.Warn("enable-backups: postgres restart failed on primary",
+						"node", capturedPrimary.Hostname, "attempt", attempt+1, "status", restartStatus, "err", restartErr)
+					emit(events.SeverityWarn, events.CodeBackupsEnabled,
+						"PostgreSQL restart failed on primary "+capturedPrimary.Hostname+" while enabling WAL archiving")
+					return
+				}
+				slog.Info("enable-backups: postgres restarted on primary",
+					"node", capturedPrimary.Hostname, "attempt", attempt+1)
+			}
+			if !primaryActive {
+				slog.Warn("enable-backups: archive_mode not confirmed on primary after max attempts — aborting",
+					"node", capturedPrimary.Hostname)
+				emit(events.SeverityWarn, events.CodeBackupsEnabled,
+					"WAL archiving could not be confirmed on primary "+capturedPrimary.Hostname+" after "+fmt.Sprintf("%d", maxAttempts)+" attempts")
+				return
+			}
+			emit(events.SeverityInfo, events.CodeBackupsEnabled,
+				"WAL archiving active on primary "+capturedPrimary.Hostname)
+
+			// 4. Replicas: check pending_restart and restart if needed.
+			for _, replica := range capturedReplicas {
+				replicaIP := stripCIDR(replica.IPAddress)
+				replicaActive := false
+				for attempt := 0; attempt < maxAttempts; attempt++ {
+					if archiveOK(replicaIP, false) {
+						slog.Info("enable-backups: no pending restart on replica",
+							"node", replica.Hostname, "attempt", attempt+1)
+						replicaActive = true
+						break
+					}
+					slog.Info("enable-backups: restarting replica to apply archive_mode",
+						"node", replica.Hostname, "attempt", attempt+1)
+
+					restartCtx, restartCancel := context.WithTimeout(bgCtx, 3*time.Minute)
+					_, restartStatus, restartErr := patroniREST(restartCtx, http.MethodPost, replicaIP,
+						"/restart", restUser, restPass, []byte(`{}`))
+					restartCancel()
+					if restartErr != nil || restartStatus >= 300 {
+						slog.Warn("enable-backups: postgres restart failed on replica",
+							"node", replica.Hostname, "attempt", attempt+1, "status", restartStatus, "err", restartErr)
+						emit(events.SeverityWarn, events.CodeBackupsEnabled,
+							"PostgreSQL restart failed on replica "+replica.Hostname+" while applying archive_mode")
+						break
+					}
+					slog.Info("enable-backups: postgres restarted on replica",
+						"node", replica.Hostname, "attempt", attempt+1)
+				}
+				if replicaActive {
+					emit(events.SeverityInfo, events.CodeBackupsEnabled,
+						"WAL archiving applied to replica "+replica.Hostname)
+				} else if !replicaActive {
+					slog.Warn("enable-backups: archive_mode not confirmed on replica after max attempts",
+						"node", replica.Hostname)
+				}
+			}
+
+			// 5. Skip stanza-create if already initialized.
+			if sched, err := h.schedules.Get(bgCtx, clusterID); err == nil && sched.StanzaInitialized {
+				slog.Info("enable-backups: stanza already initialized, skipping stanza-create",
+					"node", capturedPrimary.Hostname)
+				return
+			}
+
+			// 6. Dispatch stanza-create to the confirmed primary.
 			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
 			stanzaTaskID := uuid.New()
 			_ = h.taskResults.Create(bgCtx, capturedPrimary.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams)
@@ -538,23 +618,26 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			}); dispErr != nil {
 				slog.Warn("enable-backups: stanza-create dispatch failed",
 					"node", capturedPrimary.Hostname, "error", dispErr)
+				emit(events.SeverityWarn, events.CodeBackupsEnabled,
+					"pgBackRest stanza-create dispatch failed on "+capturedPrimary.Hostname)
 				return
 			}
 			_ = h.taskResults.SetSent(bgCtx, stanzaTaskID)
 
 			if ok := pollTaskSuccess(bgCtx, h.taskResults, stanzaTaskID, 5*time.Minute); !ok {
+				emit(events.SeverityWarn, events.CodeBackupsEnabled,
+					"pgBackRest stanza-create failed on "+capturedPrimary.Hostname)
 				return
 			}
-
 			_ = h.schedules.SetStanzaInitialized(bgCtx, clusterID, stanzaName)
+			emit(events.SeverityInfo, events.CodeBackupsEnabled,
+				"pgBackRest stanza '"+stanzaName+"' created — backups enabled")
 		}()
 	}
 
 	return c.JSON(http.StatusAccepted, map[string]any{
-		"cluster_id":  clusterID.String(),
-		"pgbackrest":  pgbTasks,
-		"patroni":     patroniTasks,
-		"stanza_task": stanzaTask,
+		"cluster_id": clusterID.String(),
+		"pgbackrest": pgbTasks,
 	})
 }
 
@@ -915,16 +998,32 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 				_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
 				return
 			}
-			slog.Info("restore goroutine: pgbackrest.restore succeeded, resuming Patroni")
+			slog.Info("restore goroutine: pgbackrest.restore succeeded, waiting for Patroni to acquire DCS lock")
 
-			// Resume Patroni via REST API — it adopts the promoted primary.
-			body, status, err := patroniREST(bgCtx, http.MethodPatch, capturedRestoreIP, "/config", restUser, restPass, []byte(`{"pause": null}`))
-			slog.Info("restore goroutine: patroni resume", "node", capturedRestoreNode.Hostname, "status", status, "body", string(body), "err", err)
-			if err != nil {
-				slog.Error("patroni resume failed", "node", capturedRestoreNode.Hostname, "error", err)
+			// Poll primary GET / until Patroni holds the DCS lock.
+			// The agent confirms PostgreSQL promoted but not that Patroni reconnected —
+			// reinitialize returns "Cluster has no leader" if sent before the lock is held.
+			primaryPollCtx, primaryPollCancel := context.WithTimeout(bgCtx, 2*time.Minute)
+			for {
+				_, primaryStatus, primaryErr := patroniREST(primaryPollCtx, http.MethodGet, capturedRestoreIP, "/", restUser, restPass, nil)
+				if primaryErr == nil && primaryStatus == http.StatusOK {
+					slog.Info("restore goroutine: primary Patroni ready, DCS lock held", "node", capturedRestoreNode.Hostname)
+					break
+				}
+				select {
+				case <-primaryPollCtx.Done():
+					primaryPollCancel()
+					slog.Error("restore goroutine: timed out waiting for primary Patroni DCS lock", "node", capturedRestoreNode.Hostname)
+					_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
+					return
+				case <-time.After(5 * time.Second):
+				}
 			}
+			primaryPollCancel()
 
-			// Reinitialize each replica via REST API.
+			// Reinitialize each replica while Patroni is still paused.
+			// The paused HA loop cannot race us with automatic pg_rewind — pg_rewind
+			// always fails after a restore (no common ancestor) and leaves replicas stuck.
 			for _, replica := range capturedReplicas {
 				replicaIP := stripCIDR(replica.IPAddress)
 				body, status, err := patroniREST(bgCtx, http.MethodPost, replicaIP, "/reinitialize", restUser, restPass, []byte(`{}`))
@@ -932,6 +1031,35 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 				if err != nil {
 					slog.Error("patroni reinitialize failed", "node", replica.Hostname, "error", err)
 				}
+			}
+
+			// Resume Patroni — HA loop takes over, replicas clone from primary via pg_basebackup.
+			body, status, err := patroniREST(bgCtx, http.MethodPatch, capturedRestoreIP, "/config", restUser, restPass, []byte(`{"pause": null}`))
+			slog.Info("restore goroutine: patroni resume", "node", capturedRestoreNode.Hostname, "status", status, "body", string(body), "err", err)
+			if err != nil {
+				slog.Error("patroni resume failed", "node", capturedRestoreNode.Hostname, "error", err)
+			}
+
+			// Poll each replica GET /replica until running as replica.
+			for _, replica := range capturedReplicas {
+				replicaIP := stripCIDR(replica.IPAddress)
+				slog.Info("restore goroutine: waiting for replica to rejoin", "node", replica.Hostname)
+				replicaPollCtx, replicaPollCancel := context.WithTimeout(bgCtx, 5*time.Minute)
+				for {
+					_, replicaStatus, replicaErr := patroniREST(replicaPollCtx, http.MethodGet, replicaIP, "/replica", restUser, restPass, nil)
+					if replicaErr == nil && replicaStatus == http.StatusOK {
+						slog.Info("restore goroutine: replica rejoined", "node", replica.Hostname)
+						break
+					}
+					select {
+					case <-replicaPollCtx.Done():
+						slog.Warn("restore goroutine: timed out waiting for replica to rejoin", "node", replica.Hostname)
+						goto nextReplica
+					case <-time.After(5 * time.Second):
+					}
+				}
+			nextReplica:
+				replicaPollCancel()
 			}
 
 			slog.Info("restore goroutine: complete, clearing restore_in_progress")
@@ -953,25 +1081,6 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	})
 }
 
-// patroniREST makes an authenticated request to the Patroni REST API on a given node.
-func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, body []byte) ([]byte, int, error) {
-	url := fmt.Sprintf("http://%s:8008%s", nodeIP, path)
-	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if user != "" {
-		req.SetBasicAuth(user, pass)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	return b, resp.StatusCode, nil
-}
 
 type nodeTestResult struct {
 	NodeID     string `json:"node_id"`

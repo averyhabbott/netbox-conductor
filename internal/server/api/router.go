@@ -144,12 +144,14 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/clusters/:id/patroni/failover", cfg.PatroniHandler.Failover, mw.RequireRole("admin"))
 	protected.POST("/clusters/:id/configure-failover", cfg.PatroniHandler.ConfigureFailover, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/failover-events", cfg.PatroniHandler.ListFailoverEvents)
-	protected.POST("/clusters/:id/patroni/push-config", cfg.PatroniHandler.PushPatroniConfig, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/patroni/witness/start", cfg.PatroniHandler.StartWitness, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/patroni/history", cfg.PatroniHandler.History)
 	protected.POST("/clusters/:id/nodes/:nid/push-patroni-config", cfg.PatroniHandler.PushPatroniConfigNode, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/nodes/:nid/install-patroni", cfg.PatroniHandler.InstallPatroni, mw.RequireRole("admin"))
 	protected.POST("/clusters/:id/nodes/:nid/db-restore", cfg.PatroniHandler.DBRestore, mw.RequireRole("admin"))
+	protected.GET("/clusters/:id/patroni-config", cfg.PatroniHandler.GetPatroniConfig, mw.RequireRole("operator"))
+	protected.PATCH("/clusters/:id/patroni-config", cfg.PatroniHandler.PatchPatroniConfig, mw.RequireRole("admin"))
+	protected.GET("/clusters/:id/patroni-config/snapshots", cfg.PatroniHandler.GetPatroniSnapshots, mw.RequireRole("operator"))
 
 	// ── Retention policy ────────────────────────────────────────────────────
 	protected.GET("/clusters/:id/retention-policy", cfg.PatroniHandler.GetRetentionPolicy)
@@ -161,6 +163,7 @@ func New(cfg RouterConfig) *echo.Echo {
 		protected.GET("/clusters/:id/backup-config", cfg.BackupHandler.GetBackupConfig)
 		protected.PUT("/clusters/:id/backup-config", cfg.BackupHandler.PutBackupSchedule, mw.RequireRole("operator"))
 		protected.POST("/clusters/:id/backup-config/enable", cfg.BackupHandler.EnableBackups, mw.RequireRole("admin"))
+		protected.POST("/clusters/:id/backup-config/disable", cfg.BackupHandler.DisableBackups, mw.RequireRole("admin"))
 		protected.POST("/clusters/:id/backup-config/push", cfg.BackupHandler.PushBackupConfig, mw.RequireRole("operator"))
 		protected.POST("/clusters/:id/backup-targets", cfg.BackupHandler.CreateBackupTarget, mw.RequireRole("operator"))
 		protected.PUT("/clusters/:id/backup-targets/:tid", cfg.BackupHandler.UpdateBackupTarget, mw.RequireRole("operator"))

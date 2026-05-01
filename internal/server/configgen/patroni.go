@@ -37,9 +37,6 @@ type PatroniInput struct {
 	// Maps to the top-level `priority` key in patroni.yml.
 	Priority int
 
-	// Archive settings — injected by the backup enable flow.
-	ArchiveEnabled bool   // add archive_mode/archive_command to DCS parameters
-	ArchiveStanza  string // pgBackRest stanza name (written into archive_command)
 }
 
 // RenderPatroni renders a complete patroni.yml for one node.
@@ -122,36 +119,10 @@ raft:
 {{- end}}
   data_dir: /var/lib/patroni
 
-# dcs settings applied on every Patroni start. These govern the running
-# cluster and take effect immediately on restart — unlike bootstrap.dcs
-# which is written to the DCS only once during initial cluster formation
-# and ignored on subsequent starts.
-dcs:
-  ttl: 30
-  loop_wait: 10
-  retry_timeout: 10
-  maximum_lag_on_failover: 1048576
-  # failsafe_mode keeps the primary serving if it loses contact with the
-  # standby, preventing a network partition from taking down the entire
-  # app tier in a 2-node cluster. The conductor witness provides the
-  # third Raft vote needed to maintain quorum on either side of a split.
-  failsafe_mode: true
-  postgresql:
-    use_pg_rewind: true
-    use_slots: true
-    parameters:
-      wal_level: replica
-      hot_standby: "on"
-      max_wal_senders: 5
-      max_replication_slots: 5
-      wal_log_hints: "on"
-{{- if .ArchiveEnabled}}
-      archive_mode: "on"
-      archive_command: 'pgbackrest --stanza={{.ArchiveStanza}} archive-push %p'
-{{- end}}
-
 bootstrap:
-  # bootstrap.dcs seeds the DCS key on first cluster formation.
+  # bootstrap.dcs seeds the DCS key on first cluster formation only.
+  # On subsequent Patroni starts this block is ignored — dynamic config
+  # is managed via PATCH /config and lives solely in the DCS.
   dcs:
     ttl: 30
     loop_wait: 10
@@ -167,10 +138,6 @@ bootstrap:
         max_wal_senders: 5
         max_replication_slots: 5
         wal_log_hints: "on"
-{{- if .ArchiveEnabled}}
-        archive_mode: "on"
-        archive_command: 'pgbackrest --stanza={{.ArchiveStanza}} archive-push %p'
-{{- end}}
 
 postgresql:
   listen: 0.0.0.0:{{.Port}}
@@ -203,10 +170,6 @@ postgresql:
     - host    all             {{.DBSuperUser}}    0.0.0.0/0          scram-sha-256
   parameters:
     unix_socket_directories: '/var/run/postgresql'
-{{- if .ArchiveEnabled}}
-    archive_mode: "on"
-    archive_command: 'pgbackrest --stanza={{.ArchiveStanza}} archive-push %p'
-{{- end}}
 
 tags:
   nofailover: false

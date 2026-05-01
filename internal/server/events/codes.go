@@ -62,10 +62,11 @@ const (
 // ─── Config events (NBC-CFG-*) ────────────────────────────────────────────────
 
 const (
-	CodeCredentialRotated     = "NBC-CFG-001"
+	CodeCredentialRotated       = "NBC-CFG-001"
 	CodeFailoverSettingsUpdated = "NBC-CFG-002"
-	CodeNodeConfigUpdated     = "NBC-CFG-003"
-	CodeConfigPushed          = "NBC-CFG-004"
-	CodePatroniConfigured     = "NBC-CFG-005"
-	CodeFailoverConfigured    = "NBC-CFG-006"
+	CodeNodeConfigUpdated       = "NBC-CFG-003"
+	CodeConfigPushed            = "NBC-CFG-004"
+	CodePatroniConfigured       = "NBC-CFG-005"
+	CodeFailoverConfigured      = "NBC-CFG-006"
+	CodeBackupsEnabled          = "NBC-CFG-007"
 )

@@ -35,6 +35,14 @@ export interface PushResult {
   error?: string
 }
 
+export interface PatroniConfigSnapshot {
+  id: string
+  cluster_id: string
+  captured_at: string
+  source: 'configure-failover' | 'configure-backups' | 'user-edit'
+  config: unknown
+}
+
 export const patroniApi = {
   topology: (clusterId: string) =>
     client.get<TopologyResponse>(`/clusters/${clusterId}/patroni/topology`).then((r) => r.data),
@@ -100,4 +108,15 @@ export const patroniApi = {
         {}
       )
       .then((r) => r.data),
+
+  getPatroniConfig: (clusterId: string): Promise<unknown> =>
+    client.get(`/clusters/${clusterId}/patroni-config`).then((r) => r.data),
+
+  patchPatroniConfig: (clusterId: string, config: unknown): Promise<unknown> =>
+    client
+      .patch(`/clusters/${clusterId}/patroni-config`, config)
+      .then((r) => r.data),
+
+  getPatroniSnapshots: (clusterId: string): Promise<PatroniConfigSnapshot[]> =>
+    client.get(`/clusters/${clusterId}/patroni-config/snapshots`).then((r) => r.data),
 }
