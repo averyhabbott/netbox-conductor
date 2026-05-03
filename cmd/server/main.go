@@ -155,6 +155,8 @@ func run(ctx context.Context) error {
 	backupRunQ := queries.NewBackupRunQuerier(store.Pool())
 	backupCatalogQ := queries.NewBackupCatalogQuerier(store.Pool())
 	patroniSnapshotQ := queries.NewPatroniSnapshotQuerier(store.Pool())
+	patroniDesignQ := queries.NewPatroniDesignQuerier(store.Pool())
+	witnessPortQ := queries.NewWitnessPortQuerier(store.Pool())
 	clusterQ := queries.NewClusterQuerier(store.Pool())
 	credQ := queries.NewCredentialQuerier(store.Pool())
 	auditQ := queries.NewAuditQuerier(store.Pool())
@@ -193,7 +195,7 @@ func run(ctx context.Context) error {
 	// Patroni witness manager
 	witnessManager := patroni.NewWitnessManager(patroni.WitnessConfig{
 		ServerAddr: serverBindIP,
-	})
+	}, witnessPortQ)
 
 	// Recover witnesses for any active_standby clusters that were already
 	// configured before this conductor process started. Without this, all
@@ -238,7 +240,7 @@ func run(ctx context.Context) error {
 	agentHandler.SetCatalogQuerier(backupCatalogQ)
 	agentHandler.SetBackupSyncRouter(backupSyncMgr)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
-	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, witnessManager)
+	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, witnessManager, logDir, logName)
 	clusterHandler.SetEmitter(emitter)
 	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, dispatcher, broker, serverURL, logDir, logName)
 	nodeHandler.SetFailoverManager(failoverManager)
@@ -248,10 +250,10 @@ func run(ctx context.Context) error {
 	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker, h)
 	configHandler.SetEmitter(emitter)
-	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, patroniSnapshotQ, enc, dispatcher, witnessManager)
+	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, patroniSnapshotQ, patroniDesignQ, enc, dispatcher, witnessManager)
 	patroniHandler.SetEmitter(emitter)
 	patroniHandler.SetFailoverManager(failoverManager)
-	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, patroniSnapshotQ, enc, dispatcher, h, credQ, witnessManager)
+	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, patroniSnapshotQ, patroniDesignQ, enc, dispatcher, h, credQ, witnessManager)
 	backupHandler.SetEmitter(emitter)
 	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, backupTargetQ, dispatcher, backupSyncMgr)
 	backupScheduler.SetEmitter(emitter)

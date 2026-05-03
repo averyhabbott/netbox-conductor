@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
@@ -18,6 +19,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/labstack/echo/v4"
 )
 
@@ -25,6 +27,28 @@ import (
 // PatroniFailoverManager is the subset of failover.Manager used by PatroniHandler.
 type PatroniFailoverManager interface {
 	CheckTopology(clusterID uuid.UUID)
+}
+
+// patroniDeployJob tracks the status of an async PatchPatroniConfig operation.
+type patroniDeployJob struct {
+	mu     sync.Mutex
+	status string // "pending" | "restarting" | "ok" | "fail"
+	errMsg string
+	paused bool
+}
+
+func (j *patroniDeployJob) set(status, errMsg string, paused bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.status = status
+	j.errMsg = errMsg
+	j.paused = paused
+}
+
+func (j *patroniDeployJob) snapshot() (status, errMsg string, paused bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.status, j.errMsg, j.paused
 }
 
 type PatroniHandler struct {
@@ -36,11 +60,13 @@ type PatroniHandler struct {
 	retention      *queries.RetentionQuerier
 	eventQ         *queries.EventQuerier
 	snapshots      *queries.PatroniSnapshotQuerier
+	designs        *queries.PatroniDesignQuerier
 	enc            *crypto.Encryptor
 	dispatcher     *hub.Dispatcher
 	witness        *patroni.WitnessManager
 	emitter        events.Emitter
 	failoverMgr    PatroniFailoverManager // optional; wired in after construction
+	deployJobs     sync.Map               // uuid.UUID → *patroniDeployJob
 }
 
 func (h *PatroniHandler) SetEmitter(e events.Emitter) { h.emitter = e }
@@ -56,22 +82,24 @@ func NewPatroniHandler(
 	retention *queries.RetentionQuerier,
 	eventQ *queries.EventQuerier,
 	snapshots *queries.PatroniSnapshotQuerier,
+	designs *queries.PatroniDesignQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	witness *patroni.WitnessManager,
 ) *PatroniHandler {
 	return &PatroniHandler{
-		clusters:       clusters,
-		nodes:          nodes,
-		creds:          creds,
-		configs:        configs,
-		taskResults:    taskResults,
-		retention:      retention,
-		eventQ:         eventQ,
-		snapshots:      snapshots,
-		enc:            enc,
-		dispatcher:     dispatcher,
-		witness:        witness,
+		clusters:    clusters,
+		nodes:       nodes,
+		creds:       creds,
+		configs:     configs,
+		taskResults: taskResults,
+		retention:   retention,
+		eventQ:      eventQ,
+		snapshots:   snapshots,
+		designs:     designs,
+		enc:         enc,
+		dispatcher:  dispatcher,
+		witness:     witness,
 	}
 }
 
@@ -1655,6 +1683,14 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					"status", patchStatus, "err", patchErr)
 			} else {
 				slog.Info("configure-failover: DCS config applied", "primary", primaryIP)
+				if h.designs != nil {
+					if err := h.designs.Upsert(bgCtx, clusterID, configPatch); err != nil {
+						slog.Warn("configure-failover: failed to store design", "cluster", clusterID, "err", err)
+					}
+				}
+				if h.snapshots != nil {
+					recordPostChangeSnapshot(bgCtx, h.snapshots, clusterID, primaryIP, restU, restP, "configure-failover")
+				}
 			}
 			patchCancel()
 
@@ -1785,11 +1821,38 @@ func (h *PatroniHandler) GetPatroniConfig(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadGateway, "failed to reach Patroni: "+err.Error())
 	}
-	return c.JSONBlob(status, body)
+	if status != http.StatusOK {
+		return c.JSONBlob(status, body)
+	}
+
+	// Parse live config into a map so we can embed it alongside the designed config.
+	var liveConfig json.RawMessage = body
+
+	var designedConfig json.RawMessage
+	if h.designs != nil {
+		if d, err := h.designs.Get(ctx, clusterID); err == nil {
+			designedConfig = d.Config
+		} else if err != pgx.ErrNoRows {
+			slog.Warn("get-patroni-config: failed to fetch designed config", "cluster", clusterID, "err", err)
+		}
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"config":  liveConfig,
+		"designed": designedConfig,
+	})
 }
 
-// PatchPatroniConfig proxies a PATCH /config to the Patroni REST API on the primary.
-// Snapshots the current config before applying.
+// patchPatroniConfigRequest is the request body for PatchPatroniConfig.
+type patchPatroniConfigRequest struct {
+	Config     json.RawMessage `json:"config"`
+	Source     string          `json:"source"`      // "user-edit" | "user-revert"
+	SnapshotID *uuid.UUID      `json:"snapshot_id"` // if set, mark this existing snapshot active instead of inserting a new one
+}
+
+// PatchPatroniConfig applies a user-initiated config change to the Patroni DCS.
+// It validates conductor-managed fields, starts a background deploy goroutine,
+// and returns a job ID immediately. The client polls GetPatroniDeployStatus.
 // PATCH /api/v1/clusters/:id/patroni-config
 func (h *PatroniHandler) PatchPatroniConfig(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
@@ -1798,17 +1861,29 @@ func (h *PatroniHandler) PatchPatroniConfig(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 
-	var patch json.RawMessage
-	if err := c.Bind(&patch); err != nil || len(patch) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "request body must be a non-empty JSON object")
+	var req patchPatroniConfigRequest
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	// Reject non-object payloads (arrays, scalars).
-	trimmed := []byte(patch)
-	for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t' || trimmed[0] == '\n' || trimmed[0] == '\r') {
-		trimmed = trimmed[1:]
+	if req.Source == "" {
+		req.Source = "user-edit"
 	}
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return echo.NewHTTPError(http.StatusBadRequest, "request body must be a JSON object")
+	if req.Source != "user-edit" && req.Source != "user-revert" {
+		return echo.NewHTTPError(http.StatusBadRequest, "source must be user-edit or user-revert")
+	}
+
+	// For user-edit, a config payload is required.
+	if req.Source == "user-edit" {
+		if len(req.Config) == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "config is required for user-edit")
+		}
+		trimmed := []byte(req.Config)
+		for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t' || trimmed[0] == '\n' || trimmed[0] == '\r') {
+			trimmed = trimmed[1:]
+		}
+		if len(trimmed) == 0 || trimmed[0] != '{' {
+			return echo.NewHTTPError(http.StatusBadRequest, "config must be a JSON object")
+		}
 	}
 
 	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
@@ -1823,17 +1898,344 @@ func (h *PatroniHandler) PatchPatroniConfig(c echo.Context) error {
 	restUser, restPass := patroniCreds(ctx, h.creds, h.enc, clusterID)
 	primaryIP := stripCIDR(primary.IPAddress)
 
-	if h.snapshots != nil {
-		snapshotPatroniConfig(ctx, h.snapshots, clusterID, primaryIP, restUser, restPass, "user-edit")
+	// Field protection check for user-edit: reject changes to conductor-managed fields.
+	if req.Source == "user-edit" && h.designs != nil {
+		design, designErr := h.designs.Get(ctx, clusterID)
+		if designErr != nil && designErr != pgx.ErrNoRows {
+			slog.Warn("patch-patroni-config: failed to fetch design", "cluster", clusterID, "err", designErr)
+		}
+		if design != nil && len(design.Config) > 0 {
+			var designedMap, intendedMap map[string]any
+			if json.Unmarshal(design.Config, &designedMap) == nil && json.Unmarshal(req.Config, &intendedMap) == nil {
+				if violation := findDesignViolation("", designedMap, intendedMap); violation != "" {
+					return echo.NewHTTPError(http.StatusBadRequest,
+						"The field "+violation+" is managed by the conductor and cannot be set directly.")
+				}
+			}
+		}
 	}
 
-	patchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	body, status, err := patroniREST(patchCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, patch)
+	// Start the async deploy goroutine.
+	jobID := uuid.New()
+	job := &patroniDeployJob{status: "pending"}
+	h.deployJobs.Store(jobID, job)
+
+	go h.runPatroniDeploy(clusterID, jobID, job, nodes, primaryIP, restUser, restPass, req)
+
+	return c.JSON(http.StatusAccepted, map[string]string{"job_id": jobID.String()})
+}
+
+// GetPatroniDeployStatus returns the current status of an async deploy job.
+// GET /api/v1/clusters/:id/patroni-config/deploy/:jobId
+func (h *PatroniHandler) GetPatroniDeployStatus(c echo.Context) error {
+	jobID, err := uuid.Parse(c.Param("jobId"))
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadGateway, "failed to reach Patroni: "+err.Error())
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid job id")
 	}
-	return c.JSONBlob(status, body)
+	v, ok := h.deployJobs.Load(jobID)
+	if !ok {
+		return echo.NewHTTPError(http.StatusNotFound, "job not found")
+	}
+	job := v.(*patroniDeployJob)
+	status, errMsg, paused := job.snapshot()
+	return c.JSON(http.StatusOK, map[string]any{
+		"status": status,
+		"error":  errMsg,
+		"paused": paused,
+	})
+}
+
+// runPatroniDeploy executes the full deploy flow in a background goroutine:
+// compute diff → PATCH Patroni → poll pending_restart → restart if needed → resume or fail.
+func (h *PatroniHandler) runPatroniDeploy(
+	clusterID uuid.UUID,
+	jobID uuid.UUID,
+	job *patroniDeployJob,
+	allNodes []queries.Node,
+	primaryIP, restUser, restPass string,
+	req patchPatroniConfigRequest,
+) {
+	bgCtx := context.Background()
+
+	// Pre-change snapshot.
+	if h.snapshots != nil {
+		snapshotPatroniConfig(bgCtx, h.snapshots, clusterID, primaryIP, restUser, restPass, req.Source)
+	}
+
+	// Fetch current DCS config to compute the diff.
+	getCurrentCtx, getCurrentCancel := context.WithTimeout(bgCtx, 10*time.Second)
+	currentBody, currentStatus, currentErr := patroniREST(getCurrentCtx, http.MethodGet, primaryIP, "/config", restUser, restPass, nil)
+	getCurrentCancel()
+	if currentErr != nil || currentStatus != http.StatusOK {
+		job.set("fail", "failed to fetch current Patroni config", false)
+		return
+	}
+	var currentMap map[string]any
+	if err := json.Unmarshal(currentBody, &currentMap); err != nil {
+		job.set("fail", "failed to parse current Patroni config", false)
+		return
+	}
+
+	// Determine intended config: for user-revert, use designed config.
+	var intendedMap map[string]any
+	if req.Source == "user-revert" {
+		if h.designs == nil {
+			job.set("fail", "no designed config available for revert", false)
+			return
+		}
+		design, err := h.designs.Get(bgCtx, clusterID)
+		if err != nil {
+			job.set("fail", "failed to fetch designed config: "+err.Error(), false)
+			return
+		}
+		if err := json.Unmarshal(design.Config, &intendedMap); err != nil {
+			job.set("fail", "failed to parse designed config", false)
+			return
+		}
+	} else {
+		if err := json.Unmarshal(req.Config, &intendedMap); err != nil {
+			job.set("fail", "failed to parse request config", false)
+			return
+		}
+	}
+	intendedJSON, _ := json.Marshal(intendedMap)
+
+	// Compute diff patch (nulls for removed keys).
+	diffMap := diffPatroniConfig(currentMap, intendedMap)
+	if diffMap == nil {
+		// Nothing to change — finalize snapshot and done.
+		h.finalizeSnapshot(bgCtx, clusterID, req, intendedJSON, primaryIP, restUser, restPass)
+		job.set("ok", "", false)
+		return
+	}
+
+	patchBody, _ := json.Marshal(diffMap)
+
+	// Read loop_wait from current config for post-PATCH poll timing.
+	loopWait := 10
+	if lw, ok := currentMap["loop_wait"].(float64); ok && lw > 0 {
+		loopWait = int(lw)
+	}
+	_ = loopWait // used below
+
+	patchCtx, patchCancel := context.WithTimeout(bgCtx, 15*time.Second)
+	_, patchStatus, patchErr := patroniREST(patchCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, patchBody)
+	patchCancel()
+	if patchErr != nil || patchStatus >= 300 {
+		msg := fmt.Sprintf("PATCH /config failed (status %d)", patchStatus)
+		if patchErr != nil {
+			msg = "PATCH /config failed: " + patchErr.Error()
+		}
+		job.set("fail", msg, false)
+		return
+	}
+
+	// Poll all nodes for pending_restart — ha.wakeup() fires on PATCH so nodes
+	// react quickly, but give them up to 30s to reflect the new config.
+	pendingNodes := h.pollPendingRestart(bgCtx, allNodes, restUser, restPass, 30*time.Second)
+
+	if len(pendingNodes) == 0 {
+		// No restart needed.
+		h.finalizeSnapshot(bgCtx, clusterID, req, intendedJSON, primaryIP, restUser, restPass)
+		job.set("ok", "", false)
+		return
+	}
+
+	// Restart required.
+	job.set("restarting", "", false)
+	slog.Info("patroni deploy: pending_restart detected, pausing cluster",
+		"cluster", clusterID, "nodes", len(pendingNodes))
+
+	// Pause Patroni to suppress automatic failover during restarts.
+	pauseCtx, pauseCancel := context.WithTimeout(bgCtx, 10*time.Second)
+	_, pauseStatus, pauseErr := patroniREST(pauseCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, []byte(`{"pause":true}`))
+	pauseCancel()
+	if pauseErr != nil || pauseStatus >= 300 {
+		job.set("fail", fmt.Sprintf("failed to pause Patroni before restart (status %d)", pauseStatus), false)
+		return
+	}
+
+	// Restart only the nodes that showed pending_restart, replicas first then primary.
+	pendingSet := make(map[string]bool, len(pendingNodes))
+	for _, hn := range pendingNodes {
+		pendingSet[hn] = true
+	}
+	replicas := make([]queries.Node, 0)
+	var primaryNode *queries.Node
+	for i := range allNodes {
+		n := &allNodes[i]
+		if !pendingSet[n.Hostname] {
+			continue
+		}
+		ip := stripCIDR(n.IPAddress)
+		if ip == primaryIP {
+			primaryNode = n
+		} else {
+			replicas = append(replicas, *n)
+		}
+	}
+
+	restartFailed := false
+	for _, node := range replicas {
+		nodeIP := stripCIDR(node.IPAddress)
+		if !h.restartAndWait(bgCtx, nodeIP, restUser, restPass, "replica") {
+			slog.Error("patroni deploy: replica restart failed", "node", node.Hostname)
+			restartFailed = true
+		}
+	}
+
+	if !restartFailed && primaryNode != nil {
+		if !h.restartAndWait(bgCtx, primaryIP, restUser, restPass, "primary") {
+			slog.Error("patroni deploy: primary restart failed", "node", primaryNode.Hostname)
+			restartFailed = true
+		}
+	}
+
+	if restartFailed {
+		job.set("fail", "PostgreSQL restart failed — cluster left in paused state", true)
+		return
+	}
+
+	// Resume Patroni.
+	resumeCtx, resumeCancel := context.WithTimeout(bgCtx, 10*time.Second)
+	_, resumeStatus, resumeErr := patroniREST(resumeCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, []byte(`{"pause":null}`))
+	resumeCancel()
+	if resumeErr != nil || resumeStatus >= 300 {
+		job.set("fail", "cluster restarted but Patroni resume failed — cluster left in paused state", true)
+		return
+	}
+
+	h.finalizeSnapshot(bgCtx, clusterID, req, intendedJSON, primaryIP, restUser, restPass)
+	job.set("ok", "", false)
+}
+
+// finalizeSnapshot records or moves the active snapshot after a successful deploy.
+// If the request carried a specific snapshot_id, that record becomes active.
+// For user-revert, the snapshot matching the designed config becomes active (or a new one is inserted).
+// Otherwise a fresh active snapshot is inserted.
+func (h *PatroniHandler) finalizeSnapshot(ctx context.Context, clusterID uuid.UUID, req patchPatroniConfigRequest,
+	intendedJSON []byte, primaryIP, restUser, restPass string) {
+	if h.snapshots == nil {
+		return
+	}
+	if req.SnapshotID != nil {
+		if err := h.snapshots.SetActive(ctx, *req.SnapshotID, clusterID); err != nil {
+			slog.Warn("patroni deploy: SetActive failed", "snapshot", *req.SnapshotID, "err", err)
+		}
+		_ = h.snapshots.Prune(ctx, clusterID)
+		return
+	}
+	if req.Source == "user-revert" {
+		setActiveForDesigned(ctx, h.snapshots, clusterID, intendedJSON, primaryIP, restUser, restPass)
+		return
+	}
+	recordPostChangeSnapshot(ctx, h.snapshots, clusterID, primaryIP, restUser, restPass, req.Source)
+}
+
+// pollPendingRestart polls all nodes for pending_restart, returning the hostnames
+// of any nodes that have it set after the poll window expires.
+func (h *PatroniHandler) pollPendingRestart(ctx context.Context, nodes []queries.Node, restUser, restPass string, timeout time.Duration) []string {
+	deadline := time.Now().Add(timeout)
+	pending := make(map[string]bool)
+	for _, n := range nodes {
+		pending[n.Hostname] = true
+	}
+
+	for time.Now().Before(deadline) {
+		for _, node := range nodes {
+			if !pending[node.Hostname] {
+				continue
+			}
+			nodeIP := stripCIDR(node.IPAddress)
+			pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			body, status, err := patroniREST(pollCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
+			cancel()
+			if err != nil || status != http.StatusOK {
+				continue
+			}
+			var health struct {
+				PendingRestart bool `json:"pending_restart"`
+			}
+			if json.Unmarshal(body, &health) == nil && !health.PendingRestart {
+				delete(pending, node.Hostname)
+			} else if json.Unmarshal(body, &health) == nil && health.PendingRestart {
+				// Node responded and has pending_restart — confirmed
+				pending[node.Hostname] = true
+			}
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	result := make([]string, 0, len(pending))
+	for h := range pending {
+		result = append(result, h)
+	}
+	return result
+}
+
+// restartAndWait sends POST /restart to a node and polls until pending_restart
+// is gone and the node is in the expected role. Returns true on success.
+func (h *PatroniHandler) restartAndWait(ctx context.Context, nodeIP, restUser, restPass, expectedRole string) bool {
+	restartCtx, restartCancel := context.WithTimeout(ctx, 10*time.Second)
+	_, status, err := patroniREST(restartCtx, http.MethodPost, nodeIP, "/restart", restUser, restPass, []byte(`{}`))
+	restartCancel()
+	if err != nil || status >= 300 {
+		slog.Warn("patroni deploy: POST /restart failed", "node", nodeIP, "status", status, "err", err)
+		return false
+	}
+
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Second)
+		pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		body, pollStatus, pollErr := patroniREST(pollCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
+		cancel()
+		if pollErr != nil || pollStatus != http.StatusOK {
+			continue
+		}
+		var health struct {
+			State          string `json:"state"`
+			Role           string `json:"role"`
+			PendingRestart bool   `json:"pending_restart"`
+		}
+		if json.Unmarshal(body, &health) != nil {
+			continue
+		}
+		if health.State == "running" && !health.PendingRestart && health.Role == expectedRole {
+			return true
+		}
+	}
+	return false
+}
+
+// findDesignViolation recursively checks whether any leaf in designed has a
+// different value in intended. Returns the dotted path of the first violation,
+// or empty string if none.
+func findDesignViolation(prefix string, designed, intended map[string]any) string {
+	for k, dv := range designed {
+		path := k
+		if prefix != "" {
+			path = prefix + "." + k
+		}
+		iv, exists := intended[k]
+		if !exists {
+			// Intended is missing a designed key — that's a violation.
+			return path
+		}
+		dMap, dIsMap := dv.(map[string]any)
+		iMap, iIsMap := iv.(map[string]any)
+		if dIsMap && iIsMap {
+			if v := findDesignViolation(path, dMap, iMap); v != "" {
+				return v
+			}
+		} else if canonicalJSON(mustMarshal(dv)) != canonicalJSON(mustMarshal(iv)) {
+			return path
+		}
+	}
+	return ""
 }
 
 // GetPatroniSnapshots returns the last 10 DCS config snapshots for a cluster.
@@ -1860,6 +2262,7 @@ func (h *PatroniHandler) GetPatroniSnapshots(c echo.Context) error {
 			"cluster_id":  s.ClusterID.String(),
 			"captured_at": s.CapturedAt.UTC().Format(time.RFC3339),
 			"source":      s.Source,
+			"is_active":   s.IsActive,
 			"config":      s.Config,
 		})
 	}

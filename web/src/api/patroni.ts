@@ -39,8 +39,23 @@ export interface PatroniConfigSnapshot {
   id: string
   cluster_id: string
   captured_at: string
-  source: 'configure-failover' | 'configure-backups' | 'user-edit'
+  source: 'configure-failover' | 'configure-backups' | 'user-edit' | 'user-revert' | 'discovered'
+  is_active: boolean
   config: unknown
+}
+
+export interface PatroniConfigResponse {
+  config: unknown
+  designed: unknown | null
+}
+
+export type DeployStatus = 'pending' | 'restarting' | 'ok' | 'fail'
+
+export interface PatroniDeployStatusResponse {
+  job_id: string
+  status: DeployStatus
+  error?: string
+  paused?: boolean
 }
 
 export const patroniApi = {
@@ -109,12 +124,31 @@ export const patroniApi = {
       )
       .then((r) => r.data),
 
-  getPatroniConfig: (clusterId: string): Promise<unknown> =>
-    client.get(`/clusters/${clusterId}/patroni-config`).then((r) => r.data),
+  getPatroniConfig: (clusterId: string): Promise<PatroniConfigResponse> =>
+    client.get<PatroniConfigResponse>(`/clusters/${clusterId}/patroni-config`).then((r) => r.data),
 
-  patchPatroniConfig: (clusterId: string, config: unknown): Promise<unknown> =>
+  patchPatroniConfig: (
+    clusterId: string,
+    config: unknown,
+    source: 'user-edit' | 'user-revert',
+    snapshotId?: string
+  ): Promise<{ job_id: string }> =>
     client
-      .patch(`/clusters/${clusterId}/patroni-config`, config)
+      .patch<{ job_id: string }>(`/clusters/${clusterId}/patroni-config`, {
+        config,
+        source,
+        ...(snapshotId ? { snapshot_id: snapshotId } : {}),
+      })
+      .then((r) => r.data),
+
+  getPatroniDeployStatus: (
+    clusterId: string,
+    jobId: string
+  ): Promise<PatroniDeployStatusResponse> =>
+    client
+      .get<PatroniDeployStatusResponse>(
+        `/clusters/${clusterId}/patroni-config/deploy/${jobId}`
+      )
       .then((r) => r.data),
 
   getPatroniSnapshots: (clusterId: string): Promise<PatroniConfigSnapshot[]> =>

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/google/uuid"
 )
 
@@ -31,10 +32,10 @@ type WitnessConfig struct {
 
 // WitnessManager manages one patroni_raft_controller process per cluster.
 type WitnessManager struct {
-	cfg      WitnessConfig
-	mu       sync.Mutex
-	procs    map[uuid.UUID]*witnessProc
-	nextPort int
+	cfg   WitnessConfig
+	db    *queries.WitnessPortQuerier
+	mu    sync.Mutex
+	procs map[uuid.UUID]*witnessProc
 }
 
 type witnessProc struct {
@@ -45,7 +46,9 @@ type witnessProc struct {
 }
 
 // NewWitnessManager creates a manager with the given config.
-func NewWitnessManager(cfg WitnessConfig) *WitnessManager {
+// db is required for persistent port allocation; if nil the manager falls back
+// to sequential in-memory allocation (test/dev only).
+func NewWitnessManager(cfg WitnessConfig, db *queries.WitnessPortQuerier) *WitnessManager {
 	if cfg.RaftControllerBin == "" {
 		cfg.RaftControllerBin = defaultRaftControllerBin
 	}
@@ -57,9 +60,9 @@ func NewWitnessManager(cfg WitnessConfig) *WitnessManager {
 	}
 
 	return &WitnessManager{
-		cfg:      cfg,
-		procs:    make(map[uuid.UUID]*witnessProc),
-		nextPort: cfg.BasePort,
+		cfg:   cfg,
+		db:    db,
+		procs: make(map[uuid.UUID]*witnessProc),
 	}
 }
 
@@ -77,8 +80,10 @@ func (m *WitnessManager) Start(clusterID uuid.UUID, partnerAddrs []string) error
 		return fmt.Errorf("witness: SERVER_BIND_IP must be set to the conductor's reachable IP address")
 	}
 
-	port := m.nextPort
-	m.nextPort++
+	port, err := m.allocatePort(clusterID)
+	if err != nil {
+		return fmt.Errorf("witness: port allocation failed: %w", err)
+	}
 
 	addr := fmt.Sprintf("%s:%d", m.cfg.ServerAddr, port)
 
@@ -91,6 +96,70 @@ func (m *WitnessManager) Start(clusterID uuid.UUID, partnerAddrs []string) error
 
 	go m.runProc(proc)
 	log.Printf("patroni witness started: cluster=%s addr=%s partners=%v", clusterID, addr, partnerAddrs)
+	return nil
+}
+
+// allocatePort returns the persisted port for a cluster, allocating and storing
+// a new one if none exists. Must be called with m.mu held.
+func (m *WitnessManager) allocatePort(clusterID uuid.UUID) (int, error) {
+	ctx := context.Background()
+
+	if m.db != nil {
+		// Try to load existing port first.
+		if port, err := m.db.GetPort(ctx, clusterID); err == nil {
+			return port, nil
+		}
+		// Allocate: find first unused port in range.
+		used, err := m.db.ListPorts(ctx)
+		if err != nil {
+			return 0, err
+		}
+		inUse := make(map[int]bool, len(used))
+		for _, p := range used {
+			inUse[p] = true
+		}
+		for p := m.cfg.BasePort; p < m.cfg.BasePort+100; p++ {
+			if !inUse[p] {
+				if err := m.db.AllocatePort(ctx, clusterID, p); err != nil {
+					return 0, err
+				}
+				return p, nil
+			}
+		}
+		return 0, fmt.Errorf("no available witness ports in range %d–%d", m.cfg.BasePort, m.cfg.BasePort+99)
+	}
+
+	// Fallback: sequential in-memory allocation (no DB).
+	port := m.cfg.BasePort
+	for _, proc := range m.procs {
+		if _, portStr, ok := parseAddr(proc.addr); ok && portStr >= port {
+			port = portStr + 1
+		}
+	}
+	return port, nil
+}
+
+// parseAddr extracts the numeric port from a "host:port" string.
+func parseAddr(addr string) (string, int, bool) {
+	for i := len(addr) - 1; i >= 0; i-- {
+		if addr[i] == ':' {
+			var port int
+			if _, err := fmt.Sscanf(addr[i+1:], "%d", &port); err == nil {
+				return addr[:i], port, true
+			}
+			return "", 0, false
+		}
+	}
+	return "", 0, false
+}
+
+// CleanupData removes the raft data directory for a cluster.
+// Call after Stop() when permanently deleting a cluster.
+func (m *WitnessManager) CleanupData(clusterID uuid.UUID) error {
+	dataDir := filepath.Join(m.cfg.RaftDataDir, clusterID.String())
+	if err := os.RemoveAll(dataDir); err != nil {
+		return fmt.Errorf("witness: removing raft data dir: %w", err)
+	}
 	return nil
 }
 

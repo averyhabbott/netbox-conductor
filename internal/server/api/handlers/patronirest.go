@@ -51,9 +51,11 @@ func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, b
 	return b, resp.StatusCode, nil
 }
 
-// snapshotPatroniConfig fetches the current DCS config and stores it before a
-// PATCH /config call. If the config is structurally identical to the most recent
-// snapshot it is not written again. Failures are logged and do not block the caller.
+// snapshotPatroniConfig fetches the current DCS config and stores it as a
+// pre-change snapshot. If the config is structurally identical to the most
+// recent snapshot it is not written again (dedup). If it differs from the
+// most recent snapshot and the source indicates an external change, it is
+// recorded as "discovered". Failures are logged and do not block the caller.
 func snapshotPatroniConfig(ctx context.Context, q *queries.PatroniSnapshotQuerier, clusterID uuid.UUID,
 	primaryIP, restUser, restPass, source string) {
 	snapshotCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -64,19 +66,78 @@ func snapshotPatroniConfig(ctx context.Context, q *queries.PatroniSnapshotQuerie
 		return
 	}
 
-	// Skip insert if structurally identical to the most recent snapshot.
-	// Re-marshal both through map[string]any so key ordering is normalised.
-	if existing, listErr := q.List(ctx, clusterID); listErr == nil && len(existing) > 0 {
+	existing, listErr := q.List(ctx, clusterID)
+	if listErr == nil && len(existing) > 0 {
+		// Find the active snapshot — it may not be existing[0] if SetActive moved
+		// the active flag to an older record.
+		var activeSnap *queries.PatroniConfigSnapshot
+		for i := range existing {
+			if existing[i].IsActive {
+				activeSnap = &existing[i]
+				break
+			}
+		}
+		if activeSnap != nil {
+			if canonicalJSON(body) == canonicalJSON(activeSnap.Config) {
+				// Live matches active — no pre-change snapshot needed.
+				return
+			}
+			// Live differs from active — config drifted outside conductor.
+			if err := q.Insert(ctx, clusterID, "discovered", body); err != nil {
+				slog.Warn("patroni config snapshot: insert discovered failed", "err", err)
+			}
+			_ = q.Prune(ctx, clusterID)
+			return
+		}
+		// No active snapshot — dedup against most recent.
 		if canonicalJSON(body) == canonicalJSON(existing[0].Config) {
 			return
 		}
 	}
 
+	// No existing snapshots — record as the provided source
 	if err := q.Insert(ctx, clusterID, source, body); err != nil {
 		slog.Warn("patroni config snapshot: insert failed", "source", source, "err", err)
 		return
 	}
 	_ = q.Prune(ctx, clusterID)
+}
+
+// recordPostChangeSnapshot fetches the current DCS config after a successful
+// PATCH and stores it as the new active snapshot. Failures are logged only.
+func recordPostChangeSnapshot(ctx context.Context, q *queries.PatroniSnapshotQuerier, clusterID uuid.UUID,
+	primaryIP, restUser, restPass, source string) {
+	snapshotCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	body, status, err := patroniREST(snapshotCtx, http.MethodGet, primaryIP, "/config", restUser, restPass, nil)
+	if err != nil || status != http.StatusOK {
+		slog.Warn("patroni post-change snapshot: GET /config failed", "source", source, "status", status, "err", err)
+		return
+	}
+	if err := q.InsertActive(ctx, clusterID, source, body); err != nil {
+		slog.Warn("patroni post-change snapshot: insert failed", "source", source, "err", err)
+		return
+	}
+	_ = q.Prune(ctx, clusterID)
+}
+
+// setActiveForDesigned records the post-revert state as a "user-revert" snapshot.
+// Exception: if the most recent snapshot is already tagged "user-revert" and its
+// config matches intendedJSON, just mark it active — no duplicate needed.
+func setActiveForDesigned(ctx context.Context, q *queries.PatroniSnapshotQuerier, clusterID uuid.UUID,
+	intendedJSON []byte, primaryIP, restUser, restPass string) {
+	existing, err := q.List(ctx, clusterID)
+	if err == nil && len(existing) > 0 {
+		most := existing[0]
+		if most.Source == "user-revert" && canonicalJSON(most.Config) == canonicalJSON(intendedJSON) {
+			if err := q.SetActive(ctx, most.ID, clusterID); err != nil {
+				slog.Warn("patroni revert: SetActive failed", "snapshot", most.ID, "err", err)
+			}
+			_ = q.Prune(ctx, clusterID)
+			return
+		}
+	}
+	recordPostChangeSnapshot(ctx, q, clusterID, primaryIP, restUser, restPass, "user-revert")
 }
 
 // canonicalJSON unmarshals raw JSON into any and re-marshals it so that map keys
@@ -93,3 +154,45 @@ func canonicalJSON(raw []byte) string {
 	}
 	return string(b)
 }
+
+// diffPatroniConfig computes the PATCH body needed to transition from current
+// to intended: keys with changed values get their intended value, keys present
+// in current but absent in intended are set to null (Patroni treats null as delete).
+// Returns nil if the configs are identical (no PATCH needed).
+func diffPatroniConfig(current, intended map[string]any) map[string]any {
+	patch := make(map[string]any)
+	diffObjects(current, intended, patch)
+	if len(patch) == 0 {
+		return nil
+	}
+	return patch
+}
+
+func diffObjects(current, intended map[string]any, patch map[string]any) {
+	// Keys in intended: set if different from current
+	for k, iv := range intended {
+		cv, exists := current[k]
+		if !exists {
+			patch[k] = iv
+			continue
+		}
+		iMap, iIsMap := iv.(map[string]any)
+		cMap, cIsMap := cv.(map[string]any)
+		if iIsMap && cIsMap {
+			sub := make(map[string]any)
+			diffObjects(cMap, iMap, sub)
+			if len(sub) > 0 {
+				patch[k] = sub
+			}
+		} else if canonicalJSON(mustMarshal(iv)) != canonicalJSON(mustMarshal(cv)) {
+			patch[k] = iv
+		}
+	}
+	// Keys in current but not in intended: null them out
+	for k := range current {
+		if _, inIntended := intended[k]; !inIntended {
+			patch[k] = nil
+		}
+	}
+}
+

@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"regexp"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/google/uuid"
@@ -19,6 +22,7 @@ import (
 // WitnessManager is the subset of patroni.WitnessManager used by ClusterHandler.
 type WitnessManager interface {
 	Stop(clusterID uuid.UUID)
+	CleanupData(clusterID uuid.UUID) error
 }
 
 // ClusterHandler handles cluster CRUD endpoints.
@@ -29,6 +33,8 @@ type ClusterHandler struct {
 	hub       *hub.Hub
 	witnesses WitnessManager
 	emitter   events.Emitter
+	logDir    string
+	logName   string
 }
 
 func NewClusterHandler(
@@ -37,6 +43,7 @@ func NewClusterHandler(
 	regToks *queries.RegistrationTokenQuerier,
 	h *hub.Hub,
 	witnesses *patroni.WitnessManager,
+	logDir, logName string,
 ) *ClusterHandler {
 	return &ClusterHandler{
 		clusters:  clusters,
@@ -44,6 +51,8 @@ func NewClusterHandler(
 		regToks:   regToks,
 		hub:       h,
 		witnesses: witnesses,
+		logDir:    logDir,
+		logName:   logName,
 	}
 }
 
@@ -276,6 +285,19 @@ func (h *ClusterHandler) Delete(c echo.Context) error {
 
 	// Stop the Patroni witness subprocess (no-op if none running)
 	h.witnesses.Stop(id)
+
+	// Remove raft data directory for this cluster.
+	if err := h.witnesses.CleanupData(id); err != nil {
+		slog.Warn("cluster delete: failed to remove raft data dir", "cluster", id, "err", err)
+	}
+
+	// Remove cluster log directory.
+	if h.logDir != "" {
+		logDir := logging.ClusterLogDir(h.logDir, h.logName, cluster.Name)
+		if err := os.RemoveAll(logDir); err != nil {
+			slog.Warn("cluster delete: failed to remove log dir", "cluster", id, "path", logDir, "err", err)
+		}
+	}
 
 	// Delete from DB — CASCADE handles nodes, credentials, configs, tokens, tasks, audit logs
 	if err := h.clusters.Delete(c.Request().Context(), id); err != nil {

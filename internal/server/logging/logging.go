@@ -93,6 +93,11 @@ func OpenAgentLog(logDir, logName, clusterName, hostname string) *AgentLog {
 	return &AgentLog{Logger: logger, Path: path, file: f}
 }
 
+// ClusterLogDir returns the directory that holds all logs for a cluster.
+func ClusterLogDir(logDir, logName, clusterName string) string {
+	return filepath.Join(logDir, logName, sanitize(clusterName))
+}
+
 // AgentLogPath returns the expected log file path for a cluster/node pair
 // without opening it. Used by the logs API endpoint.
 func AgentLogPath(logDir, logName, clusterName, hostname string) string {

@@ -152,6 +152,7 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.GET("/clusters/:id/patroni-config", cfg.PatroniHandler.GetPatroniConfig, mw.RequireRole("operator"))
 	protected.PATCH("/clusters/:id/patroni-config", cfg.PatroniHandler.PatchPatroniConfig, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/patroni-config/snapshots", cfg.PatroniHandler.GetPatroniSnapshots, mw.RequireRole("operator"))
+	protected.GET("/clusters/:id/patroni-config/deploy/:jobId", cfg.PatroniHandler.GetPatroniDeployStatus, mw.RequireRole("operator"))
 
 	// ── Retention policy ────────────────────────────────────────────────────
 	protected.GET("/clusters/:id/retention-policy", cfg.PatroniHandler.GetRetentionPolicy)

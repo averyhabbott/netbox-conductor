@@ -3761,6 +3761,32 @@ function sortedJSON(value: unknown): string {
 
 // ── PatroniConfigModal ────────────────────────────────────────────────────────
 
+function findDesignViolation(
+  designed: Record<string, unknown>,
+  user: Record<string, unknown>,
+  path = ''
+): string | null {
+  for (const [k, dv] of Object.entries(designed)) {
+    const fullPath = path ? `${path}.${k}` : k
+    const uv = user[k]
+    if (typeof dv === 'object' && dv !== null && !Array.isArray(dv)) {
+      if (typeof uv === 'object' && uv !== null && !Array.isArray(uv)) {
+        const result = findDesignViolation(
+          dv as Record<string, unknown>,
+          uv as Record<string, unknown>,
+          fullPath
+        )
+        if (result) return result
+      } else {
+        return fullPath
+      }
+    } else {
+      if (JSON.stringify(dv) !== JSON.stringify(uv)) return fullPath
+    }
+  }
+  return null
+}
+
 function PatroniConfigModal({
   clusterId,
   primaryHostname,
@@ -3771,15 +3797,20 @@ function PatroniConfigModal({
   onClose: () => void
 }) {
   const [editorValue, setEditorValue] = useState('')
-  const [currentConfig, setCurrentConfig] = useState('')
+  const [liveConfig, setLiveConfig] = useState('')
+  const [designedConfig, setDesignedConfig] = useState<string | null>(null)
   const [snapshots, setSnapshots] = useState<PatroniConfigSnapshot[]>([])
-  const [selectedSnapshot, setSelectedSnapshot] = useState('current')
+  const [selectedSnapshot, setSelectedSnapshot] = useState<string>('__live__')
+  const [liveDrifted, setLiveDrifted] = useState(false)
+  const [revertToDesigned, setRevertToDesigned] = useState(false)
   const [loadState, setLoadState] = useState<'loading' | 'loaded' | 'error'>('loading')
   const [loadError, setLoadError] = useState('')
   const [validationError, setValidationError] = useState('')
   const [showDeployResult, setShowDeployResult] = useState(false)
-  const [deployStatus, setDeployStatus] = useState<'pending' | 'ok' | 'fail'>('pending')
+  const [deployStatus, setDeployStatus] = useState<'pending' | 'restarting' | 'ok' | 'fail'>('pending')
   const [deployError, setDeployError] = useState('')
+  const [deployPaused, setDeployPaused] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -3787,12 +3818,24 @@ function PatroniConfigModal({
       patroniApi.getPatroniConfig(clusterId),
       patroniApi.getPatroniSnapshots(clusterId),
     ])
-      .then(([cfg, snaps]) => {
+      .then(([resp, snaps]) => {
         if (cancelled) return
-        const pretty = sortedJSON(cfg)
-        setCurrentConfig(pretty)
+        const pretty = sortedJSON(resp.config)
+        setLiveConfig(pretty)
         setEditorValue(pretty)
         setSnapshots(snaps)
+        if (resp.designed !== null && resp.designed !== undefined) {
+          setDesignedConfig(sortedJSON(resp.designed))
+        }
+
+        // Find active snapshot and check for drift.
+        const activeSnap = snaps.find((s) => s.is_active)
+        if (activeSnap) {
+          const drifted = sortedJSON(resp.config) !== sortedJSON(activeSnap.config)
+          setLiveDrifted(drifted)
+          setSelectedSnapshot(activeSnap.id)
+          if (!drifted) setEditorValue(sortedJSON(activeSnap.config))
+        }
         setLoadState('loaded')
       })
       .catch((err: unknown) => {
@@ -3803,18 +3846,57 @@ function PatroniConfigModal({
     return () => { cancelled = true }
   }, [clusterId])
 
+  // Stop polling on unmount.
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
+
   function handleSnapshotChange(id: string) {
     setSelectedSnapshot(id)
-    if (id === 'current') {
-      setEditorValue(currentConfig)
+    if (id === '__live__') {
+      setEditorValue(liveConfig)
     } else {
       const snap = snapshots.find((s) => s.id === id)
       if (snap) setEditorValue(sortedJSON(snap.config))
     }
   }
 
+  function handleRevertToggle(checked: boolean) {
+    setRevertToDesigned(checked)
+    if (checked && designedConfig !== null) {
+      setEditorValue(designedConfig)
+    } else {
+      // Restore snapshot selection.
+      handleSnapshotChange(selectedSnapshot)
+    }
+  }
+
+  function startPolling(clusterId: string, jobId: string) {
+    if (pollRef.current) clearInterval(pollRef.current)
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await patroniApi.getPatroniDeployStatus(clusterId, jobId)
+        if (res.status === 'restarting') {
+          setDeployStatus('restarting')
+        } else if (res.status === 'ok') {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+          setDeployStatus('ok')
+        } else if (res.status === 'fail') {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+          setDeployStatus('fail')
+          setDeployError(res.error ?? 'Deploy failed')
+          setDeployPaused(res.paused ?? false)
+        }
+      } catch {
+        // transient poll error — keep trying
+      }
+    }, 3000)
+  }
+
   async function handleDeploy() {
     setValidationError('')
+
+    const source: 'user-edit' | 'user-revert' = revertToDesigned ? 'user-revert' : 'user-edit'
     let parsed: unknown
     try {
       parsed = JSON.parse(editorValue)
@@ -3826,17 +3908,47 @@ function PatroniConfigModal({
       setValidationError('Config must be a JSON object.')
       return
     }
+
+    // Field protection: block changes to conductor-managed keys.
+    if (!revertToDesigned && designedConfig !== null) {
+      try {
+        const designed = JSON.parse(designedConfig) as Record<string, unknown>
+        const violation = findDesignViolation(designed, parsed as Record<string, unknown>)
+        if (violation) {
+          setValidationError(
+            `The field "${violation}" is managed by the conductor and cannot be set directly.`
+          )
+          return
+        }
+      } catch {
+        // designed config malformed — skip check
+      }
+    }
+
+    // If a specific snapshot is selected and the editor content matches it exactly,
+    // pass its ID so the backend marks it active instead of creating a new snapshot.
+    const selectedSnap = !revertToDesigned && selectedSnapshot !== '__live__'
+      ? snapshots.find((s) => s.id === selectedSnapshot)
+      : null
+    const snapshotId = selectedSnap && sortedJSON(selectedSnap.config) === editorValue
+      ? selectedSnapshot
+      : undefined
+
     setDeployStatus('pending')
     setDeployError('')
+    setDeployPaused(false)
     setShowDeployResult(true)
+
     try {
-      await patroniApi.patchPatroniConfig(clusterId, parsed)
-      setDeployStatus('ok')
+      const { job_id } = await patroniApi.patchPatroniConfig(clusterId, parsed, source, snapshotId)
+      startPolling(clusterId, job_id)
     } catch (err: unknown) {
       setDeployStatus('fail')
       setDeployError(err instanceof Error ? err.message : String(err))
     }
   }
+
+  const activeSnapId = snapshots.find((s) => s.is_active)?.id
 
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60">
@@ -3847,13 +3959,17 @@ function PatroniConfigModal({
           {loadState === 'loaded' && snapshots.length > 0 && (
             <select
               value={selectedSnapshot}
+              disabled={revertToDesigned}
               onChange={(e) => handleSnapshotChange(e.target.value)}
-              className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-300"
+              className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-300 disabled:opacity-40"
             >
-              <option value="current">Current</option>
+              {liveDrifted && (
+                <option value="__live__" disabled>Modified (Current)</option>
+              )}
               {snapshots.map((s) => (
                 <option key={s.id} value={s.id}>
                   {new Date(s.captured_at).toLocaleString()} — {s.source}
+                  {s.id === activeSnapId && !liveDrifted ? ' (Current)' : ''}
                 </option>
               ))}
             </select>
@@ -3886,31 +4002,42 @@ function PatroniConfigModal({
           <>
             <textarea
               value={editorValue}
-              onChange={(e) => setEditorValue(e.target.value)}
+              onChange={(e) => { if (!revertToDesigned) setEditorValue(e.target.value) }}
+              readOnly={revertToDesigned}
               rows={20}
               spellCheck={false}
-              className="w-full font-mono text-xs bg-gray-950 border border-gray-700 rounded p-3 text-gray-200 resize-none focus:outline-none focus:border-gray-500"
+              className="w-full font-mono text-xs bg-gray-950 border border-gray-700 rounded p-3 text-gray-200 resize-none focus:outline-none focus:border-gray-500 read-only:opacity-70 read-only:cursor-default"
             />
             {validationError && (
               <p className="text-xs text-red-400">{validationError}</p>
             )}
-            <p className="text-xs text-gray-500">
-              Conductor-managed keys (reset on next Configure Failover / Enable Backups):{' '}
-              <span className="font-mono">ttl, loop_wait, retry_timeout, maximum_lag_on_failover, failsafe_mode, use_pg_rewind, use_slots, wal_level, hot_standby, max_wal_senders, max_replication_slots, wal_log_hints, archive_mode, archive_command</span>
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={onClose}
-                className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleDeploy}
-                className="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-white"
-              >
-                Deploy
-              </button>
+            <div className="flex items-center justify-between gap-2">
+              <span title={designedConfig === null ? 'No designed config available' : undefined}>
+                <label className={`flex items-center gap-2 text-xs select-none ${designedConfig === null ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer text-gray-300'}`}>
+                  <input
+                    type="checkbox"
+                    checked={revertToDesigned}
+                    disabled={designedConfig === null}
+                    onChange={(e) => handleRevertToggle(e.target.checked)}
+                    className="accent-blue-500"
+                  />
+                  Revert to Designed Config
+                </label>
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={onClose}
+                  className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleDeploy}
+                  className="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-white"
+                >
+                  Deploy
+                </button>
+              </div>
             </div>
           </>
         )}
@@ -3922,16 +4049,20 @@ function PatroniConfigModal({
           <div className="bg-gray-900 border border-gray-700 rounded-lg w-full max-w-md p-6 space-y-4">
             <h2 className="text-sm font-semibold text-white">Deploying to {primaryHostname}</h2>
             <div className="text-xs">
-              {deployStatus === 'pending' && <span className="text-gray-400">Deploying…</span>}
-              {deployStatus === 'ok'      && <span className="text-emerald-400">✓ Applied</span>}
-              {deployStatus === 'fail'    && <span className="text-red-400">✗ Failed</span>}
+              {deployStatus === 'pending'    && <span className="text-gray-400">Deploying…</span>}
+              {deployStatus === 'restarting' && <span className="text-amber-400">Restart required, restarting…</span>}
+              {deployStatus === 'ok'         && <span className="text-emerald-400">✓ Applied</span>}
+              {deployStatus === 'fail'       && <span className="text-red-400">✗ Failed</span>}
             </div>
             {deployStatus === 'fail' && deployError && (
               <p className="text-xs text-red-400/80 font-mono break-all">{deployError}</p>
             )}
+            {deployStatus === 'fail' && deployPaused && (
+              <p className="text-xs text-amber-400/80">Patroni cluster left in paused state — operator intervention required.</p>
+            )}
             <div className="flex justify-end">
               <button
-                disabled={deployStatus === 'pending'}
+                disabled={deployStatus === 'pending' || deployStatus === 'restarting'}
                 onClick={() => setShowDeployResult(false)}
                 className="text-xs px-3 py-1.5 border border-gray-600 rounded hover:border-gray-400 text-gray-300 hover:text-white disabled:opacity-40"
               >

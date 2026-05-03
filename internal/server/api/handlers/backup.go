@@ -31,6 +31,7 @@ type BackupHandler struct {
 	catalog     *queries.BackupCatalogQuerier
 	taskResults *queries.TaskResultQuerier
 	snapshots   *queries.PatroniSnapshotQuerier
+	designs     *queries.PatroniDesignQuerier
 	enc         *crypto.Encryptor
 	dispatcher  *hub.Dispatcher
 	hub         *hub.Hub
@@ -50,6 +51,7 @@ func NewBackupHandler(
 	catalog *queries.BackupCatalogQuerier,
 	taskResults *queries.TaskResultQuerier,
 	snapshots *queries.PatroniSnapshotQuerier,
+	designs *queries.PatroniDesignQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	h *hub.Hub,
@@ -65,6 +67,7 @@ func NewBackupHandler(
 		catalog:     catalog,
 		taskResults: taskResults,
 		snapshots:   snapshots,
+		designs:     designs,
 		enc:         enc,
 		dispatcher:  dispatcher,
 		hub:         h,
@@ -417,6 +420,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	if primaryNode != nil {
 		capturedPrimary := *primaryNode
 		capturedSnapshots := h.snapshots
+		capturedDesigns := h.designs
 		capturedEmitter := h.emitter
 
 		// Collect replica nodes (DB nodes that are not the primary).
@@ -597,6 +601,16 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 					slog.Warn("enable-backups: archive_mode not confirmed on replica after max attempts",
 						"node", replica.Hostname)
 				}
+			}
+
+			// Record design intent and post-change snapshot after all nodes confirm archive_mode.
+			if capturedDesigns != nil {
+				if err := capturedDesigns.Upsert(bgCtx, clusterID, archivePatch); err != nil {
+					slog.Warn("enable-backups: failed to store design", "cluster", clusterID, "err", err)
+				}
+			}
+			if capturedSnapshots != nil {
+				recordPostChangeSnapshot(bgCtx, capturedSnapshots, clusterID, primaryIP, restUser, restPass, "configure-backups")
 			}
 
 			// 5. Skip stanza-create if already initialized.
