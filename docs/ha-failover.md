@@ -40,7 +40,7 @@ Patroni uses its built-in Raft DCS — no external etcd, Consul, or ZooKeeper is
 
 **Witness process:** The Conductor spawns `patroni_raft_controller` (one subprocess per active/standby cluster) that participates in Raft voting but holds no data. This gives a 2-node cluster a 3rd voter on the conductor host, so either node can maintain quorum after a network partition without promoting a split-brain primary. The witness is also automatically recovered when the Conductor restarts — no manual trigger needed.
 
-`patroni_raft_controller` is installed at `/opt/netbox-conductor/venv/bin/patroni_raft_controller` as part of the Patroni pip package. See [Installation](installation.md#3-set-up-the-patroni-witness-python-environment) for setup steps. If the witness process crashes it auto-restarts every 5 seconds; the current address is visible in the cluster's Patroni Topology view.
+`patroni_raft_controller` is installed at `/opt/netbox-conductor/venv/bin/patroni_raft_controller` as part of the Patroni pip package. See [Installation](installation.md#3-set-up-the-patroni-witness-python-environment) for setup steps. If the witness process crashes it auto-restarts every 5 seconds. To prevent a misconfigured binary from flooding logs, the supervisor switches to a 5-minute backoff after 5 crashes within 60 seconds; a run that stays up for at least 30 seconds resets the counter and returns to the base cadence. The current address is visible in the cluster's Patroni Topology view.
 
 **`failsafe_mode: true`** is set in all generated configs — the primary continues serving if it loses contact with the standby, preventing a self-inflicted outage in a 2-node cluster with a temporary network hiccup.
 

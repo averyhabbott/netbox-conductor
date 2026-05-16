@@ -212,7 +212,13 @@ func (s *BackupScheduler) dispatchBackup(ctx context.Context, node *queries.Node
 		Type:   backupType,
 	})
 	taskID := uuid.New()
-	_ = s.tasks.Create(ctx, node.ID, taskID, string(protocol.TaskPGBackRestBackup), params)
+	// Use a per-task ack timeout matching the agent-side execution limit so the
+	// sweeper does not mark a still-running backup as timed-out. The +5 min
+	// slack absorbs result-delivery latency between agent and conductor.
+	const backupAckTimeoutSecs = 3600 + 300
+	if err := s.tasks.CreateWithAckTimeout(ctx, node.ID, taskID, string(protocol.TaskPGBackRestBackup), params, backupAckTimeoutSecs); err != nil {
+		return uuid.Nil, fmt.Errorf("create backup task record: %w", err)
+	}
 	if err := s.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
 		TaskID:      taskID.String(),
 		TaskType:    protocol.TaskPGBackRestBackup,
@@ -221,7 +227,9 @@ func (s *BackupScheduler) dispatchBackup(ctx context.Context, node *queries.Node
 	}); err != nil {
 		return uuid.Nil, err
 	}
-	_ = s.tasks.SetSent(ctx, taskID)
+	if err := s.tasks.SetSent(ctx, taskID); err != nil {
+		slog.Warn("backupscheduler: SetSent failed", "node", node.Hostname, "task", taskID, "error", err)
+	}
 	return taskID, nil
 }
 

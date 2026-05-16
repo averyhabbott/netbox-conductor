@@ -3,21 +3,43 @@
 // API handler and the failover manager.
 package nodestate
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
+
+// ErrPatroniStateCorrupt is returned by ExtractPatroniRoleStrict when the
+// Patroni state blob is present but cannot be parsed as JSON. Callers making
+// failover or topology decisions should treat this as "do not trust this
+// node's role" rather than "no Patroni role" — they are not the same.
+var ErrPatroniStateCorrupt = errors.New("patroni state is not valid JSON")
 
 // ExtractPatroniRole parses a Patroni state JSON blob and returns the node's
 // Patroni role string (e.g. "primary", "replica"). Returns "" if state is nil
-// or unparseable.
+// or unparseable. Use this for cosmetic display where collapsing both cases to
+// "unknown" is acceptable.
 func ExtractPatroniRole(state json.RawMessage) string {
+	role, _ := ExtractPatroniRoleStrict(state)
+	return role
+}
+
+// ExtractPatroniRoleStrict parses a Patroni state JSON blob and returns the
+// node's role plus a parse error if the blob is present but malformed. A nil
+// state returns ("", nil) — "no heartbeat yet" is distinct from "corruption".
+//
+// Callers making decisions that depend on a node's actual role (failover
+// candidate selection, topology checks) should branch on the error so they
+// don't silently treat a corrupted-state node as a non-primary.
+func ExtractPatroniRoleStrict(state json.RawMessage) (string, error) {
 	if state == nil {
-		return ""
+		return "", nil
 	}
 	var ps map[string]any
 	if err := json.Unmarshal(state, &ps); err != nil {
-		return ""
+		return "", ErrPatroniStateCorrupt
 	}
 	role, _ := ps["role"].(string)
-	return role
+	return role, nil
 }
 
 // ComputeNodeHealth returns "healthy", "unhealthy", or "offline" for a node

@@ -21,6 +21,14 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// Default backup schedules. Sunday 1am for the full backup; the rest of the
+// week 1am for differentials. Centralized here so the "create defaults" and
+// "fill in missing field" paths can't drift apart.
+const (
+	DefaultFullBackupCron = "0 1 * * 0"
+	DefaultDiffBackupCron = "0 1 * * 1-6"
+)
+
 // BackupHandler handles backup configuration, scheduling, catalog, and restore.
 type BackupHandler struct {
 	clusters    *queries.ClusterQuerier
@@ -119,10 +127,10 @@ func (h *BackupHandler) PutBackupSchedule(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
 	if req.FullBackupCron == "" {
-		req.FullBackupCron = "0 1 * * 0"
+		req.FullBackupCron = DefaultFullBackupCron
 	}
 	if req.DiffBackupCron == "" {
-		req.DiffBackupCron = "0 1 * * 1-6"
+		req.DiffBackupCron = DefaultDiffBackupCron
 	}
 	if req.IncrBackupIntervalHrs <= 0 {
 		req.IncrBackupIntervalHrs = 1
@@ -280,18 +288,14 @@ func (h *BackupHandler) DisableBackups(c echo.Context) error {
 // disableArchiving snapshots the current Patroni config, then PATCHes archive_mode and
 // archive_command to null (removes them from DCS). Also clears stanza_initialized.
 func (h *BackupHandler) disableArchiving(ctx context.Context, clusterID uuid.UUID, primary queries.Node, snaps *queries.PatroniSnapshotQuerier) error {
-	restUser, restPass := "patroni", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+	restUser, restPass := CredDefaultUserPatroniREST, ""
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPatroniREST); err == nil {
 		restUser = cred.Username
 		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
 			restPass = string(pw)
 		}
 	}
 	primaryIP := stripCIDR(primary.IPAddress)
-
-	if snaps != nil {
-		snapshotPatroniConfig(ctx, snaps, clusterID, primaryIP, restUser, restPass, "configure-backups")
-	}
 
 	disablePatch, _ := json.Marshal(map[string]any{
 		"postgresql": map[string]any{
@@ -303,7 +307,17 @@ func (h *BackupHandler) disableArchiving(ctx context.Context, clusterID uuid.UUI
 	})
 	patchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	_, status, err := patroniREST(patchCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, disablePatch)
+	_, status, err := patroniDCSChange(patchCtx, patroniDCSChangeOptions{
+		snapshots: snaps,
+		tasks:     h.taskResults,
+		clusterID: clusterID,
+		nodeID:    primary.ID,
+		primaryIP: primaryIP,
+		restUser:  restUser,
+		restPass:  restPass,
+		patchBody: disablePatch,
+		source:    "disable-archiving",
+	})
 	if err != nil {
 		return err
 	}
@@ -356,8 +370,8 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		if _, err := h.schedules.Upsert(ctx, queries.UpsertBackupScheduleParams{
 			ClusterID:             clusterID,
 			Enabled:               true,
-			FullBackupCron:        "0 1 * * 0",
-			DiffBackupCron:        "0 1 * * 1-6",
+			FullBackupCron:        DefaultFullBackupCron,
+			DiffBackupCron:        DefaultDiffBackupCron,
 			IncrBackupIntervalHrs: 1,
 		}); err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to initialize backup schedule: "+err.Error())
@@ -483,6 +497,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			// archiveOK checks whether a node has archive_mode active in the DCS and no
 			// pending PostgreSQL restart. For replicas, pass checkDCS=false (DCS propagates
 			// automatically; only pending_restart matters).
+			expectedArchiveCommand := "pgbackrest --stanza=" + stanzaName + " archive-push %p"
 			archiveOK := func(nodeIP string, checkDCS bool) bool {
 				if checkDCS {
 					cfgCtx, cfgCancel := context.WithTimeout(bgCtx, 10*time.Second)
@@ -496,10 +511,20 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 							Parameters map[string]any `json:"parameters"`
 						} `json:"postgresql"`
 					}
-					if json.Unmarshal(body, &cfg) != nil {
+					if err := json.Unmarshal(body, &cfg); err != nil {
+						slog.Warn("enable-backups: unparseable /config response from primary — treating as not-ready",
+							"node", nodeIP, "err", err)
 						return false
 					}
 					if v, ok := cfg.Postgresql.Parameters["archive_mode"]; !ok || v != "on" {
+						return false
+					}
+					// archive_command must also match what we PATCHed in — if archive_mode
+					// is "on" but the command is stale or missing, WAL files won't reach
+					// the pgBackRest stanza and the next backup will fail with no warning.
+					if v, ok := cfg.Postgresql.Parameters["archive_command"]; !ok || v != expectedArchiveCommand {
+						slog.Warn("enable-backups: archive_command in DCS does not match expected value",
+							"node", nodeIP, "got", v, "want", expectedArchiveCommand)
 						return false
 					}
 				}
@@ -512,7 +537,13 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 				var health struct {
 					PendingRestart bool `json:"pending_restart"`
 				}
-				_ = json.Unmarshal(body, &health)
+				if err := json.Unmarshal(body, &health); err != nil {
+					// If we can't parse the health response, we don't actually know
+					// whether a restart is pending — refuse to declare success.
+					slog.Warn("enable-backups: unparseable health response — treating as not-ready",
+						"node", nodeIP, "err", err)
+					return false
+				}
 				return !health.PendingRestart
 			}
 
@@ -531,8 +562,8 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 					"node", capturedPrimary.Hostname, "attempt", attempt+1)
 
 				patchCtx, patchCancel := context.WithTimeout(bgCtx, 30*time.Second)
-				_, patchStatus, patchErr := patroniREST(patchCtx, http.MethodPatch, primaryIP,
-					"/config", restUser, restPass, archivePatch)
+				_, patchStatus, patchErr := patroniPATCHConfigAudited(patchCtx, h.taskResults, capturedPrimary.ID, primaryIP,
+					restUser, restPass, archivePatch, "configure-backups")
 				patchCancel()
 				if patchErr != nil || patchStatus >= 300 {
 					slog.Warn("enable-backups: PATCH /config failed",
@@ -597,9 +628,11 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 				if replicaActive {
 					emit(events.SeverityInfo, events.CodeBackupsEnabled,
 						"WAL archiving applied to replica "+replica.Hostname)
-				} else if !replicaActive {
+				} else {
 					slog.Warn("enable-backups: archive_mode not confirmed on replica after max attempts",
 						"node", replica.Hostname)
+					emit(events.SeverityWarn, events.CodeBackupsEnabled,
+						"WAL archiving could not be confirmed on replica "+replica.Hostname+" after "+fmt.Sprintf("%d", maxAttempts)+" attempts — backups may be incomplete from this node")
 				}
 			}
 
@@ -623,7 +656,13 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			// 6. Dispatch stanza-create to the confirmed primary.
 			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
 			stanzaTaskID := uuid.New()
-			_ = h.taskResults.Create(bgCtx, capturedPrimary.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams)
+			if createErr := h.taskResults.Create(bgCtx, capturedPrimary.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams); createErr != nil {
+				slog.Error("enable-backups: stanza-create task record create failed — aborting",
+					"node", capturedPrimary.Hostname, "error", createErr)
+				emit(events.SeverityWarn, events.CodeBackupsEnabled,
+					"pgBackRest stanza-create could not be recorded for "+capturedPrimary.Hostname+" — aborting")
+				return
+			}
 			if dispErr := h.dispatcher.Dispatch(capturedPrimary.ID, protocol.TaskDispatchPayload{
 				TaskID:      stanzaTaskID.String(),
 				TaskType:    protocol.TaskPGBackRestStanzaCreate,
@@ -636,7 +675,10 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 					"pgBackRest stanza-create dispatch failed on "+capturedPrimary.Hostname)
 				return
 			}
-			_ = h.taskResults.SetSent(bgCtx, stanzaTaskID)
+			if sentErr := h.taskResults.SetSent(bgCtx, stanzaTaskID); sentErr != nil {
+				slog.Warn("enable-backups: stanza-create SetSent failed",
+					"node", capturedPrimary.Hostname, "task", stanzaTaskID, "error", sentErr)
+			}
 
 			if ok := pollTaskSuccess(bgCtx, h.taskResults, stanzaTaskID, 5*time.Minute); !ok {
 				emit(events.SeverityWarn, events.CodeBackupsEnabled,
@@ -920,7 +962,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	// Step 1: Pause Patroni automation via REST API.
 	// The pause flag propagates via DCS to all cluster members automatically.
 	restoreIP := stripCIDR(restoreNode.IPAddress)
-	if _, status, err := patroniREST(ctx, http.MethodPatch, restoreIP, "/config", restUser, restPass, []byte(`{"pause": true}`)); err != nil || status >= 300 {
+	if _, status, err := patroniPATCHConfigAudited(ctx, h.taskResults, restoreNode.ID, restoreIP, restUser, restPass, []byte(`{"pause": true}`), "restore-pause"); err != nil || status >= 300 {
 		_ = h.schedules.SetRestoreInProgress(ctx, clusterID, false)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadGateway, "patroni pause failed: "+err.Error())
@@ -1048,7 +1090,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 			}
 
 			// Resume Patroni — HA loop takes over, replicas clone from primary via pg_basebackup.
-			body, status, err := patroniREST(bgCtx, http.MethodPatch, capturedRestoreIP, "/config", restUser, restPass, []byte(`{"pause": null}`))
+			body, status, err := patroniPATCHConfigAudited(bgCtx, h.taskResults, capturedRestoreNode.ID, capturedRestoreIP, restUser, restPass, []byte(`{"pause": null}`), "restore-resume")
 			slog.Info("restore goroutine: patroni resume", "node", capturedRestoreNode.Hostname, "status", status, "body", string(body), "err", err)
 			if err != nil {
 				slog.Error("patroni resume failed", "node", capturedRestoreNode.Hostname, "error", err)

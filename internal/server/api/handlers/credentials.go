@@ -77,15 +77,43 @@ type upsertCredentialRequest struct {
 	DBName   *string `json:"db_name"`
 }
 
+// Credential kind constants. Used in DB lookups, JSON payloads, and as the
+// authoritative source for which credentials a cluster may store. Code paths
+// that build Patroni configs or look up specific credentials should use these
+// rather than string literals so a rename propagates cleanly.
+const (
+	CredKindPostgresSuperuser   = "postgres_superuser"
+	CredKindPostgresReplication = "postgres_replication"
+	CredKindNetboxDBUser        = "netbox_db_user"
+	CredKindRedisTasks          = "redis_tasks_password"
+	CredKindRedisCaching        = "redis_caching_password"
+	CredKindNetboxSecretKey     = "netbox_secret_key"
+	CredKindNetboxAPITokenPepper = "netbox_api_token_pepper"
+	CredKindPatroniREST         = "patroni_rest_password"
+)
+
+// Default usernames used when a credential record is created or when a config
+// builder needs a sensible fallback. Single source of truth — the credential
+// generator and the fallbacks in PushPatroniConfig must agree, otherwise a
+// fresh cluster could generate "replicator" while the config generator wrote
+// "replica" into patroni.yml.
+const (
+	CredDefaultUserPostgresSuperuser   = "postgres"
+	CredDefaultUserPostgresReplication = "replicator"
+	CredDefaultUserPatroniREST         = "patroni"
+	CredDefaultUserNetboxDB            = "netbox"
+	CredDefaultDBNetbox                = "netbox"
+)
+
 var validCredKinds = map[string]bool{
-	"postgres_superuser":      true,
-	"postgres_replication":    true,
-	"netbox_db_user":          true,
-	"redis_tasks_password":    true,
-	"redis_caching_password":  true,
-	"netbox_secret_key":       true,
-	"netbox_api_token_pepper": true,
-	"patroni_rest_password":   true,
+	CredKindPostgresSuperuser:    true,
+	CredKindPostgresReplication:  true,
+	CredKindNetboxDBUser:         true,
+	CredKindRedisTasks:           true,
+	CredKindRedisCaching:         true,
+	CredKindNetboxSecretKey:      true,
+	CredKindNetboxAPITokenPepper: true,
+	CredKindPatroniREST:          true,
 }
 
 // autoGenDefaults maps credential kind → default username (and optional db name).
@@ -94,11 +122,11 @@ var autoGenDefaults = []struct {
 	Username string
 	DBName   *string
 }{
-	{Kind: "postgres_superuser", Username: "postgres"},
-	{Kind: "postgres_replication", Username: "replicator"},
-	{Kind: "netbox_db_user", Username: "netbox", DBName: strPtr("netbox")},
-	{Kind: "redis_tasks_password", Username: ""},
-	{Kind: "patroni_rest_password", Username: "patroni"},
+	{Kind: CredKindPostgresSuperuser, Username: CredDefaultUserPostgresSuperuser},
+	{Kind: CredKindPostgresReplication, Username: CredDefaultUserPostgresReplication},
+	{Kind: CredKindNetboxDBUser, Username: CredDefaultUserNetboxDB, DBName: strPtr(CredDefaultDBNetbox)},
+	{Kind: CredKindRedisTasks, Username: ""},
+	{Kind: CredKindPatroniREST, Username: CredDefaultUserPatroniREST},
 }
 
 func strPtr(s string) *string { return &s }

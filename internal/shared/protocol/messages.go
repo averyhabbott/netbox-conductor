@@ -68,6 +68,35 @@ const (
 	TaskBackupSyncWrite        TaskType = "backup.sync.write"       // write conductor-relayed backup repo chunks to disk
 )
 
+// SafeToRetryOnReconnect reports whether re-dispatching a task to an agent that
+// previously had it "sent" but never returned a result is safe — i.e. whether
+// running the operation a second time produces the same end state as running it
+// once. Used by the reconnect handler: tasks that are NOT safe to retry are
+// marked timeout instead of being re-sent, so the operator is alerted and the
+// underlying work isn't accidentally duplicated.
+//
+// Idempotent: state-converging (start/stop/restart, write-config-file,
+// host-update), read-only, or designed for repeat invocation (stanza-create
+// is bootstrap-only but the agent guards against double-init).
+//
+// NOT idempotent: anything that does work twice if run twice (backups,
+// pg_dump, full restore, exec.run admin commands, agent self-upgrade).
+func SafeToRetryOnReconnect(t TaskType) bool {
+	switch t {
+	case TaskPGBackRestBackup,
+		TaskPGBackRestRestore,
+		TaskDBBackup,
+		TaskDBRestore,
+		TaskMediaSync,
+		TaskRunCommand,
+		TaskAgentUpgrade,
+		TaskBackupSyncRead,
+		TaskBackupSyncWrite:
+		return false
+	}
+	return true
+}
+
 // Envelope wraps every WebSocket message.
 type Envelope struct {
 	// ID is a UUIDv4 used to correlate requests and responses.

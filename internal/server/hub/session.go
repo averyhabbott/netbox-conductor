@@ -146,3 +146,15 @@ func (s *Session) SetNetboxRunning(running *bool) (prev *bool, changed bool) {
 	s.netboxRunning = running
 	return old, changed
 }
+
+// NetboxRunning returns the last NetBox-running value reported by a heartbeat
+// on this session. Returns nil if no heartbeat has been received yet.
+//
+// Callers who need to know "is NetBox actually running right now?" should pair
+// this with LastSeen() and reject values from sessions that have not heartbeat
+// recently — the in-memory value is only as fresh as the last heartbeat.
+func (s *Session) NetboxRunning() *bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.netboxRunning
+}

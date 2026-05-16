@@ -230,9 +230,33 @@ func (m *WitnessManager) writeRaftConfig(proc *witnessProc) (string, error) {
 	return cfgPath, nil
 }
 
+// witness crash-loop guard parameters. A misconfigured binary or persistently
+// invalid config would otherwise restart forever at the base 5s interval,
+// flooding logs and burning CPU. After maxCrashes within crashWindow we back
+// off to longBackoff and emit a one-shot error so it's visible in monitoring.
+const (
+	witnessMaxCrashes       = 5
+	witnessCrashWindow      = time.Minute
+	witnessLongBackoff      = 5 * time.Minute
+	witnessSuccessThreshold = 30 * time.Second
+)
+
 // runProc supervises a single patroni_raft_controller subprocess with auto-restart.
+//
+// The restart loop has a crash-rate guard: more than witnessMaxCrashes failures
+// inside witnessCrashWindow switches the loop to witnessLongBackoff and logs
+// a sustained-failure error. A run that lasts at least witnessSuccessThreshold
+// resets the counter, so an intermittent crash doesn't permanently degrade
+// the restart cadence.
 func (m *WitnessManager) runProc(proc *witnessProc) {
-	backoff := 5 * time.Second
+	const baseBackoff = 5 * time.Second
+	backoff := baseBackoff
+
+	var (
+		recentCrashes  []time.Time
+		degraded       bool
+		degradedLogged bool
+	)
 
 	for {
 		// Check if we've been stopped
@@ -264,16 +288,59 @@ func (m *WitnessManager) runProc(proc *witnessProc) {
 		cmd.Stdout = &prefixWriter{prefix: fmt.Sprintf("[witness %s] ", proc.clusterID)}
 		cmd.Stderr = &prefixWriter{prefix: fmt.Sprintf("[witness %s] ", proc.clusterID)}
 
-		if err := cmd.Run(); err != nil {
+		startedAt := time.Now()
+		runErr := cmd.Run()
+		ranFor := time.Since(startedAt)
+
+		if runErr != nil {
 			if ctx.Err() != nil {
 				cancel()
 				return // stopped intentionally
 			}
-			log.Printf("witness crashed for cluster=%s: %v — restarting in %s",
-				proc.clusterID, err, backoff)
+			log.Printf("witness crashed for cluster=%s after %s: %v — restarting in %s",
+				proc.clusterID, ranFor.Round(time.Second), runErr, backoff)
 		}
 
 		cancel()
+
+		// A run that stayed up long enough is treated as a successful supervision;
+		// clear the crash record and return to the base backoff cadence.
+		if ranFor >= witnessSuccessThreshold {
+			recentCrashes = recentCrashes[:0]
+			if degraded {
+				slog.Info("witness: subprocess stabilized — returning to base backoff",
+					"cluster", proc.clusterID, "ran_for", ranFor.Round(time.Second))
+			}
+			degraded = false
+			degradedLogged = false
+			backoff = baseBackoff
+		} else {
+			now := time.Now()
+			recentCrashes = append(recentCrashes, now)
+			cutoff := now.Add(-witnessCrashWindow)
+			pruned := recentCrashes[:0]
+			for _, t := range recentCrashes {
+				if t.After(cutoff) {
+					pruned = append(pruned, t)
+				}
+			}
+			recentCrashes = pruned
+
+			if len(recentCrashes) >= witnessMaxCrashes {
+				if !degraded {
+					degraded = true
+				}
+				backoff = witnessLongBackoff
+				if !degradedLogged {
+					slog.Error("witness: subprocess crash-looping — slowing restart to long backoff",
+						"cluster", proc.clusterID,
+						"recent_crashes", len(recentCrashes),
+						"window", witnessCrashWindow.String(),
+						"long_backoff", witnessLongBackoff.String())
+					degradedLogged = true
+				}
+			}
+		}
 
 		// Check if stopped between crash and restart
 		m.mu.Lock()

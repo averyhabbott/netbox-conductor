@@ -178,23 +178,23 @@ func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
 	}
 
 	// Gather credentials
-	superUser, superPass := "postgres", ""
-	replicaUser, replicaPass := "replicator", ""
-	restUser, restPass := "patroni", ""
+	superUser, superPass := CredDefaultUserPostgresSuperuser, ""
+	replicaUser, replicaPass := CredDefaultUserPostgresReplication, ""
+	restUser, restPass := CredDefaultUserPatroniREST, ""
 
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_superuser"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresSuperuser); err == nil {
 		superUser = cred.Username
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			superPass = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_replication"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresReplication); err == nil {
 		replicaUser = cred.Username
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			replicaPass = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPatroniREST); err == nil {
 		restUser = cred.Username
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			restPass = string(pw)
@@ -205,7 +205,7 @@ func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
 	raftPeers := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":5433")
+			raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
 		}
 	}
 
@@ -243,7 +243,7 @@ func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
 			Scope:         cluster.PatroniScope,
 			NodeName:      node.Hostname,
 			NodeAddr:      nodeIP,
-			RaftSelfAddr:  nodeIP + ":5433",
+			RaftSelfAddr:  nodeIP + ":" + protocol.PatroniRaftPortStr,
 			RaftPartners:  partners,
 			WitnessAddr:   witnessAddr,
 			RESTUsername:  restUser,
@@ -356,7 +356,7 @@ func (h *PatroniHandler) Switchover(c echo.Context) error {
 		switchBody["candidate"] = req.Candidate
 	}
 	bodyBytes, _ := json.Marshal(switchBody)
-	patroniURL := fmt.Sprintf("http://%s:8008/switchover", primaryIP)
+	patroniURL := fmt.Sprintf("http://%s:%d/switchover", primaryIP, protocol.PatroniRESTPort)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, patroniURL, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build switchover request")
@@ -408,7 +408,7 @@ func (h *PatroniHandler) StartWitness(c echo.Context) error {
 	partners := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			partners = append(partners, stripCIDR(n.IPAddress)+":5433")
+			partners = append(partners, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
 		}
 	}
 
@@ -566,7 +566,7 @@ func (h *PatroniHandler) PushPatroniConfigNode(c echo.Context) error {
 	allPeers := make([]string, 0)
 	for _, n := range allNodes {
 		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			allPeers = append(allPeers, stripCIDR(n.IPAddress)+":5433")
+			allPeers = append(allPeers, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
 		}
 	}
 	partners := make([]string, 0)
@@ -585,7 +585,7 @@ func (h *PatroniHandler) PushPatroniConfigNode(c echo.Context) error {
 		Scope:         cluster.PatroniScope,
 		NodeName:      node.Hostname,
 		NodeAddr:      nodeIP,
-		RaftSelfAddr:  nodeIP + ":5433",
+		RaftSelfAddr:  nodeIP + ":" + protocol.PatroniRaftPortStr,
 		RaftPartners:  partners,
 		WitnessAddr:   witnessAddr,
 		RESTUsername:  restUser,
@@ -855,7 +855,7 @@ func (h *PatroniHandler) Failover(c echo.Context) error {
 		failBody["candidate"] = req.Candidate
 	}
 	bodyBytes, _ := json.Marshal(failBody)
-	patroniURL := fmt.Sprintf("http://%s:8008/failover", targetIP)
+	patroniURL := fmt.Sprintf("http://%s:%d/failover", targetIP, protocol.PatroniRESTPort)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, patroniURL, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build failover request")
@@ -1132,10 +1132,10 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		username string
 		dbName   *string
 	}{
-		{"postgres_superuser", "postgres", nil},
-		{"postgres_replication", "replicator", nil},
-		{"patroni_rest_password", "patroni", nil},
-		{"redis_tasks_password", "", nil},
+		{CredKindPostgresSuperuser, CredDefaultUserPostgresSuperuser, nil},
+		{CredKindPostgresReplication, CredDefaultUserPostgresReplication, nil},
+		{CredKindPatroniREST, CredDefaultUserPatroniREST, nil},
+		{CredKindRedisTasks, "", nil},
 	} {
 		if _, err := h.creds.GetByKind(ctx, clusterID, def.kind); err != nil {
 			raw, genErr := crypto.GenerateToken(32)
@@ -1163,30 +1163,30 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 
 	// Decrypt credentials for config rendering
-	superUser, superPass := "postgres", ""
-	replicaUser, replicaPass := "replicator", ""
-	restUser, restPass := "patroni", ""
+	superUser, superPass := CredDefaultUserPostgresSuperuser, ""
+	replicaUser, replicaPass := CredDefaultUserPostgresReplication, ""
+	restUser, restPass := CredDefaultUserPatroniREST, ""
 	redisPassword := ""
 
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_superuser"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresSuperuser); err == nil {
 		superUser = cred.Username
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			superPass = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_replication"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresReplication); err == nil {
 		replicaUser = cred.Username
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			replicaPass = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPatroniREST); err == nil {
 		restUser = cred.Username
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			restPass = string(pw)
 		}
 	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "redis_tasks_password"); err == nil {
+	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindRedisTasks); err == nil {
 		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
 			redisPassword = string(pw)
 		}
@@ -1254,7 +1254,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// Build Raft peer list (all nodes participate in Raft consensus)
 	raftPeers := make([]string, 0, len(nodes))
 	for _, n := range nodes {
-		raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":5433")
+		raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
 	}
 
 	// Start witness on conductor (idempotent — no-op if already running)
@@ -1413,7 +1413,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			Scope:         cluster.PatroniScope,
 			NodeName:      node.Hostname,
 			NodeAddr:      nodeIP,
-			RaftSelfAddr:  nodeIP + ":5433",
+			RaftSelfAddr:  nodeIP + ":" + protocol.PatroniRaftPortStr,
 			RaftPartners:  partners,
 			WitnessAddr:   witnessAddr,
 			RESTUsername:  restUser,
@@ -1588,12 +1588,23 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 	}
 	if len(replicaNodes) > 0 {
-		go func(replicas []queries.Node, primaryIP, restU, restP string) {
+		go func(replicas []queries.Node, primaryNodeID uuid.UUID, primaryIP, restU, restP string) {
 			// Overall backstop: derived from poll ceilings (90s + 65s) plus buffer.
 			bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer bgCancel()
 
 			bgDispatch := mkDispatch(bgCtx)
+
+			// emit publishes a configure-failover event so operators see background
+			// failures even though the HTTP handler already returned 202.
+			emit := func(severity, msg string) {
+				if h.emitter == nil {
+					return
+				}
+				h.emitter.Emit(events.New(events.CategoryHA, severity,
+					events.CodeFailoverConfigured, msg, events.ActorSystem).
+					Cluster(clusterID).Build())
+			}
 
 			// Poll GET /primary — returns 200 when this node is the Patroni leader.
 			deadline := time.Now().Add(90 * time.Second)
@@ -1677,10 +1688,12 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				},
 			})
 			patchCtx, patchCancel := context.WithTimeout(bgCtx, 15*time.Second)
-			if _, patchStatus, patchErr := patroniREST(patchCtx, http.MethodPatch, primaryIP,
-				"/config", restU, restP, configPatch); patchErr != nil || patchStatus >= 300 {
+			if _, patchStatus, patchErr := patroniPATCHConfigAudited(patchCtx, h.taskResults, primaryNodeID, primaryIP,
+				restU, restP, configPatch, "configure-failover"); patchErr != nil || patchStatus >= 300 {
 				slog.Warn("configure-failover: PATCH /config failed", "primary", primaryIP,
 					"status", patchStatus, "err", patchErr)
+				emit(events.SeverityWarn,
+					"failed to apply DCS config (ttl, failover params) on primary — cluster will use Patroni defaults until retried")
 			} else {
 				slog.Info("configure-failover: DCS config applied", "primary", primaryIP)
 				if h.designs != nil {
@@ -1726,11 +1739,15 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					if err != nil {
 						slog.Error("configure-failover: reinitialize request failed — skipping replica",
 							"replica", node.Hostname, "error", err)
+						emit(events.SeverityWarn,
+							"replica "+node.Hostname+" reinitialize request failed — needs manual intervention to join cluster")
 						continue
 					}
 					if status >= 300 {
 						slog.Error("configure-failover: reinitialize refused by Patroni — skipping replica",
 							"replica", node.Hostname, "status", status)
+						emit(events.SeverityWarn,
+							"replica "+node.Hostname+" reinitialize refused by Patroni (status "+fmt.Sprintf("%d", status)+") — needs manual intervention to join cluster")
 						continue
 					}
 					slog.Info("configure-failover: triggered replica reinitialize",
@@ -1778,6 +1795,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				if !streamingVerified {
 					slog.Error("configure-failover: replica streaming verify timed out — skipping replica",
 						"replica", node.Hostname, "primary", primaryIP, "last_state", lastState)
+					emit(events.SeverityWarn,
+						"replica "+node.Hostname+" did not reach streaming state within 2 minutes (last state: "+lastState+") — needs investigation; subsequent config tasks were skipped")
 					continue
 				}
 				slog.Info("configure-failover: replica streaming verified",
@@ -1794,7 +1813,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				}
 				dispatchConfigForNode(bgCtx, bgDispatch, node, req.AppTierAlwaysAvailable)
 			}
-		}(replicaNodes, masterHost, restUser, restPass)
+		}(replicaNodes, primaryNode.ID, masterHost, restUser, restPass)
 	}
 
 	if err := h.clusters.SetPatroniConfigured(ctx, clusterID); err != nil {
@@ -1959,7 +1978,7 @@ func (h *PatroniHandler) PatchPatroniConfig(c echo.Context) error {
 	job := &patroniDeployJob{status: "pending"}
 	h.deployJobs.Store(jobID, job)
 
-	go h.runPatroniDeploy(clusterID, jobID, job, nodes, primaryIP, restUser, restPass, req)
+	go h.runPatroniDeploy(clusterID, jobID, job, nodes, primary.ID, primaryIP, restUser, restPass, req)
 
 	return c.JSON(http.StatusAccepted, map[string]string{"job_id": jobID.String()})
 }
@@ -1991,6 +2010,7 @@ func (h *PatroniHandler) runPatroniDeploy(
 	jobID uuid.UUID,
 	job *patroniDeployJob,
 	allNodes []queries.Node,
+	primaryNodeID uuid.UUID,
 	primaryIP, restUser, restPass string,
 	req patchPatroniConfigRequest,
 ) {
@@ -2058,7 +2078,7 @@ func (h *PatroniHandler) runPatroniDeploy(
 	_ = loopWait // used below
 
 	patchCtx, patchCancel := context.WithTimeout(bgCtx, 15*time.Second)
-	_, patchStatus, patchErr := patroniREST(patchCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, patchBody)
+	_, patchStatus, patchErr := patroniPATCHConfigAudited(patchCtx, h.taskResults, primaryNodeID, primaryIP, restUser, restPass, patchBody, "user-edit")
 	patchCancel()
 	if patchErr != nil || patchStatus >= 300 {
 		msg := fmt.Sprintf("PATCH /config failed (status %d)", patchStatus)
@@ -2087,7 +2107,7 @@ func (h *PatroniHandler) runPatroniDeploy(
 
 	// Pause Patroni to suppress automatic failover during restarts.
 	pauseCtx, pauseCancel := context.WithTimeout(bgCtx, 10*time.Second)
-	_, pauseStatus, pauseErr := patroniREST(pauseCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, []byte(`{"pause":true}`))
+	_, pauseStatus, pauseErr := patroniPATCHConfigAudited(pauseCtx, h.taskResults, primaryNodeID, primaryIP, restUser, restPass, []byte(`{"pause":true}`), "deploy-pause")
 	pauseCancel()
 	if pauseErr != nil || pauseStatus >= 300 {
 		job.set("fail", fmt.Sprintf("failed to pause Patroni before restart (status %d)", pauseStatus), false)
@@ -2137,7 +2157,7 @@ func (h *PatroniHandler) runPatroniDeploy(
 
 	// Resume Patroni.
 	resumeCtx, resumeCancel := context.WithTimeout(bgCtx, 10*time.Second)
-	_, resumeStatus, resumeErr := patroniREST(resumeCtx, http.MethodPatch, primaryIP, "/config", restUser, restPass, []byte(`{"pause":null}`))
+	_, resumeStatus, resumeErr := patroniPATCHConfigAudited(resumeCtx, h.taskResults, primaryNodeID, primaryIP, restUser, restPass, []byte(`{"pause":null}`), "deploy-resume")
 	resumeCancel()
 	if resumeErr != nil || resumeStatus >= 300 {
 		job.set("fail", "cluster restarted but Patroni resume failed — cluster left in paused state", true)

@@ -384,21 +384,37 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	slog.Info("agent connected", "node", nodeID, "hostname", node.Hostname, "version", hello.AgentVersion)
 
 	// Dispatch pending tasks on reconnect:
-	//   "sent"   tasks were in-flight before the last disconnect — re-send them.
+	//   "sent"   tasks were in-flight before the last disconnect.
+	//            - Idempotent task types: re-send (running again converges to the same state).
+	//            - Non-idempotent (backups, restores, exec.run, agent.upgrade): the
+	//              agent may have already executed it before disconnecting; re-running
+	//              would double the work or worse. Mark as timeout so the operator
+	//              can verify state and re-trigger if needed.
 	//   "queued" tasks were created while the node was offline (e.g. a stop.netbox
 	//            enqueued to prevent split-brain) — dispatch them for the first time.
 	if pending, err := h.taskResults.ListPendingByNode(ctx, nodeID); err == nil && len(pending) > 0 {
-		slog.Info("dispatching pending tasks on reconnect", "node", nodeID, "count", len(pending))
+		slog.Info("processing pending tasks on reconnect", "node", nodeID, "count", len(pending))
 		for i := range pending {
 			t := &pending[i]
 			if len(t.RequestPayload) == 0 || t.TaskType == "" {
+				continue
+			}
+			taskType := protocol.TaskType(t.TaskType)
+			if t.Status == "sent" && !protocol.SafeToRetryOnReconnect(taskType) {
+				if err := h.taskResults.MarkOrphaned(ctx, t.TaskID,
+					"task was in-flight when agent disconnected; not safe to retry automatically (non-idempotent operation)"); err != nil {
+					slog.Warn("failed to mark orphaned non-idempotent task", "node", nodeID, "task", t.TaskID, "type", taskType, "error", err)
+				} else {
+					slog.Warn("orphaned non-idempotent task on reconnect — not re-dispatching",
+						"node", nodeID, "task", t.TaskID, "type", taskType)
+				}
 				continue
 			}
 			// Reconstruct the full TaskDispatchPayload wrapper. request_payload stores
 			// only the inner params; the agent expects the complete dispatch shape.
 			wrapped, err := json.Marshal(protocol.TaskDispatchPayload{
 				TaskID:      t.TaskID.String(),
-				TaskType:    protocol.TaskType(t.TaskType),
+				TaskType:    taskType,
 				Params:      t.RequestPayload,
 				TimeoutSecs: 60,
 			})
@@ -412,7 +428,9 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 			})
 			// Advance queued → sent; "sent" tasks are already in the correct state.
 			if t.Status == "queued" {
-				_ = h.taskResults.SetSent(ctx, t.TaskID)
+				if err := h.taskResults.SetSent(ctx, t.TaskID); err != nil {
+					slog.Warn("SetSent failed during reconnect dispatch", "node", nodeID, "task", t.TaskID, "error", err)
+				}
 			}
 		}
 	}

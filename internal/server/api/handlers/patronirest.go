@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
 )
 
@@ -25,9 +26,119 @@ var patroniHTTPClient = &http.Client{
 	},
 }
 
+// patroniDCSChangeOptions bundles the dependencies for a snapshot-bracketed
+// PATCH /config operation. nil snapshots disables the pre/post snapshot capture
+// (e.g. for pause/resume operations that aren't design-intent changes). nil
+// tasks disables the task_results audit row.
+type patroniDCSChangeOptions struct {
+	snapshots *queries.PatroniSnapshotQuerier
+	tasks     *queries.TaskResultQuerier
+	clusterID uuid.UUID
+	nodeID    uuid.UUID
+
+	primaryIP string
+	restUser  string
+	restPass  string
+
+	patchBody []byte
+	source    string // "configure-backups", "configure-failover", "user-edit", ...
+}
+
+// patroniDCSChange runs the three-step "design intent" PATCH sequence:
+//
+//  1. snapshot the current DCS config (pre-change baseline)
+//  2. PATCH /config (with task_results audit row)
+//  3. on success, record the new DCS state as the active snapshot
+//
+// Each step is independent — snapshot failures are logged but don't block the
+// PATCH; PATCH failure skips the post-snapshot since there's nothing new to
+// record. Returns the PATCH response/status/error so callers can branch on
+// success/failure exactly as they did when the steps were inlined.
+//
+// Use this for operations that represent operator-visible design changes
+// (configure-failover, configure-backups, user-edit). For transient state
+// changes that aren't a design (pause/resume), call patroniPATCHConfigAudited
+// directly with snapshots=nil-effective so the snapshot history isn't polluted.
+func patroniDCSChange(ctx context.Context, opts patroniDCSChangeOptions) ([]byte, int, error) {
+	if opts.snapshots != nil {
+		snapshotPatroniConfig(ctx, opts.snapshots, opts.clusterID, opts.primaryIP, opts.restUser, opts.restPass, opts.source)
+	}
+
+	body, status, err := patroniPATCHConfigAudited(ctx, opts.tasks, opts.nodeID,
+		opts.primaryIP, opts.restUser, opts.restPass, opts.patchBody, opts.source)
+
+	if err == nil && status < 300 && opts.snapshots != nil {
+		recordPostChangeSnapshot(ctx, opts.snapshots, opts.clusterID, opts.primaryIP, opts.restUser, opts.restPass, opts.source)
+	}
+
+	return body, status, err
+}
+
+// patroniPATCHConfigAudited performs a PATCH /config call against the primary
+// Patroni REST API and records the operation in task_results so the change is
+// correlated with the conductor operation that initiated it.
+//
+// Why: the snapshot table (patroni_config_snapshots) captures *what* the DCS
+// config looked like before and after, but not *which* conductor operation
+// caused the change. Without this row, an operator investigating a DCS drift
+// has no way to trace it back to ConfigureBackups vs ConfigureFailover vs a
+// user edit via the config editor. Writing a task_result with the source
+// gives that single point of correlation.
+//
+// source is a short label like "configure-backups", "configure-failover",
+// "user-edit", "restore-pause", "restore-resume", "disable-archiving". It
+// becomes a suffix on the task_type so audit history filters cleanly by op.
+//
+// nodeID should be the primary node — that's the node actually receiving the
+// PATCH. tasks may be nil during early initialization or in tests; in that
+// case the audit step is skipped silently and the PATCH still runs.
+func patroniPATCHConfigAudited(
+	ctx context.Context,
+	tasks *queries.TaskResultQuerier,
+	nodeID uuid.UUID,
+	primaryIP, restUser, restPass string,
+	patchBody []byte,
+	source string,
+) ([]byte, int, error) {
+	taskType := "patroni.dcs.patch"
+	if source != "" {
+		taskType = "patroni.dcs.patch." + source
+	}
+	taskID := uuid.New()
+	if tasks != nil && nodeID != uuid.Nil {
+		if err := tasks.Create(ctx, nodeID, taskID, taskType, patchBody); err != nil {
+			slog.Warn("patroni-dcs-audit: create task record failed", "source", source, "err", err)
+			// Proceed anyway — losing the audit row is preferable to skipping the PATCH.
+			tasks = nil
+		} else if err := tasks.SetSent(ctx, taskID); err != nil {
+			slog.Warn("patroni-dcs-audit: SetSent failed", "source", source, "task", taskID, "err", err)
+		}
+	}
+
+	body, status, err := patroniREST(ctx, http.MethodPatch, primaryIP, "/config", restUser, restPass, patchBody)
+
+	if tasks != nil && nodeID != uuid.Nil {
+		success := err == nil && status < 300
+		errStr := ""
+		if err != nil {
+			errStr = err.Error()
+		}
+		respPayload, _ := json.Marshal(map[string]any{
+			"status": status,
+			"body":   json.RawMessage(body),
+			"error":  errStr,
+		})
+		if cerr := tasks.Complete(ctx, taskID, success, respPayload); cerr != nil {
+			slog.Warn("patroni-dcs-audit: Complete failed", "source", source, "task", taskID, "err", cerr)
+		}
+	}
+
+	return body, status, err
+}
+
 // patroniREST makes an authenticated request to the Patroni REST API on a given node.
 func patroniREST(ctx context.Context, method, nodeIP, path, user, pass string, body []byte) ([]byte, int, error) {
-	url := "http://" + nodeIP + ":8008" + path
+	url := "http://" + nodeIP + ":" + protocol.PatroniRESTPortStr + path
 	var bodyReader *bytes.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)

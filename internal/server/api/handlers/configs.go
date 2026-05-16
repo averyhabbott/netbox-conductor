@@ -606,7 +606,7 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 	var sentinelAddrs []string
 	for _, n := range allNodes {
 		if n.Role == "hyperconverged" || n.Role == "app" {
-			sentinelAddrs = append(sentinelAddrs, stripCIDR(n.IPAddress)+":26379")
+			sentinelAddrs = append(sentinelAddrs, stripCIDR(n.IPAddress)+":"+protocol.RedisSentinelPortStr)
 		}
 	}
 

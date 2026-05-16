@@ -274,14 +274,18 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 	ctx := context.Background()
 
 	// Check if the node recovered since the timer was armed.
-	// Skip failover only when the node is connected AND reporting NetBox running.
-	// (For a disconnect scenario OnNodeConnect would have already cancelled the
-	// timer, but guard against the narrow race anyway.)
-	if m.h.IsConnected(failedNodeID) {
-		if check, err := m.nodes.GetByID(ctx, failedNodeID); err == nil &&
-			check.NetboxRunning != nil && *check.NetboxRunning {
-			slog.Debug("failover: node recovered before timer fired — skipping", "node", failedNodeID)
-			return
+	// Skip failover only when the node has an active session AND a recent
+	// heartbeat AND that heartbeat reports NetBox running. Using the in-hub
+	// session state avoids trusting the DB's netbox_running flag when it may
+	// be stale (the DB row is only as fresh as the last persisted heartbeat,
+	// which during a flap could be from before the disconnect).
+	if sess := m.h.Get(failedNodeID); sess != nil {
+		const heartbeatFreshness = 15 * time.Second
+		if time.Since(sess.LastSeen()) <= heartbeatFreshness {
+			if running := sess.NetboxRunning(); running != nil && *running {
+				slog.Debug("failover: node recovered before timer fired — skipping", "node", failedNodeID)
+				return
+			}
 		}
 	}
 
@@ -387,6 +391,16 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 		m.dispatchRedisHostUpdate(ctx, allNodes, candidateIP)
 	}
 
+	// Enqueue stop.netbox for the failed node BEFORE dispatching start to the
+	// candidate. This closes the split-brain window unconditionally: if the start
+	// dispatch fails, we still want the failed node to self-stop on reconnect so
+	// it cannot come back and run NetBox alongside a candidate that gets started
+	// later (manually or by retry).
+	if err := m.enqueueForReconnect(ctx, failedNode, protocol.TaskStopNetbox); err != nil {
+		slog.Warn("failover: could not enqueue stop task for failed node — split-brain risk",
+			"node", failedNode.ID, "error", err)
+	}
+
 	if err := m.dispatchServiceTask(ctx, candidate, protocol.TaskStartNetbox); err != nil {
 		slog.Error("failover: dispatch failed", "candidate", candidate.ID, "error", err)
 		m.emitHAEvent(ctx, haEventParams{
@@ -406,14 +420,6 @@ func (m *Manager) attemptFailover(failedNodeID, clusterID uuid.UUID, checkNetbox
 			"candidate": candidate.Hostname,
 		})
 		return
-	}
-
-	// Enqueue stop.netbox for the failed node so it self-stops when it reconnects.
-	// This closes the split-brain window: if the node comes back while the candidate
-	// is already running NetBox, it will stop itself before accepting connections.
-	if err := m.enqueueForReconnect(ctx, failedNode, protocol.TaskStopNetbox); err != nil {
-		slog.Warn("failover: could not enqueue stop task for failed node — split-brain risk",
-			"node", failedNode.ID, "error", err)
 	}
 
 	m.emitHAEvent(ctx, haEventParams{
@@ -880,7 +886,16 @@ func (m *Manager) bestCandidate(ctx context.Context, clusterID, excludeNodeID uu
 	// Prefer healthy candidates. Nodes are already sorted by failover_priority DESC,
 	// so the first healthy one is both the highest priority and healthy.
 	for _, n := range eligible {
-		patroniRole := nodestate.ExtractPatroniRole(n.PatroniState)
+		patroniRole, err := nodestate.ExtractPatroniRoleStrict(n.PatroniState)
+		if err != nil {
+			// Corrupted Patroni state — we can't trust this node's role, so we
+			// can't make a defensible health judgement either. Skip rather than
+			// treating it as "no role" (which would let an actual primary with
+			// a truncated heartbeat be misclassified as standby).
+			slog.Warn("failover: candidate has unparseable patroni_state — excluding from healthy candidates",
+				"node", n.Hostname, "node_id", n.ID, "error", err)
+			continue
+		}
 		if nodestate.ComputeNodeHealth(n.Role, "connected", n.NetboxRunning, n.RQRunning, patroniRole, false) == "healthy" {
 			return n, nil
 		}
@@ -925,7 +940,15 @@ func (m *Manager) triggerPatroniSwitchover(
 	if !cluster.PatroniConfigured || cluster.Mode != "active_standby" {
 		return false, nil
 	}
-	candidateRole := nodestate.ExtractPatroniRole(candidate.PatroniState)
+	candidateRole, roleErr := nodestate.ExtractPatroniRoleStrict(candidate.PatroniState)
+	if roleErr != nil {
+		// Corrupted heartbeat state — we cannot safely switch over to a node whose
+		// current Patroni role we cannot determine. Logging surfaces the corruption
+		// so operators can investigate (truncated heartbeat, agent bug, etc).
+		slog.Warn("failover: candidate has unparseable patroni_state — refusing switchover",
+			"candidate", candidate.Hostname, "error", roleErr)
+		return false, nil
+	}
 	// Candidate is already primary, or has no Patroni role (app-only node) — nothing to do.
 	if candidateRole == "primary" || candidateRole == "master" || candidateRole == "" {
 		return false, nil
@@ -956,7 +979,7 @@ func (m *Manager) triggerPatroniSwitchover(
 			"leader":    primary.Hostname,
 			"candidate": candidate.Hostname,
 		})
-		url := fmt.Sprintf("http://%s:8008/switchover", primaryIP)
+		url := fmt.Sprintf("http://%s:%d/switchover", primaryIP, protocol.PatroniRESTPort)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.SetBasicAuth(restUser, restPass)
@@ -985,7 +1008,7 @@ func (m *Manager) triggerPatroniSwitchover(
 			"master":    failingHostname,
 			"candidate": candidate.Hostname,
 		})
-		url := fmt.Sprintf("http://%s:8008/failover", candidateIP)
+		url := fmt.Sprintf("http://%s:%d/failover", candidateIP, protocol.PatroniRESTPort)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.SetBasicAuth(restUser, restPass)
@@ -1015,7 +1038,10 @@ func (m *Manager) dispatchDBHostUpdate(ctx context.Context, nodes []queries.Node
 			continue
 		}
 		taskID := uuid.New()
-		_ = m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateDBHost), params)
+		if err := m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateDBHost), params); err != nil {
+			slog.Error("failover: db-host-update task record create failed — skipping dispatch", "node", n.Hostname, "error", err)
+			continue
+		}
 		if err := m.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
 			TaskID:      taskID.String(),
 			TaskType:    protocol.TaskUpdateDBHost,
@@ -1025,7 +1051,9 @@ func (m *Manager) dispatchDBHostUpdate(ctx context.Context, nodes []queries.Node
 			slog.Warn("failover: db-host-update dispatch failed", "node", n.Hostname, "error", err)
 			continue
 		}
-		_ = m.tasks.SetSent(ctx, taskID)
+		if err := m.tasks.SetSent(ctx, taskID); err != nil {
+			slog.Warn("failover: db-host-update SetSent failed", "node", n.Hostname, "task", taskID, "error", err)
+		}
 	}
 }
 
@@ -1048,7 +1076,10 @@ func (m *Manager) dispatchRedisHostUpdate(ctx context.Context, nodes []queries.N
 			continue
 		}
 		taskID := uuid.New()
-		_ = m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateRedisHost), params)
+		if err := m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateRedisHost), params); err != nil {
+			slog.Error("failover: redis-host-update task record create failed — skipping dispatch", "node", n.Hostname, "error", err)
+			continue
+		}
 		if err := m.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
 			TaskID:      taskID.String(),
 			TaskType:    protocol.TaskUpdateRedisHost,
@@ -1058,7 +1089,9 @@ func (m *Manager) dispatchRedisHostUpdate(ctx context.Context, nodes []queries.N
 			slog.Warn("failover: redis-host-update dispatch failed", "node", n.Hostname, "error", err)
 			continue
 		}
-		_ = m.tasks.SetSent(ctx, taskID)
+		if err := m.tasks.SetSent(ctx, taskID); err != nil {
+			slog.Warn("failover: redis-host-update SetSent failed", "node", n.Hostname, "task", taskID, "error", err)
+		}
 	}
 }
 
@@ -1071,11 +1104,15 @@ func (m *Manager) dispatchServiceTask(ctx context.Context, node *queries.Node, t
 		TimeoutSecs: 30,
 	}
 	raw, _ := json.Marshal(dispatchPayload)
-	_ = m.tasks.Create(ctx, node.ID, taskID, string(taskType), raw)
+	if err := m.tasks.Create(ctx, node.ID, taskID, string(taskType), raw); err != nil {
+		return fmt.Errorf("create task record: %w", err)
+	}
 	if err := m.dispatcher.Dispatch(node.ID, dispatchPayload); err != nil {
 		return err
 	}
-	_ = m.tasks.SetSent(ctx, taskID)
+	if err := m.tasks.SetSent(ctx, taskID); err != nil {
+		slog.Warn("failover: service-task SetSent failed", "node", node.Hostname, "task", taskID, "type", taskType, "error", err)
+	}
 	return nil
 }
 

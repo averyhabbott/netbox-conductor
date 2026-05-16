@@ -1,0 +1,11 @@
+-- Per-task acknowledgement timeout override.
+--
+-- Most tasks are short-lived and use the conductor-wide default AckTimeout
+-- (a few minutes). Long-running tasks like pgbackrest backups or full cluster
+-- restores legitimately run for an hour or more; without a per-task override
+-- the global sweeper marks them as "timeout" while the agent is still working,
+-- causing the scheduler to retry and produce duplicate concurrent runs.
+--
+-- NULL means "use the default". Numeric values override the global default
+-- for the "ack" → terminal transition only.
+ALTER TABLE task_results ADD COLUMN ack_timeout_secs INTEGER;

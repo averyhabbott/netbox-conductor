@@ -30,12 +30,23 @@ func NewTaskResultQuerier(pool *pgxpool.Pool) *TaskResultQuerier {
 	return &TaskResultQuerier{pool: pool}
 }
 
-// Create records a newly queued task.
+// Create records a newly queued task using the default sweeper ack timeout.
 func (q *TaskResultQuerier) Create(ctx context.Context, nodeID, taskID uuid.UUID, taskType string, payload json.RawMessage) error {
 	_, err := q.pool.Exec(ctx, `
 		INSERT INTO task_results (node_id, task_id, task_type, status, request_payload)
 		VALUES ($1, $2, $3, 'queued', $4)`,
 		nodeID, taskID, taskType, payload)
+	return err
+}
+
+// CreateWithAckTimeout records a newly queued task with a per-task ack timeout
+// override (in seconds). Use this for legitimately long-running tasks (full
+// backups, full cluster restores) so the sweeper does not kill them prematurely.
+func (q *TaskResultQuerier) CreateWithAckTimeout(ctx context.Context, nodeID, taskID uuid.UUID, taskType string, payload json.RawMessage, ackTimeoutSecs int) error {
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO task_results (node_id, task_id, task_type, status, request_payload, ack_timeout_secs)
+		VALUES ($1, $2, $3, 'queued', $4, $5)`,
+		nodeID, taskID, taskType, payload, ackTimeoutSecs)
 	return err
 }
 
@@ -64,6 +75,21 @@ func (q *TaskResultQuerier) Complete(ctx context.Context, taskID uuid.UUID, succ
 		SET status = $2, response_payload = $3, completed_at = now()
 		WHERE task_id = $1`,
 		taskID, status, responsePayload)
+	return err
+}
+
+// MarkOrphaned records a task as timed out with an explanatory payload. Used
+// when a non-idempotent task in "sent" state is found on agent reconnect — we
+// can't safely re-dispatch (the agent may have already executed it), so we
+// mark it timeout with context so the UI/operator can investigate rather than
+// silently leaving it stuck.
+func (q *TaskResultQuerier) MarkOrphaned(ctx context.Context, taskID uuid.UUID, reason string) error {
+	payload, _ := json.Marshal(map[string]string{"error": reason})
+	_, err := q.pool.Exec(ctx, `
+		UPDATE task_results
+		SET status = 'timeout', response_payload = $2, completed_at = now()
+		WHERE task_id = $1 AND status IN ('sent', 'ack')`,
+		taskID, payload)
 	return err
 }
 
@@ -111,13 +137,16 @@ func (q *TaskResultQuerier) ListByNode(ctx context.Context, nodeID uuid.UUID, li
 }
 
 // TimeoutStale marks tasks that have been stuck in "sent", "ack", or "queued"
-// status longer than the given durations as "timeout". Returns the number of rows affected.
+// status longer than the given durations as "timeout". The "ack" timeout uses
+// the per-task ack_timeout_secs column when set, falling back to ackTimeout
+// otherwise — this lets long-running tasks (backups, restores) opt out of the
+// short global default. Returns the number of rows affected.
 func (q *TaskResultQuerier) TimeoutStale(ctx context.Context, sentTimeout, ackTimeout, queuedTimeout time.Duration) (int64, error) {
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE task_results
 		SET status = 'timeout', completed_at = now()
 		WHERE (status = 'sent'   AND queued_at < now() - $1::interval)
-		   OR (status = 'ack'    AND queued_at < now() - $2::interval)
+		   OR (status = 'ack'    AND queued_at < now() - make_interval(secs => COALESCE(ack_timeout_secs, EXTRACT(EPOCH FROM $2::interval)::int)))
 		   OR (status = 'queued' AND queued_at < now() - $3::interval)`,
 		sentTimeout.String(), ackTimeout.String(), queuedTimeout.String())
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,11 +36,18 @@ func UpgradeAgent(params protocol.AgentUpgradeParams, tlsSkipVerify bool, tlsCAC
 		arch = runtime.GOARCH
 	}
 
-	// Build HTTP client matching the agent's TLS configuration.
+	// Build HTTP client matching the agent's TLS configuration. When the agent
+	// is configured with a custom CA cert (self-signed conductor), trust that
+	// CA explicitly rather than disabling verification — preserves the
+	// authenticity check while accepting the operator's chosen root.
 	tlsCfg := &tls.Config{InsecureSkipVerify: tlsSkipVerify} //nolint:gosec
-	if tlsCACert != "" {
-		// Re-use insecure for upgrade — the URL was provided by the trusted conductor.
-		_ = tlsCACert
+	if tlsCACert != "" && !tlsSkipVerify {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM([]byte(tlsCACert)) {
+			tlsCfg.RootCAs = pool
+		} else {
+			return "", fmt.Errorf("tls_ca_cert is not valid PEM")
+		}
 	}
 	httpClient := &http.Client{
 		Timeout:   120 * time.Second,
