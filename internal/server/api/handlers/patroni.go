@@ -1715,34 +1715,73 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				}
 
 				// POST /reinitialize forces a clean pg_basebackup from the primary.
-				// Patroni handles the file operations itself, so no agent permissions needed.
+				// force:true is required so Patroni wipes an existing data dir that
+				// looks "okay enough" — without it, stale credentials from a prior
+				// bootstrap leave a non-replicating replica untouched.
 				if bgCtx.Err() == nil {
 					reinitCtx, reinitCancel := context.WithTimeout(bgCtx, 15*time.Second)
-					if _, _, err := patroniREST(reinitCtx, http.MethodPost, replicaIP, "/reinitialize",
-						restU, restP, []byte(`{}`)); err == nil {
-						slog.Info("configure-failover: triggered replica reinitialize",
-							"replica", node.Hostname)
-					} else {
-						slog.Warn("configure-failover: reinitialize request failed",
-							"replica", node.Hostname, "error", err)
-					}
+					_, status, err := patroniREST(reinitCtx, http.MethodPost, replicaIP, "/reinitialize",
+						restU, restP, []byte(`{"force": true}`))
 					reinitCancel()
+					if err != nil {
+						slog.Error("configure-failover: reinitialize request failed — skipping replica",
+							"replica", node.Hostname, "error", err)
+						continue
+					}
+					if status >= 300 {
+						slog.Error("configure-failover: reinitialize refused by Patroni — skipping replica",
+							"replica", node.Hostname, "status", status)
+						continue
+					}
+					slog.Info("configure-failover: triggered replica reinitialize",
+						"replica", node.Hostname, "status", status)
 				}
 
-				// Wait for replica to finish pg_basebackup and enter streaming state.
+				// Wait for the replica to actually reach streaming state. /cluster on
+				// the primary reports each member's state from pg_stat_replication;
+				// /replica on the replica only confirms "I am a secondary process",
+				// which stays true even when streaming is broken (e.g., bad creds).
+				streamingVerified := false
+				var lastState string
 				replicaReadyDeadline := time.Now().Add(120 * time.Second)
 				for time.Now().Before(replicaReadyDeadline) {
 					if bgCtx.Err() != nil {
 						break
 					}
 					pollCtx, pollCancel := context.WithTimeout(bgCtx, 10*time.Second)
-					_, status, err := patroniREST(pollCtx, http.MethodGet, replicaIP, "/replica", restU, restP, nil)
+					body, status, err := patroniREST(pollCtx, http.MethodGet, primaryIP, "/cluster", restU, restP, nil)
 					pollCancel()
 					if err == nil && status == http.StatusOK {
+						var clusterView struct {
+							Members []struct {
+								Name  string `json:"name"`
+								State string `json:"state"`
+							} `json:"members"`
+						}
+						if json.Unmarshal(body, &clusterView) == nil {
+							for _, m := range clusterView.Members {
+								if m.Name == node.Hostname {
+									lastState = m.State
+									if m.State == "streaming" {
+										streamingVerified = true
+									}
+									break
+								}
+							}
+						}
+					}
+					if streamingVerified {
 						break
 					}
 					time.Sleep(5 * time.Second)
 				}
+				if !streamingVerified {
+					slog.Error("configure-failover: replica streaming verify timed out — skipping replica",
+						"replica", node.Hostname, "primary", primaryIP, "last_state", lastState)
+					continue
+				}
+				slog.Info("configure-failover: replica streaming verified",
+					"replica", node.Hostname)
 
 				if cluster.Mode == "active_standby" {
 					dispatchStopSentinel(bgDispatch, node)
