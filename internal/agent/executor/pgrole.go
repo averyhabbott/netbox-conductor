@@ -33,20 +33,30 @@ func CreatePgRole(params protocol.CreatePgRoleParams) (string, error) {
 
 	// Idempotent: create if absent, otherwise update the password so re-running
 	// configure-failover always leaves the role in the correct state.
-	sql := fmt.Sprintf(`DO $$ BEGIN
+	// Pick a dollar-quote tag that can't appear in the name or password, so a
+	// password containing "$$" can't end the DO block early.
+	tag := "$nbc$"
+	for strings.Contains(params.RoleName+params.Password, tag) {
+		tag = tag[:len(tag)-1] + "x$"
+	}
+	sql := fmt.Sprintf(`DO %s BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%s') THEN
     CREATE ROLE %s WITH %s PASSWORD '%s';
   ELSE
     ALTER ROLE %s WITH %s PASSWORD '%s';
   END IF;
-END $$;`,
+END %s;`,
+		tag,
 		escapedName,
 		quotedName, opts, escapedPass,
-		quotedName, opts, escapedPass)
+		quotedName, opts, escapedPass,
+		tag)
 
 	deadline := time.Now().Add(120 * time.Second)
 	for {
-		cmd := exec.Command("sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-c", sql)
+		// SQL (with the password) goes via stdin, not -c, so it isn't visible in ps.
+		cmd := exec.Command("sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1")
+		cmd.Stdin = strings.NewReader(sql)
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			return fmt.Sprintf("role %s created/updated", params.RoleName), nil

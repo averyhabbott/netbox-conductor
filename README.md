@@ -64,7 +64,7 @@ No inbound firewall rules are needed on agent hosts — all traffic is agent-ini
 
 | Component | Technology |
 | --- | --- |
-| Server | Go 1.25 + Echo v4 |
+| Server | Go 1.26 + Echo v4 |
 | Frontend | React 18 + TypeScript + Vite + Tailwind CSS v4 |
 | Database | PostgreSQL (pgx/v5 driver) |
 | Agent protocol | WebSocket + JSON envelopes |

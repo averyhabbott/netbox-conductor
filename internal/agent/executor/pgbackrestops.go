@@ -98,8 +98,10 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 	if params.TargetTime == "" {
 		return "", fmt.Errorf("target_time is required")
 	}
-	if _, err := time.Parse(time.RFC3339, params.TargetTime); err != nil {
-		return "", fmt.Errorf("invalid target_time %q (must be RFC3339): %w", params.TargetTime, err)
+	// Validate before stopping anything so a bad time can't leave Postgres down.
+	pgbackrestTime, err := pgbackrestTargetTime(params.TargetTime)
+	if err != nil {
+		return "", err
 	}
 
 	dataDir := params.DataDir
@@ -121,12 +123,6 @@ func RunPGBackRestRestore(params protocol.PGBackRestRestoreParams) (string, erro
 	}
 
 	// Step 2: Run pgBackRest restore as the postgres OS user.
-	// pgbackrest requires YYYY-MM-DD HH:MM:SS+00, not RFC3339 (T/Z).
-	pgbackrestTime := strings.NewReplacer("T", " ", "Z", "+00").Replace(params.TargetTime)
-	if dot := strings.IndexByte(pgbackrestTime, '.'); dot != -1 {
-		pgbackrestTime = pgbackrestTime[:dot] + pgbackrestTime[strings.IndexByte(pgbackrestTime, '+'):]
-	}
-
 	var restoreArgs []string
 	if params.RestoreCmd != "" {
 		restoreArgs = strings.Fields(params.RestoreCmd) //nolint:gosec — operator-supplied command
@@ -296,4 +292,14 @@ func PostgresDataDir() string {
 		return fields[5]
 	}
 	return "/var/lib/postgresql/data"
+}
+
+// pgbackrestTargetTime converts an RFC3339 time to the "YYYY-MM-DD HH:MM:SS+00"
+// form pgbackrest expects, in UTC. Fractional seconds are dropped.
+func pgbackrestTargetTime(s string) (string, error) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "", fmt.Errorf("invalid target_time %q (must be RFC3339): %w", s, err)
+	}
+	return t.UTC().Format("2006-01-02 15:04:05-07"), nil
 }

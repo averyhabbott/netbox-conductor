@@ -99,12 +99,11 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 func queryRedisRole() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	args := []string{"-p", "6379"}
+	cmd := exec.CommandContext(ctx, "redis-cli", "-p", "6379", "ROLE")
 	if pass := redisPassword(); pass != "" {
-		args = append(args, "--no-auth-warning", "-a", pass)
+		cmd.Env = append(os.Environ(), "REDISCLI_AUTH="+pass) // not argv: visible in ps
 	}
-	args = append(args, "ROLE")
-	out, err := exec.CommandContext(ctx, "redis-cli", args...).Output()
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}

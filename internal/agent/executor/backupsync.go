@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
@@ -24,7 +23,7 @@ const (
 //
 // sendFn is called for each Envelope to be sent over the WebSocket connection.
 // This mirrors PushMediaRoot from mediasync.go.
-func PushBackupRepo(params protocol.BackupSyncReadParams, sendFn func(protocol.Envelope)) error {
+func PushBackupRepo(params protocol.BackupSyncReadParams, sendFn func(protocol.Envelope) error) error {
 	repoPath := params.RepoPath
 	if repoPath == "" {
 		repoPath = defaultBackupRepoPath
@@ -76,11 +75,14 @@ func PushBackupRepo(params protocol.BackupSyncReadParams, sendFn func(protocol.E
 				EOF:          isEOF,
 			}
 			payload, _ := json.Marshal(chunk)
-			sendFn(protocol.Envelope{
+			if err := sendFn(protocol.Envelope{
 				ID:      uuid.New().String(),
 				Type:    protocol.TypeBackupChunk,
 				Payload: json.RawMessage(payload),
-			})
+			}); err != nil {
+				_ = f.Close()
+				return fmt.Errorf("sending %s: %w", rel, err)
+			}
 
 			chunkIdx++
 			if isEOF {
@@ -101,59 +103,19 @@ func PushBackupRepo(params protocol.BackupSyncReadParams, sendFn func(protocol.E
 		EOF:          true,
 	}
 	payload, _ := json.Marshal(done)
-	sendFn(protocol.Envelope{
+	return sendFn(protocol.Envelope{
 		ID:      uuid.New().String(),
 		Type:    protocol.TypeBackupChunk,
 		Payload: json.RawMessage(payload),
 	})
-
-	return nil
 }
 
 // WriteBackupChunk writes a received pgBackRest repo chunk to the local repo directory.
-// Skips the file if it already exists — pgBackRest repo files are immutable once written,
+// Skips files that already exist — pgBackRest repo files are immutable once written,
 // so existence implies identical content and no overwrite is needed.
 func WriteBackupChunk(chunk protocol.BackupChunkPayload, repoPath string) error {
-	if chunk.RelativePath == "" {
-		return nil // EOF sentinel
-	}
-
-	// Guard against path traversal.
-	rel := filepath.FromSlash(chunk.RelativePath)
-	if strings.HasPrefix(rel, "..") || strings.Contains(rel, string(filepath.Separator)+"..") {
-		return fmt.Errorf("invalid path: %s", chunk.RelativePath)
-	}
-
 	if repoPath == "" {
 		repoPath = defaultBackupRepoPath
 	}
-	dest := filepath.Join(repoPath, rel)
-
-	// Skip if already exists (immutability guarantee means same name = same content).
-	if chunk.ChunkIndex == 0 {
-		if _, err := os.Stat(dest); err == nil {
-			return nil // file exists, skip
-		}
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dest), 0750); err != nil {
-		return fmt.Errorf("creating parent dir for %s: %w", rel, err)
-	}
-
-	var f *os.File
-	var err error
-	if chunk.ChunkIndex == 0 {
-		f, err = os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
-	} else {
-		f, err = os.OpenFile(dest, os.O_APPEND|os.O_WRONLY, 0640)
-	}
-	if err != nil {
-		return fmt.Errorf("opening %s for write: %w", dest, err)
-	}
-	defer f.Close()
-
-	if _, err := f.Write(chunk.Data); err != nil {
-		return fmt.Errorf("writing %s: %w", dest, err)
-	}
-	return nil
+	return writeChunk(repoPath, chunk.TransferID, chunk.RelativePath, chunk.ChunkIndex, chunk.Data, chunk.EOF, true, 0640, 0750)
 }

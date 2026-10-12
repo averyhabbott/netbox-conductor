@@ -30,17 +30,39 @@ func (b *loginBucket) allow() bool {
 	return b.attempts <= loginMaxAttempts
 }
 
-// loginBuckets is a global map of IP → bucket. Buckets are never deleted
-// (acceptable for a long-lived server; the map stays small in practice).
-var loginBuckets sync.Map // map[string]*loginBucket
+// loginBuckets is a global map of route+IP → bucket. Expired buckets are swept
+// every few minutes so the map can't grow without bound.
+var (
+	loginBuckets   sync.Map // map[string]*loginBucket
+	loginSweepOnce sync.Once
+)
 
-// LoginRateLimit limits POST /auth/login to loginMaxAttempts per IP per minute.
-// Returns 429 when the limit is exceeded.
+func sweepLoginBuckets() {
+	for range time.Tick(5 * time.Minute) {
+		now := time.Now()
+		loginBuckets.Range(func(k, v any) bool {
+			b := v.(*loginBucket)
+			b.mu.Lock()
+			expired := now.After(b.resetAt)
+			b.mu.Unlock()
+			if expired {
+				loginBuckets.Delete(k)
+			}
+			return true
+		})
+	}
+}
+
+// LoginRateLimit limits each route it's attached to (login, TOTP verify) to
+// loginMaxAttempts per client IP per minute; each route has its own budget.
+// Returns 429 when the limit is exceeded. The IP is the TCP peer address
+// (router sets ExtractIPDirect), so X-Forwarded-For can't fake a fresh IP.
 func LoginRateLimit() echo.MiddlewareFunc {
+	loginSweepOnce.Do(func() { go sweepLoginBuckets() })
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			ip := c.RealIP()
-			val, _ := loginBuckets.LoadOrStore(ip, &loginBucket{
+			key := c.Path() + "|" + c.RealIP()
+			val, _ := loginBuckets.LoadOrStore(key, &loginBucket{
 				resetAt: time.Now().Add(loginWindow),
 			})
 			b := val.(*loginBucket)

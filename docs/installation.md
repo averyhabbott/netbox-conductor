@@ -22,13 +22,13 @@ The conductor server and build toolchain target **Linux (arm64/amd64)**. The age
 sudo apt-get install -y git make wget
 ```
 
-### Go 1.25+
+### Go 1.26+
 
 ```bash
-# Check https://go.dev/dl/ for the latest 1.25.x release
-wget https://go.dev/dl/go1.25.9.linux-amd64.tar.gz
+# Check https://go.dev/dl/ for the latest 1.26.x release
+wget https://go.dev/dl/go1.26.9.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.25.9.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.9.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh
 source /etc/profile.d/go.sh
 go version

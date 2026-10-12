@@ -10,14 +10,19 @@
 // The tool will:
 //  1. Load the current master key (from NETBOX_CONDUCTOR_MASTER_KEY_FILE or NETBOX_CONDUCTOR_MASTER_KEY).
 //  2. Load or generate the new key (from NEW_MASTER_KEY_FILE or NEW_MASTER_KEY).
-//  3. Re-encrypt all encrypted columns in a single transaction.
-//  4. Write the new key to NEW_MASTER_KEY_FILE on success (or overwrite the current key file
-//     if --in-place is passed).
+//  3. Save a newly generated key to NEW_MASTER_KEY_FILE before touching the database,
+//     so the key that encrypts the data is always on disk.
+//  4. Re-encrypt all encrypted columns in a single transaction.
+//  5. With --in-place, move the new key file over the current key file after commit.
+//
+// Stop the netbox-conductor server first: anything it encrypts during the rotation
+// would use the old key and become unreadable afterwards.
 package main
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -43,11 +48,17 @@ func main() {
 	oldEnc := crypto.NewEncryptor(oldKey)
 
 	// Load or generate new key
-	newKey, newKeyPath, err := loadOrGenerateNewKey()
+	newKey, newKeyPath, fromFile, err := loadOrGenerateNewKey()
 	if err != nil {
 		log.Fatalf("loading new master key: %v", err)
 	}
 	newEnc := crypto.NewEncryptor(newKey)
+	if !fromFile {
+		if err := writeKeyFile(newKeyPath, newKey); err != nil {
+			log.Fatalf("saving new key to %s (database untouched): %v", newKeyPath, err)
+		}
+		log.Printf("new master key saved to %s", newKeyPath)
+	}
 
 	log.Printf("connecting to database…")
 	ctx := context.Background()
@@ -70,6 +81,7 @@ func main() {
 	n, err := reencryptColumn(ctx, tx, oldEnc, newEnc,
 		"SELECT id, password_enc FROM credentials WHERE password_enc IS NOT NULL",
 		"UPDATE credentials SET password_enc = $1 WHERE id = $2",
+		false,
 	)
 	if err != nil {
 		log.Fatalf("re-encrypting credentials: %v", err)
@@ -81,6 +93,7 @@ func main() {
 	n, err = reencryptColumn(ctx, tx, oldEnc, newEnc,
 		"SELECT id, totp_secret_enc FROM users WHERE totp_secret_enc IS NOT NULL",
 		"UPDATE users SET totp_secret_enc = $1 WHERE id = $2",
+		false,
 	)
 	if err != nil {
 		log.Fatalf("re-encrypting users.totp_secret_enc: %v", err)
@@ -88,27 +101,19 @@ func main() {
 	total += n
 	log.Printf("  users.totp_secret_enc: %d rows", n)
 
-	// ── clusters.netbox_secret_key ───────────────────────────────────────────
-	n, err = reencryptColumn(ctx, tx, oldEnc, newEnc,
-		"SELECT id, netbox_secret_key FROM clusters WHERE netbox_secret_key IS NOT NULL",
-		"UPDATE clusters SET netbox_secret_key = $1 WHERE id = $2",
-	)
-	if err != nil {
-		log.Fatalf("re-encrypting clusters.netbox_secret_key: %v", err)
+	// ── backup_targets.*_enc (base64 text) ───────────────────────────────────
+	for _, col := range []string{"s3_key_id_enc", "s3_secret_enc", "gcs_key_enc", "azure_key_enc", "sftp_private_key_enc"} {
+		n, err = reencryptColumn(ctx, tx, oldEnc, newEnc,
+			"SELECT id, "+col+" FROM backup_targets WHERE "+col+" IS NOT NULL",
+			"UPDATE backup_targets SET "+col+" = $1 WHERE id = $2",
+			true,
+		)
+		if err != nil {
+			log.Fatalf("re-encrypting backup_targets.%s: %v", col, err)
+		}
+		total += n
+		log.Printf("  backup_targets.%s: %d rows", col, n)
 	}
-	total += n
-	log.Printf("  clusters.netbox_secret_key: %d rows", n)
-
-	// ── clusters.api_token_pepper ────────────────────────────────────────────
-	n, err = reencryptColumn(ctx, tx, oldEnc, newEnc,
-		"SELECT id, api_token_pepper FROM clusters WHERE api_token_pepper IS NOT NULL",
-		"UPDATE clusters SET api_token_pepper = $1 WHERE id = $2",
-	)
-	if err != nil {
-		log.Fatalf("re-encrypting clusters.api_token_pepper: %v", err)
-	}
-	total += n
-	log.Printf("  clusters.api_token_pepper: %d rows", n)
 
 	if err := tx.Commit(ctx); err != nil {
 		log.Fatalf("committing transaction: %v", err)
@@ -116,27 +121,41 @@ func main() {
 
 	log.Printf("re-encryption complete: %d values updated", total)
 
-	// Write new key to disk
-	destPath := newKeyPath
-	if *inPlace {
-		destPath = os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY_FILE")
-		if destPath == "" {
-			destPath = "/etc/netbox-conductor/master.key"
-		}
-	}
-	newKeyHex := hex.EncodeToString(newKey[:]) + "\n"
-	if err := os.WriteFile(destPath, []byte(newKeyHex), 0400); err != nil {
-		log.Fatalf("writing new key to %s: %v", destPath, err)
-	}
-	log.Printf("new master key written to %s", destPath)
 	if !*inPlace {
-		log.Printf("IMPORTANT: replace your current key file with the new one before restarting the server:\n  mv %s <current-key-file>", destPath)
+		log.Printf("IMPORTANT: replace your current key file with the new one before restarting the server:\n  mv %s <current-key-file>", newKeyPath)
+		return
 	}
+	destPath := os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY_FILE")
+	if destPath == "" {
+		destPath = "/etc/netbox-conductor/master.key"
+	}
+	if err := os.Rename(newKeyPath, destPath); err != nil {
+		log.Fatalf("database now uses the key in %s, but moving it to %s failed: %v — move it by hand before restarting the server", newKeyPath, destPath, err)
+	}
+	log.Printf("new master key moved to %s", destPath)
 }
 
-// reencryptColumn reads all rows matching selectSQL, re-encrypts the BYTEA column,
-// and applies the update. Returns the number of rows processed.
-func reencryptColumn(ctx context.Context, tx pgx.Tx, oldEnc, newEnc *crypto.Encryptor, selectSQL, updateSQL string) (int, error) {
+// writeKeyFile writes the key as hex and syncs it to disk. Fails if the file exists.
+func writeKeyFile(path string, key *crypto.MasterKey) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(hex.EncodeToString(key[:]) + "\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// reencryptColumn reads all rows matching selectSQL, re-encrypts the column, and
+// applies the update. b64 marks TEXT columns holding base64 ciphertext (backup
+// targets) rather than BYTEA. Returns the number of rows processed.
+func reencryptColumn(ctx context.Context, tx pgx.Tx, oldEnc, newEnc *crypto.Encryptor, selectSQL, updateSQL string, b64 bool) (int, error) {
 	rows, err := tx.Query(ctx, selectSQL)
 	if err != nil {
 		return 0, fmt.Errorf("querying rows: %w", err)
@@ -163,7 +182,13 @@ func reencryptColumn(ctx context.Context, tx pgx.Tx, oldEnc, newEnc *crypto.Encr
 		if len(item.enc) == 0 {
 			continue
 		}
-		plaintext, err := oldEnc.Decrypt(item.enc)
+		ciphertext := item.enc
+		if b64 {
+			if ciphertext, err = base64.StdEncoding.DecodeString(string(item.enc)); err != nil {
+				return 0, fmt.Errorf("decoding row %v: %w", item.id, err)
+			}
+		}
+		plaintext, err := oldEnc.Decrypt(ciphertext)
 		if err != nil {
 			return 0, fmt.Errorf("decrypting row %v: %w", item.id, err)
 		}
@@ -171,15 +196,19 @@ func reencryptColumn(ctx context.Context, tx pgx.Tx, oldEnc, newEnc *crypto.Encr
 		if err != nil {
 			return 0, fmt.Errorf("re-encrypting row %v: %w", item.id, err)
 		}
-		if _, err := tx.Exec(ctx, updateSQL, reencrypted, item.id); err != nil {
+		var newVal any = reencrypted
+		if b64 {
+			newVal = base64.StdEncoding.EncodeToString(reencrypted)
+		}
+		if _, err := tx.Exec(ctx, updateSQL, newVal, item.id); err != nil {
 			return 0, fmt.Errorf("updating row %v: %w", item.id, err)
 		}
 	}
 	return len(items), nil
 }
 
-func loadOrGenerateNewKey() (*crypto.MasterKey, string, error) {
-	path := os.Getenv("NEW_MASTER_KEY_FILE")
+func loadOrGenerateNewKey() (key *crypto.MasterKey, path string, fromFile bool, err error) {
+	path = os.Getenv("NEW_MASTER_KEY_FILE")
 	if path == "" {
 		path = os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY_FILE") + ".new"
 		if path == ".new" {
@@ -190,11 +219,11 @@ func loadOrGenerateNewKey() (*crypto.MasterKey, string, error) {
 	if hexKey := os.Getenv("NEW_MASTER_KEY"); hexKey != "" {
 		raw, err := hex.DecodeString(hexKey)
 		if err != nil || len(raw) != 32 {
-			return nil, path, fmt.Errorf("NEW_MASTER_KEY must be a 64-char hex string (32 bytes)")
+			return nil, path, false, fmt.Errorf("NEW_MASTER_KEY must be a 64-char hex string (32 bytes)")
 		}
 		var mk crypto.MasterKey
 		copy(mk[:], raw)
-		return &mk, path, nil
+		return &mk, path, false, nil
 	}
 
 	// Check if the new key file already exists
@@ -205,21 +234,21 @@ func loadOrGenerateNewKey() (*crypto.MasterKey, string, error) {
 		}
 		raw, err := hex.DecodeString(hexStr)
 		if err != nil || len(raw) != 32 {
-			return nil, path, fmt.Errorf("invalid key in %s", path)
+			return nil, path, false, fmt.Errorf("invalid key in %s", path)
 		}
 		var mk crypto.MasterKey
 		copy(mk[:], raw)
 		log.Printf("loaded new key from %s", path)
-		return &mk, path, nil
+		return &mk, path, true, nil
 	}
 
 	// Generate a fresh key
 	var mk crypto.MasterKey
 	if _, err := io.ReadFull(rand.Reader, mk[:]); err != nil {
-		return nil, path, fmt.Errorf("generating new key: %w", err)
+		return nil, path, false, fmt.Errorf("generating new key: %w", err)
 	}
-	log.Printf("generated new master key (will be written to %s on success)", path)
-	return &mk, path, nil
+	log.Printf("generated new master key")
+	return &mk, path, false, nil
 }
 
 func requireEnv(key string) string {

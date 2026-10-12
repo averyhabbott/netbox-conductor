@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/jwtutil"
@@ -24,7 +25,21 @@ type AuthHandler struct {
 	keyFile       string            // path to TLS private key
 	serverURL     string            // SERVER_URL env value (used for cert SAN generation)
 	enc           *crypto.Encryptor // for encrypting TOTP secrets at rest
+
+	// Last TOTP code accepted at login per user, so a code seen over someone's
+	// shoulder can't be replayed while it's still valid. In memory: one server.
+	totpMu   sync.Mutex
+	totpUsed map[uuid.UUID]usedTOTP
 }
+
+type usedTOTP struct {
+	code  string
+	until time.Time
+}
+
+// totpValidity covers the current 30 s step plus one step of clock skew either
+// side, which totp.Validate accepts.
+const totpValidity = 90 * time.Second
 
 func NewAuthHandler(
 	users *queries.UserQuerier,
@@ -392,6 +407,16 @@ func (h *AuthHandler) VerifyTOTP(c echo.Context) error {
 	if !totp.Validate(req.Code, string(secretBytes)) {
 		return echo.NewHTTPError(http.StatusUnauthorized, "invalid TOTP code")
 	}
+	h.totpMu.Lock()
+	if last, ok := h.totpUsed[userID]; ok && last.code == req.Code && time.Now().Before(last.until) {
+		h.totpMu.Unlock()
+		return echo.NewHTTPError(http.StatusUnauthorized, "TOTP code already used — wait for the next code")
+	}
+	if h.totpUsed == nil {
+		h.totpUsed = make(map[uuid.UUID]usedTOTP)
+	}
+	h.totpUsed[userID] = usedTOTP{code: req.Code, until: time.Now().Add(totpValidity)}
+	h.totpMu.Unlock()
 
 	return h.issueFullTokens(c, user)
 }

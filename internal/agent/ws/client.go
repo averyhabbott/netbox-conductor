@@ -73,6 +73,19 @@ func (c *Client) Send(env protocol.Envelope) {
 	}
 }
 
+// SendWait enqueues an envelope, waiting up to timeout for buffer space instead
+// of dropping it. Used for file-sync chunks, where a dropped message corrupts data.
+func (c *Client) SendWait(env protocol.Envelope, timeout time.Duration) error {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case c.outbound <- env:
+		return nil
+	case <-t.C:
+		return fmt.Errorf("outbound buffer still full after %s", timeout)
+	}
+}
+
 // Run connects to the server and maintains the connection until ctx is cancelled.
 // On disconnect it reconnects with exponential backoff + jitter.
 func (c *Client) Run(ctx context.Context) {

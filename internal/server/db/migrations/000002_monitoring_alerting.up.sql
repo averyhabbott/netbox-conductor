@@ -39,13 +39,14 @@ CREATE INDEX events_category_idx   ON events (category,   occurred_at DESC);
 CREATE INDEX events_severity_idx   ON events (severity,   occurred_at DESC);
 CREATE INDEX events_code_idx       ON events (code,       occurred_at DESC);
 
--- Create monthly partitions: 2025-01 through 2026-12.
--- The partition manager goroutine extends these as time passes.
+-- Create monthly partitions for the current month + 3 ahead (UTC), matching the
+-- partition manager. They must exist before startup events are written, or rows
+-- land in _default and block the manager from creating this month's partition.
 DO $$
 DECLARE
-    d DATE := '2025-01-01';
+    d DATE := date_trunc('month', now() AT TIME ZONE 'UTC')::date;
 BEGIN
-    WHILE d < '2027-01-01' LOOP
+    WHILE d <= date_trunc('month', now() AT TIME ZONE 'UTC')::date + INTERVAL '3 months' LOOP
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS events_%s
              PARTITION OF events
@@ -92,12 +93,12 @@ CREATE TABLE node_heartbeats (
 CREATE INDEX heartbeats_node_idx    ON node_heartbeats (node_id,    recorded_at DESC);
 CREATE INDEX heartbeats_cluster_idx ON node_heartbeats (cluster_id, recorded_at DESC);
 
--- Monthly heartbeat partitions: 2025-01 through 2026-06.
+-- Monthly heartbeat partitions: current month + 3 ahead (UTC), same as events.
 DO $$
 DECLARE
-    d DATE := '2025-01-01';
+    d DATE := date_trunc('month', now() AT TIME ZONE 'UTC')::date;
 BEGIN
-    WHILE d < '2026-07-01' LOOP
+    WHILE d <= date_trunc('month', now() AT TIME ZONE 'UTC')::date + INTERVAL '3 months' LOOP
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS node_heartbeats_%s
              PARTITION OF node_heartbeats

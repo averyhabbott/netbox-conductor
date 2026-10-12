@@ -68,6 +68,18 @@ func (s *Session) Send(env protocol.Envelope) bool {
 	}
 }
 
+// SendWait is Send but waits up to timeout for buffer space before giving up.
+func (s *Session) SendWait(env protocol.Envelope, timeout time.Duration) bool {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case s.send <- env:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 // TouchLastSeen updates the last-seen timestamp (called on heartbeat receipt).
 func (s *Session) TouchLastSeen() {
 	s.mu.Lock()

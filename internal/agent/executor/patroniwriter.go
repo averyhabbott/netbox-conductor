@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,24 +28,35 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 	}
 
 	dir := filepath.Dir(configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return "", fmt.Errorf("creating config dir: %w", err)
 	}
-	// Explicitly chmod to bypass any restrictive umask on the agent service.
-	_ = os.Chmod(dir, 0755)
+
+	// patroni.yml holds DB passwords, so only the postgres group (Patroni,
+	// patronictl) may read it. If the agent can't hand the file to that group
+	// (not a member), fall back to world-readable so Patroni still starts.
+	fileMode, dirMode := os.FileMode(0644), os.FileMode(0755)
+	pgGID := -1
+	if pg, err := user.LookupGroup("postgres"); err == nil {
+		if gid, err := strconv.Atoi(pg.Gid); err == nil && os.Chown(dir, -1, gid) == nil {
+			pgGID, fileMode, dirMode = gid, 0640, 0750
+		}
+	}
+	// Explicit chmod bypasses any restrictive umask on the agent service.
+	_ = os.Chmod(dir, dirMode)
 
 	tmpPath := filepath.Join(dir, fmt.Sprintf(".patroni-config.tmp.%d", time.Now().UnixNano()))
-	// 0644 so the postgres OS user (which runs patronictl) can read the file
-	// without needing to be in the netbox-agent group.
-	if err := os.WriteFile(tmpPath, []byte(params.Content), 0644); err != nil {
+	if err := os.WriteFile(tmpPath, []byte(params.Content), 0600); err != nil {
 		return "", fmt.Errorf("writing temp config: %w", err)
 	}
+	if pgGID >= 0 {
+		_ = os.Chown(tmpPath, -1, pgGID)
+	}
+	_ = os.Chmod(tmpPath, fileMode)
 	if err := os.Rename(tmpPath, configPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("atomic rename failed: %w", err)
 	}
-	// Ensure the file is world-readable regardless of the service umask.
-	_ = os.Chmod(configPath, 0644)
 
 	// The Debian/Ubuntu Patroni systemd unit ships with
 	//   ConditionPathExists=/etc/patroni/config.yml

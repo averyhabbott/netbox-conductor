@@ -21,6 +21,7 @@ type Claims struct {
 	UserID   string `json:"sub"`
 	Username string `json:"username"`
 	Role     string `json:"role"`
+	Type     string `json:"typ"` // "access" — distinguishes from totp_pending / totp_enroll tokens signed with the same secret
 	jwt.RegisteredClaims
 }
 
@@ -31,6 +32,7 @@ func IssueAccess(userID uuid.UUID, username, role string, secret []byte) (string
 		UserID:   userID.String(),
 		Username: username,
 		Role:     role,
+		Type:     "access",
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenTTL)),
@@ -52,7 +54,7 @@ func ParseAccess(raw string, secret []byte) (*Claims, error) {
 		return nil, err
 	}
 	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
+	if !ok || !token.Valid || claims.Type != "access" {
 		return nil, fmt.Errorf("invalid token claims")
 	}
 	return claims, nil

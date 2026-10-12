@@ -31,8 +31,14 @@ const serverVersion = "0.1.0"
 // Implemented by backupsync.Manager; interface avoids import cycle.
 type BackupChunkRouter interface {
 	GetTargets(transferID uuid.UUID) ([]uuid.UUID, bool)
+	DropTarget(transferID, nodeID uuid.UUID)
 	Remove(transferID uuid.UUID)
 }
+
+// relaySendTimeout bounds how long relaying one sync chunk may block the source
+// agent's read loop. Must stay well under the 10 s pong deadline (hub/session.go),
+// or the source agent's connection is dropped while we wait.
+const relaySendTimeout = 5 * time.Second
 
 // AgentHandler handles agent WebSocket connections and registration.
 type AgentHandler struct {
@@ -233,6 +239,9 @@ func (h *AgentHandler) Connect(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	// Library default is 32 KiB; sync chunks, catalog JSON and task output exceed it.
+	// Matches the agent side's limit (internal/agent/ws/client.go).
+	conn.SetReadLimit(4 << 20)
 
 	ctx := c.Request().Context()
 
@@ -934,14 +943,20 @@ func (h *AgentHandler) handleMediaChunk(_ context.Context, _ *hub.Session, env p
 
 	t, ok := h.media.Get(transferID)
 	if !ok {
-		logger.Warn("media.chunk: unknown transfer", "transfer_id", chunk.TransferID)
+		// Debug: an aborted transfer's remaining chunks all land here.
+		logger.Debug("media.chunk: unknown transfer", "transfer_id", chunk.TransferID)
 		return
 	}
 
-	// Forward chunk envelope directly to target agent session.
+	// Forward chunk envelope directly to target agent session. On failure the
+	// transfer is dropped: the target keeps the partial file as a temp file and
+	// never renames it into place.
 	targetSess := h.hub.Get(t.TargetNode)
-	if targetSess != nil {
-		targetSess.Send(env) // forward as-is; target parses TypeMediaChunk
+	if targetSess == nil || !targetSess.SendWait(env, relaySendTimeout) {
+		h.media.Remove(transferID)
+		logger.Error("media transfer aborted: target agent offline or not keeping up",
+			"transfer_id", chunk.TransferID, "target_node", t.TargetNode)
+		return
 	}
 
 	// Signal EOF into the pipe so the relay goroutine can clean up.
@@ -1001,8 +1016,11 @@ func (h *AgentHandler) handleBackupChunk(_ *hub.Session, env protocol.Envelope, 
 		return
 	}
 	for _, nodeID := range targets {
-		if s := h.hub.Get(nodeID); s != nil {
-			s.Send(env)
+		if s := h.hub.Get(nodeID); s == nil || !s.SendWait(env, relaySendTimeout) {
+			// Stop feeding this target; its partial files stay as temp files.
+			h.backupSync.DropTarget(tid, nodeID)
+			logger.Error("backup sync to node aborted: target agent offline or not keeping up",
+				"transfer_id", chunk.TransferID, "target_node", nodeID)
 		}
 	}
 	if chunk.EOF && chunk.RelativePath == "" {

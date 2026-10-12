@@ -26,6 +26,10 @@ import (
 
 const defaultEnvFile = "/etc/netbox-agent/netbox-agent.env"
 
+// chunkSendTimeout is how long a sync push waits for outbound buffer space before
+// failing the task; the buffer stays full while the server is slow or disconnected.
+const chunkSendTimeout = 30 * time.Second
+
 func main() {
 	envFile := os.Getenv("AGENT_ENV_FILE")
 	if envFile == "" {
@@ -119,6 +123,17 @@ func main() {
 		}
 	}()
 
+	// Incoming file-sync chunks are written one at a time, in arrival order: a
+	// file is built by appending chunks, so concurrent writes would scramble it.
+	// When the queue is full the read loop blocks, which slows the sender instead
+	// of dropping chunks.
+	chunkQueue := make(chan func(), 64)
+	go func() {
+		for fn := range chunkQueue {
+			fn()
+		}
+	}()
+
 	// Message handler for inbound server commands
 	onMessage := func(ctx context.Context, env protocol.Envelope) error {
 		switch env.Type {
@@ -126,7 +141,7 @@ func main() {
 			handleTaskDispatch(ctx, cfg, wsClient, env, taskQueue)
 		case protocol.TypeMediaChunk:
 			// Server is forwarding a media chunk to us (pull_from_server mode).
-			go func() {
+			chunkQueue <- func() {
 				var chunk protocol.MediaChunkPayload
 				if err := json.Unmarshal(env.Payload, &chunk); err != nil {
 					slog.Warn("malformed media.chunk", "error", err)
@@ -146,10 +161,10 @@ func main() {
 					Type:    protocol.TypeMediaChunkAck,
 					Payload: json.RawMessage(ack),
 				})
-			}()
+			}
 		case protocol.TypeBackupChunk:
 			// Conductor is relaying a pgBackRest repo file chunk to us (backup sync write side).
-			go func() {
+			chunkQueue <- func() {
 				var chunk protocol.BackupChunkPayload
 				if err := json.Unmarshal(env.Payload, &chunk); err != nil {
 					slog.Warn("malformed backup.chunk", "error", err)
@@ -168,7 +183,7 @@ func main() {
 					Type:    protocol.TypeBackupChunkAck,
 					Payload: json.RawMessage(ack),
 				})
-			}()
+			}
 
 		default:
 			slog.Warn("unhandled server message type", "type", env.Type)
@@ -611,8 +626,8 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		if err := json.Unmarshal(task.Params, &params); err != nil {
 			errMsg = "bad params: " + err.Error()
 		} else if params.Direction == "push_to_server" {
-			err := executor.PushMediaRoot(params, cfg.NetboxMediaRoot, func(env protocol.Envelope) {
-				client.Send(env)
+			err := executor.PushMediaRoot(params, cfg.NetboxMediaRoot, func(env protocol.Envelope) error {
+				return client.SendWait(env, chunkSendTimeout)
 			})
 			if err != nil {
 				errMsg = err.Error()
@@ -753,8 +768,8 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		if err := json.Unmarshal(task.Params, &params); err != nil {
 			errMsg = "bad params: " + err.Error()
 		} else {
-			err := executor.PushBackupRepo(params, func(env protocol.Envelope) {
-				client.Send(env)
+			err := executor.PushBackupRepo(params, func(env protocol.Envelope) error {
+				return client.SendWait(env, chunkSendTimeout)
 			})
 			if err != nil {
 				errMsg = err.Error()

@@ -3,7 +3,9 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
@@ -222,6 +224,13 @@ func (h *CredentialHandler) Upsert(c echo.Context) error {
 	}
 	if req.Password == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "password is required")
+	}
+	// Values are pasted into quoted strings in configuration.py and as bare tokens in
+	// sentinel.conf. The pepper kind holds a whole Python dict literal, so it's exempt.
+	if kind != CredKindNetboxAPITokenPepper && strings.ContainsFunc(req.Password, func(r rune) bool {
+		return r == '\'' || r == '"' || r == '\\' || unicode.IsSpace(r) || unicode.IsControl(r)
+	}) {
+		return echo.NewHTTPError(http.StatusBadRequest, "password must not contain quotes, backslashes, spaces or control characters")
 	}
 
 	encPassword, err := h.enc.Encrypt([]byte(req.Password))

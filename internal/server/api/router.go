@@ -42,6 +42,9 @@ type RouterConfig struct {
 // New creates and returns a fully configured Echo instance.
 func New(cfg RouterConfig) *echo.Echo {
 	e := echo.New()
+	// The conductor terminates TLS itself (no reverse proxy), so the TCP peer is
+	// the client; never trust X-Forwarded-For / X-Real-IP, which clients can forge.
+	e.IPExtractor = echo.ExtractIPDirect()
 	e.HideBanner = true
 	e.HidePort = true
 
@@ -84,7 +87,7 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/auth/totp/disable", cfg.AuthHandler.DisableTOTP)
 
 	// ── TOTP second-step (no JWT — totp_token acts as auth) ──────────────────
-	v1.POST("/auth/totp/verify", cfg.AuthHandler.VerifyTOTP)
+	v1.POST("/auth/totp/verify", cfg.AuthHandler.VerifyTOTP, mw.LoginRateLimit())
 
 	// ── Users (admin-only management) ──────────────────────────────────────────
 	protected.GET("/users", cfg.AuthHandler.ListUsers, mw.RequireRole("admin"))

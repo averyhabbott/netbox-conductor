@@ -31,6 +31,19 @@ func (m *Manager) GetTargets(transferID uuid.UUID) ([]uuid.UUID, bool) {
 	return t, ok
 }
 
+// DropTarget stops relaying a transfer to one node (it went offline or fell behind).
+func (m *Manager) DropTarget(transferID, nodeID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.transfers[transferID]
+	for i, id := range t {
+		if id == nodeID {
+			m.transfers[transferID] = append(t[:i:i], t[i+1:]...)
+			return
+		}
+	}
+}
+
 func (m *Manager) Remove(transferID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
