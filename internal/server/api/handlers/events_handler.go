@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,19 +43,12 @@ func (h *EventsHandler) ListEvents(c echo.Context) error {
 		}
 		f.NodeID = &id
 	}
-	if s := c.QueryParam("from"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid from timestamp (RFC3339 required)")
-		}
-		f.From = &t
+	var err error
+	if f.From, err = parseTimeParam(c, "from"); err != nil {
+		return err
 	}
-	if s := c.QueryParam("to"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid to timestamp (RFC3339 required)")
-		}
-		f.To = &t
+	if f.To, err = parseTimeParam(c, "to"); err != nil {
+		return err
 	}
 	parseIntParam(c, "limit", &f.Limit, 200, 1, 1000)
 	parseIntParam(c, "offset", &f.Offset, 0, 0, 1<<30)
@@ -126,20 +120,13 @@ func (h *EventsHandler) ListHeartbeats(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid node_id")
 	}
-	var from, to *time.Time
-	if s := c.QueryParam("from"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid from")
-		}
-		from = &t
+	from, err := parseTimeParam(c, "from")
+	if err != nil {
+		return err
 	}
-	if s := c.QueryParam("to"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid to")
-		}
-		to = &t
+	to, err := parseTimeParam(c, "to")
+	if err != nil {
+		return err
 	}
 	limit := 500
 	parseIntParam(c, "limit", &limit, 500, 1, 5000)
@@ -154,12 +141,24 @@ func (h *EventsHandler) ListHeartbeats(c echo.Context) error {
 	return c.JSON(http.StatusOK, hbs)
 }
 
+// parseTimeParam reads an optional RFC3339 query param; nil when absent.
+func parseTimeParam(c echo.Context, name string) (*time.Time, error) {
+	s := c.QueryParam(name)
+	if s == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil, echo.NewHTTPError(http.StatusBadRequest, "invalid "+name+" timestamp (RFC3339 required)")
+	}
+	return &t, nil
+}
+
 // parseIntParam reads a query param into *target, applying min/max bounds and a default.
 func parseIntParam(c echo.Context, name string, target *int, def, min, max int) {
 	*target = def
 	if s := c.QueryParam(name); s != "" {
-		var n int
-		if _, err := parseIntStr(s, &n); err == nil {
+		if n, err := strconv.Atoi(s); err == nil {
 			if n < min {
 				n = min
 			} else if n > max {
@@ -169,19 +168,3 @@ func parseIntParam(c echo.Context, name string, target *int, def, min, max int) 
 		}
 	}
 }
-
-func parseIntStr(s string, out *int) (int, error) {
-	n := 0
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return 0, &parseIntError{}
-		}
-		n = n*10 + int(r-'0')
-	}
-	*out = n
-	return n, nil
-}
-
-type parseIntError struct{}
-
-func (e *parseIntError) Error() string { return "not an integer" }

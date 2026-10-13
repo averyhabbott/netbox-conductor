@@ -2,12 +2,15 @@ import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
-import { nodesApi } from '../api/nodes'
-import client from '../api/client'
+import { nodesApi, roleLabel } from '../api/nodes'
+import type { RegTokenResponse } from '../api/nodes'
+import client, { apiError } from '../api/client'
 import Layout from '../components/Layout'
 import { useAuthStore } from '../store/auth'
-import { eventsApi } from '../api/events'
+import { eventsApi, CATEGORIES } from '../api/events'
 import EventsTable from '../components/EventsTable'
+import AgentEnvValues from '../components/AgentEnvValues'
+import { useCopy } from '../hooks/useCopy'
 
 interface LogsData {
   lines: string[]
@@ -190,7 +193,7 @@ function RemoveNodeDialog({
   const [dialogStep, setDialogStep] = useState<1 | 2>(1)
   const [mode, setMode] = useState<RemoveMode | null>(null)
   const [hostnameInput, setHostnameInput] = useState('')
-  const [copied, setCopied] = useState(false)
+  const [copied, copy] = useCopy()
 
   const cleanupCommands = [
     'sudo systemctl stop netbox-agent',
@@ -199,12 +202,6 @@ function RemoveNodeDialog({
     'sudo rm /usr/local/bin/netbox-agent',
     'sudo rm -rf /etc/netbox-agent/',
   ].join('\n')
-
-  const copyCleanup = async () => {
-    await navigator.clipboard.writeText(cleanupCommands)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -337,7 +334,7 @@ function RemoveNodeDialog({
                       </pre>
                       <button
                         type="button"
-                        onClick={copyCleanup}
+                        onClick={() => copy(cleanupCommands)}
                         className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
                       >
                         {copied ? '✓ Copied' : 'Copy'}
@@ -413,8 +410,6 @@ function NodeEventsCard({ clusterId, nodeId }: { clusterId: string; nodeId: stri
     refetchInterval: 15000,
   })
 
-  const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
-
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
       <div className="flex items-center justify-between mb-3">
@@ -485,7 +480,7 @@ export default function NodeDetail() {
     onError: (e: any) => {
       setActionResult({
         success: false,
-        message: e.response?.data?.message ?? 'Failed to dispatch task',
+        message: apiError(e, 'Failed to dispatch task'),
       })
     },
   })
@@ -499,7 +494,7 @@ export default function NodeDetail() {
     onError: (e: any) => {
       setActionResult({
         success: false,
-        message: e.response?.data?.message ?? 'Failed to dispatch task',
+        message: apiError(e, 'Failed to dispatch task'),
       })
     },
   })
@@ -509,45 +504,12 @@ export default function NodeDetail() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['node', nid] }),
   })
 
-  const [envDownloading, setEnvDownloading] = useState(false)
-  const downloadEnv = async () => {
-    setEnvDownloading(true)
-    try {
-      await nodesApi.downloadAgentEnv(id!, nid!, node?.hostname ?? nid!)
-    } finally {
-      setEnvDownloading(false)
-    }
-  }
-
-  const [showEnvMenu, setShowEnvMenu] = useState(false)
-  const envMenuRef = useRef<HTMLDivElement>(null)
-  const [envContent, setEnvContent] = useState<string | null>(null)
-  const [envViewing, setEnvViewing] = useState(false)
-  const [envCopied, setEnvCopied] = useState(false)
-
-  useEffect(() => {
-    if (!showEnvMenu) return
-    const handler = (e: MouseEvent) => {
-      if (envMenuRef.current && !envMenuRef.current.contains(e.target as HTMLElement)) {
-        setShowEnvMenu(false)
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [showEnvMenu])
-
-  const viewEnv = async () => {
-    setShowEnvMenu(false)
-    setEnvViewing(true)
-    try {
-      const text = await nodesApi.fetchAgentEnvText(id!, nid!)
-      setEnvContent(text)
-    } catch {
-      setEnvContent('Failed to fetch agent .env file.')
-    } finally {
-      setEnvViewing(false)
-    }
-  }
+  const [rekey, setRekey] = useState<RegTokenResponse | null>(null)
+  const rekeyAgent = useMutation({
+    mutationFn: () => nodesApi.generateRegToken(id!, nid!),
+    onSuccess: setRekey,
+    onError: (e) => setActionResult({ success: false, message: apiError(e, 'Failed to re-key agent') }),
+  })
 
   const { data: tasksData } = useQuery({
     queryKey: ['node-tasks', nid],
@@ -615,31 +577,15 @@ export default function NodeDetail() {
 
         {/* Service controls */}
         <div className="flex gap-2 flex-wrap items-center">
-          <div className="relative" ref={envMenuRef}>
-            <button
-              onClick={() => setShowEnvMenu((v) => !v)}
-              disabled={envDownloading || envViewing}
-              className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
-            >
-              {envViewing ? 'Loading…' : envDownloading ? 'Generating…' : 'Agent .env ▾'}
-            </button>
-            {showEnvMenu && (
-              <div className="absolute right-0 top-full mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-10 min-w-max">
-                <button
-                  onClick={viewEnv}
-                  className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-700 rounded-t-lg transition-colors"
-                >
-                  View
-                </button>
-                <button
-                  onClick={() => { setShowEnvMenu(false); downloadEnv() }}
-                  className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-700 rounded-b-lg transition-colors"
-                >
-                  Download
-                </button>
-              </div>
-            )}
-          </div>
+          <button
+            onClick={() => {
+              if (confirm(`Re-key the agent on ${node.hostname}? Its current token stops working: the agent disconnects until you set the new values on the node.`)) rekeyAgent.mutate()
+            }}
+            disabled={rekeyAgent.isPending}
+            className="bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-sm px-3 py-1.5 rounded-lg transition-colors"
+          >
+            {rekeyAgent.isPending ? 'Generating…' : 'Re-key agent…'}
+          </button>
           {/* NetBox service actions dropdown */}
           <div className="relative" ref={netboxMenuRef}>
             <button
@@ -700,7 +646,7 @@ export default function NodeDetail() {
         {/* Node status */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
           <h3 className="font-medium mb-4">Node Status</h3>
-          <StatusRow label="Role" value={node.role.replace('_', ' ')} />
+          <StatusRow label="Role" value={roleLabel(node.role)} />
           <StatusRow label="Failover Priority" value={node.failover_priority} />
           <StatusRow label="SSH Port" value={node.ssh_port} />
           <StatusRow label="Agent Status" value={node.agent_status} />
@@ -874,33 +820,23 @@ export default function NodeDetail() {
       </div>
 
 
-      {envContent !== null && (
+      {rekey && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[80vh]">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800 flex-shrink-0">
-              <h3 className="font-medium">Agent .env — {node.hostname}</h3>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    navigator.clipboard.writeText(envContent)
-                    setEnvCopied(true)
-                    setTimeout(() => setEnvCopied(false), 2000)
-                  }}
-                  className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg transition-colors"
-                >
-                  {envCopied ? '✓ Copied' : 'Copy'}
-                </button>
-                <button
-                  onClick={() => setEnvContent(null)}
-                  className="text-gray-400 hover:text-white transition-colors text-lg leading-none"
-                >
-                  ✕
-                </button>
-              </div>
+          <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-2xl p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-medium">New agent key — {node.hostname}</h3>
+              <button
+                onClick={() => setRekey(null)}
+                className="text-gray-400 hover:text-white transition-colors text-lg leading-none"
+              >
+                ✕
+              </button>
             </div>
-            <pre className="text-xs font-mono text-gray-300 p-6 overflow-auto flex-1 leading-5 whitespace-pre">
-              {envContent}
-            </pre>
+            <AgentEnvValues hostname={node.hostname} snippet={rekey.env_snippet} />
+            <p className="text-sm text-gray-400">
+              Then run <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">sudo systemctl restart netbox-agent</code>.
+              These values are shown only once.
+            </p>
           </div>
         </div>
       )}

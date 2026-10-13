@@ -27,7 +27,6 @@ type MetricsCollector struct {
 	netboxConfigPath string
 	mediaRoot        string
 	patroniRESTURL   string
-	httpClient       *http.Client
 	cachedNBVersion  string // cached after first successful detection
 }
 
@@ -37,7 +36,6 @@ func NewMetricsCollector(netboxConfigPath, mediaRoot, patroniRESTURL string) *Me
 		netboxConfigPath: netboxConfigPath,
 		mediaRoot:        mediaRoot,
 		patroniRESTURL:   patroniRESTURL,
-		httpClient:       &http.Client{Timeout: 3 * time.Second},
 	}
 }
 
@@ -65,12 +63,12 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 	_, _ = cpu.Percent(0, false)
 
 	// Service state
-	hb.NetboxRunning = isServiceActive("netbox")
-	hb.RQRunning = isServiceActive("netbox-rq")
-	hb.RedisRunning = isServiceActive("redis")
+	hb.NetboxRunning = IsServiceActive("netbox")
+	hb.RQRunning = IsServiceActive("netbox-rq")
+	hb.RedisRunning = IsServiceActive("redis")
 	hb.RedisRole = queryRedisRole()
-	hb.SentinelRunning = isServiceActive("redis-sentinel")
-	hb.PatroniRunning = isServiceActive("patroni")
+	hb.SentinelRunning = IsServiceActive("redis-sentinel")
+	hb.PatroniRunning = IsServiceActive("patroni")
 	hb.PostgresRunning = isPostgresReady()
 
 	// NetBox version (cached; re-detected if empty)
@@ -99,11 +97,7 @@ func (m *MetricsCollector) Collect() (protocol.HeartbeatPayload, error) {
 func queryRedisRole() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "redis-cli", "-p", "6379", "ROLE")
-	if pass := redisPassword(); pass != "" {
-		cmd.Env = append(os.Environ(), "REDISCLI_AUTH="+pass) // not argv: visible in ps
-	}
-	out, err := cmd.Output()
+	out, err := redisCLI(ctx, redisPassword(), "", "-p", "6379", "ROLE").Output()
 	if err != nil {
 		return ""
 	}
@@ -138,38 +132,54 @@ func isPostgresReady() bool {
 	return exec.CommandContext(ctx, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres").Run() == nil
 }
 
-// isServiceActive checks if a systemd service is active.
-func isServiceActive(unit string) bool {
+// IsServiceActive checks if a systemd service is active.
+func IsServiceActive(unit string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).CombinedOutput()
-	_ = out
-	return err == nil
+	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
+}
+
+// PatroniRole returns the local Patroni node's role ("master", "replica",
+// "standby_leader", etc.), or "" on any error (Patroni not running, not
+// configured, etc.).
+func PatroniRole(restURL string) string {
+	state, err := fetchPatroni(restURL)
+	if err != nil {
+		return ""
+	}
+	role, _ := state["role"].(string)
+	return role
+}
+
+// fetchPatroni calls the local Patroni REST API's /patroni endpoint and
+// returns the decoded state.
+func fetchPatroni(restURL string) (map[string]any, error) {
+	if restURL == "" {
+		return nil, fmt.Errorf("patroni REST URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, restURL+"/patroni", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var state map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		return nil, err
+	}
+	return state, nil
 }
 
 // queryPatroni calls the local Patroni REST API and extracts role + lag.
 // Returns ("", -1, nil) if Patroni is not running or not configured.
 func (m *MetricsCollector) queryPatroni() (role string, lagBytes int64, stateJSON []byte) {
-	if m.patroniRESTURL == "" {
-		return "", -1, nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.patroniRESTURL+"/patroni", nil)
+	state, err := fetchPatroni(m.patroniRESTURL)
 	if err != nil {
-		return "", -1, nil
-	}
-
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return "", -1, nil
-	}
-	defer resp.Body.Close()
-
-	var state map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
 		return "", -1, nil
 	}
 
@@ -296,13 +306,3 @@ func parseVersionFile(path string) string {
 	}
 	return ""
 }
-
-// formatSI formats bytes as a human-readable string (for logging).
-func formatSI(bytes int64) string {
-	if bytes < 1024 {
-		return fmt.Sprintf("%dB", bytes)
-	}
-	return fmt.Sprintf("%.1fKiB", float64(bytes)/1024)
-}
-
-var _ = formatSI // suppress unused

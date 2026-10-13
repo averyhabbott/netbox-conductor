@@ -1,26 +1,27 @@
 // Package syncperm implements the "check-sync-permissions" agent CLI command.
-// It fetches the cluster's configured sync paths from the conductor and ensures
-// the netbox-agent OS user has the necessary filesystem access on each one.
-// The command must be run with sudo (or as root) since it modifies group membership.
+// It fetches the cluster's configured sync paths from the conductor and grants
+// the netbox-agent OS user read/write access to each one with POSIX ACLs.
+// The command must be run with sudo (or as root) since it changes ACLs.
 package syncperm
 
 import (
-	"bufio"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"strings"
-	"syscall"
 
 	agentconfig "github.com/averyhabbott/netbox-conductor/internal/agent/config"
 )
 
-const agentUser = "netbox-agent"
+const (
+	agentUser  = "netbox-agent"
+	netboxUser = "netbox" // the NetBox service user; gets the same access to files the agent copies in
+)
 
 // syncConfig is the response body from GET /api/v1/agent/sync-config.
 type syncConfig struct {
@@ -38,8 +39,11 @@ func Run(cfg *agentconfig.Config) error {
 		return fmt.Errorf("fetching sync config from conductor: %w", err)
 	}
 
-	// Always check NETBOX_MEDIA_ROOT; add extra folders when enabled.
-	paths := []string{cfg.NetboxMediaRoot}
+	// The NetBox media folder (none on a db-only node), plus extra folders when enabled.
+	var paths []string
+	if cfg.NetboxMediaRoot != "" {
+		paths = append(paths, cfg.NetboxMediaRoot)
+	}
 	if sc.ExtraFoldersSyncEnabled {
 		for _, p := range sc.ExtraSyncFolders {
 			if p != "" {
@@ -48,11 +52,21 @@ func Run(cfg *agentconfig.Config) error {
 		}
 	}
 
-	fmt.Printf("Checking sync permissions for %d path(s):\n", len(paths))
+	if _, err := exec.LookPath("setfacl"); err != nil {
+		return errors.New("setfacl not found: install the 'acl' package (apt-get install acl / dnf install acl)")
+	}
+	users := []string{agentUser}
+	if _, err := user.Lookup(netboxUser); err == nil {
+		users = append(users, netboxUser)
+	} else {
+		fmt.Printf("Note: user %q not found; granting access to %s only.\n", netboxUser, agentUser)
+	}
+
+	fmt.Printf("Granting sync access for %d path(s):\n", len(paths))
 
 	anyError := false
 	for _, path := range paths {
-		if err := checkAndFix(path); err != nil {
+		if err := grant(path, users); err != nil {
 			fmt.Printf("  ✗ %s: %v\n", path, err)
 			anyError = true
 		}
@@ -61,24 +75,18 @@ func Run(cfg *agentconfig.Config) error {
 	if anyError {
 		return fmt.Errorf("one or more paths could not be fixed — review the output above")
 	}
-	fmt.Println("\nAll paths OK. Note: group membership changes take effect on the next agent restart.")
+	fmt.Println("\nAll paths OK. ACLs take effect immediately; no restart needed.")
 	return nil
 }
 
 // fetchSyncConfig calls the conductor REST API using the agent's bearer token.
 func fetchSyncConfig(cfg *agentconfig.Config) (*syncConfig, error) {
-	// Convert wss:// → https:// and strip the WebSocket path suffix.
-	baseURL := strings.NewReplacer("wss://", "https://", "ws://", "http://").Replace(cfg.ServerURL)
-	if idx := strings.Index(baseURL, "/api/"); idx != -1 {
-		baseURL = baseURL[:idx]
-	}
-
-	httpClient, err := buildHTTPClient(cfg)
+	httpClient, err := cfg.HTTPClient()
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/agent/sync-config", nil)
+	req, err := http.NewRequest(http.MethodGet, cfg.BaseURL()+"/api/v1/agent/sync-config", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -102,27 +110,10 @@ func fetchSyncConfig(cfg *agentconfig.Config) (*syncConfig, error) {
 	return &sc, nil
 }
 
-func buildHTTPClient(cfg *agentconfig.Config) (*http.Client, error) {
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: cfg.TLSSkipVerify, //nolint:gosec // intentional dev option
-	}
-	if cfg.TLSCACert != "" {
-		pemData, err := os.ReadFile(cfg.TLSCACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert %s: %w", cfg.TLSCACert, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pemData) {
-			return nil, fmt.Errorf("no valid certificates in %s", cfg.TLSCACert)
-		}
-		tlsCfg.RootCAs = pool
-	}
-	return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}, nil
-}
-
-// checkAndFix inspects path and ensures netbox-agent has read+execute access,
-// either as a direct group member or by adding it to the directory's owning group.
-func checkAndFix(path string) error {
+// grant gives each user read/write on path and everything under it, plus
+// default ACL entries so files and dirs created later inherit the same access.
+// rwX: execute only on directories (and files already executable).
+func grant(path string, users []string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("path does not exist or is inaccessible: %w", err)
@@ -130,91 +121,14 @@ func checkAndFix(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("expected a directory, got a regular file")
 	}
-
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("unable to read filesystem metadata (non-Linux platform?)")
+	var spec []string
+	for _, u := range users {
+		spec = append(spec, "u:"+u+":rwX", "d:u:"+u+":rwX")
 	}
-
-	groupName, err := groupNameForGID(int(stat.Gid))
-	if err != nil {
-		return fmt.Errorf("resolving group for GID %d: %w", stat.Gid, err)
+	args := []string{"-R", "-m", strings.Join(spec, ","), path}
+	if out, err := exec.Command("setfacl", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("setfacl %s failed: %w\n%s", strings.Join(args, " "), err, out)
 	}
-
-	member, err := isGroupMember(agentUser, groupName)
-	if err != nil {
-		return fmt.Errorf("checking group membership: %w", err)
-	}
-
-	mode := info.Mode().Perm()
-	groupCanRead := mode&0o040 != 0
-	groupCanExec := mode&0o010 != 0
-
-	if member && groupCanRead && groupCanExec {
-		fmt.Printf("  ✓ %s — %s already has access (group: %s, mode: %04o)\n",
-			path, agentUser, groupName, mode)
-		return nil
-	}
-
-	if !member {
-		fmt.Printf("  → Adding %s to group '%s'\n", agentUser, groupName)
-		out, err := exec.Command("usermod", "-aG", groupName, agentUser).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("usermod -aG %s %s failed: %w\n%s", groupName, agentUser, err, string(out))
-		}
-	}
-
-	if !groupCanRead || !groupCanExec {
-		fmt.Printf("  → Applying g+rX on %s (current mode: %04o)\n", path, mode)
-		out, err := exec.Command("chmod", "g+rX", path).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("chmod g+rX %s failed: %w\n%s", path, err, string(out))
-		}
-	}
-
-	fmt.Printf("  ✓ %s — fixed (group: %s)\n", path, groupName)
+	fmt.Printf("  ✓ %s — read/write for %s (setfacl %s)\n", path, strings.Join(users, ", "), strings.Join(args, " "))
 	return nil
-}
-
-// groupNameForGID resolves a numeric GID to its name by reading /etc/group.
-func groupNameForGID(gid int) (string, error) {
-	f, err := os.Open("/etc/group")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	target := fmt.Sprint(gid)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		fields := strings.SplitN(scanner.Text(), ":", 4)
-		if len(fields) >= 3 && fields[2] == target {
-			return fields[0], nil
-		}
-	}
-	return "", fmt.Errorf("GID %d not found in /etc/group", gid)
-}
-
-// isGroupMember checks /etc/group to see if username is listed as a member of groupName.
-func isGroupMember(username, groupName string) (bool, error) {
-	f, err := os.Open("/etc/group")
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		fields := strings.SplitN(scanner.Text(), ":", 4)
-		if len(fields) < 4 || fields[0] != groupName {
-			continue
-		}
-		for _, m := range strings.Split(fields[3], ",") {
-			if strings.TrimSpace(m) == username {
-				return true, nil
-			}
-		}
-		return false, nil
-	}
-	return false, nil
 }

@@ -294,21 +294,12 @@ func (h *ConfigHandler) Push(c echo.Context) error {
 			RestartAfter:   req.RestartAfter && node.NetboxRunning != nil && *node.NetboxRunning,
 		})
 
-		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskWriteConfig), params)
-
-		if dispErr := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskWriteConfig,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 60,
-		}); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskWriteConfig, params, 60, 0); dispErr != nil {
 			nr.Status = "offline"
 			nr.Error = dispErr.Error()
 			results = append(results, nr)
 			continue
 		}
-
-		_ = h.taskResults.SetSent(ctx, taskID)
 		nr.TaskID = taskID.String()
 		nr.Status = "dispatched"
 		dispatchCount++
@@ -383,7 +374,6 @@ func (h *ConfigHandler) ReadNodeConfig(c echo.Context) error {
 
 	taskID := uuid.New()
 	params, _ := json.Marshal(struct{}{})
-	_ = h.taskResults.Create(ctx, nodeID, taskID, string(protocol.TaskReadNetboxConfig), params)
 
 	// Register waiter before dispatching to avoid race.
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -400,15 +390,9 @@ func (h *ConfigHandler) ReadNodeConfig(c echo.Context) error {
 		ch <- waitResult{r, e}
 	}()
 
-	if dispErr := h.dispatcher.Dispatch(nodeID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskReadNetboxConfig,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 10,
-	}); dispErr != nil {
+	if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, nodeID, taskID, protocol.TaskReadNetboxConfig, params, 10, 0); dispErr != nil {
 		return echo.NewHTTPError(http.StatusBadGateway, "node not connected")
 	}
-	_ = h.taskResults.SetSent(ctx, taskID)
 
 	wr := <-ch
 	if wr.err != nil {
@@ -513,21 +497,12 @@ func (h *ConfigHandler) SyncConfig(c echo.Context) error {
 			BackupExisting: true,
 			RestartAfter:   req.RestartAfter,
 		})
-		_ = h.taskResults.Create(ctx, destID, writeTaskID, string(protocol.TaskWriteConfig), writeParams)
-
-		if dispErr := h.dispatcher.Dispatch(destID, protocol.TaskDispatchPayload{
-			TaskID:      writeTaskID.String(),
-			TaskType:    protocol.TaskWriteConfig,
-			Params:      json.RawMessage(writeParams),
-			TimeoutSecs: 60,
-		}); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, destID, writeTaskID, protocol.TaskWriteConfig, writeParams, 60, 0); dispErr != nil {
 			nr.Status = "offline"
 			nr.Error = dispErr.Error()
 			results = append(results, nr)
 			continue
 		}
-
-		_ = h.taskResults.SetSent(ctx, writeTaskID)
 		nr.TaskID = writeTaskID.String()
 		nr.Status = "dispatched"
 		dispatchCount++
@@ -605,7 +580,7 @@ func renderInputFor(ctx context.Context, clusters *queries.ClusterQuerier, creds
 
 	var sentinelAddrs []string
 	for _, n := range allNodes {
-		if n.Role == "hyperconverged" || n.Role == "app" {
+		if nodestate.IsAppRole(n.Role) {
 			sentinelAddrs = append(sentinelAddrs, stripCIDR(n.IPAddress)+":"+protocol.RedisSentinelPortStr)
 		}
 	}

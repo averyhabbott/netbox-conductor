@@ -18,9 +18,11 @@ SyslogIdentifier=netbox-agent
 # Harden the service
 # Note: NoNewPrivileges is intentionally omitted — the agent needs to invoke
 # sudo to manage systemd services (netbox, patroni, redis, etc.).
-ProtectSystem=strict
+# ProtectSystem is intentionally omitted too: commands the agent starts via sudo
+# inherit its read-only view, which blocks pgBackRest, pg_dump and restores from
+# writing their repo, log and data dirs. Access is limited by the agent's groups
+# and the sudoers file instead.
 ProtectHome=yes
-ReadWritePaths=/opt/netbox/netbox/netbox /opt/netbox/netbox/media /etc/patroni /etc/redis /etc/pgbackrest /var/log/netbox-agent
 PrivateTmp=yes
 
 [Install]

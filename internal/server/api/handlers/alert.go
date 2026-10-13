@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/alerting/transports"
+	"github.com/averyhabbott/netbox-conductor/internal/server/api/middleware"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 )
@@ -65,6 +66,19 @@ func (h *AlertHandler) CreateRule(c echo.Context) error {
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
 	}
+	if err := validateAlertRule(&p); err != nil {
+		return err
+	}
+	r, err := h.ruleQ.Create(c.Request().Context(), p)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to create rule")
+	}
+	return c.JSON(http.StatusCreated, r)
+}
+
+// validateAlertRule checks a rule for CreateRule and UpdateRule (both write
+// every column) and fills defaults for omitted fields.
+func validateAlertRule(p *queries.AlertRuleParams) error {
 	p.Name = strings.TrimSpace(p.Name)
 	if p.Name == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
@@ -75,11 +89,14 @@ func (h *AlertHandler) CreateRule(c echo.Context) error {
 	if p.MinSeverity == "" {
 		p.MinSeverity = "info"
 	}
-	r, err := h.ruleQ.Create(c.Request().Context(), p)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to create rule")
+	// Omitted lists would be written as NULL into NOT NULL columns; empty means match all.
+	if p.Categories == nil {
+		p.Categories = []string{}
 	}
-	return c.JSON(http.StatusCreated, r)
+	if p.Codes == nil {
+		p.Codes = []string{}
+	}
+	return nil
 }
 
 func (h *AlertHandler) GetRule(c echo.Context) error {
@@ -103,7 +120,9 @@ func (h *AlertHandler) UpdateRule(c echo.Context) error {
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
 	}
-	p.Name = strings.TrimSpace(p.Name)
+	if err := validateAlertRule(&p); err != nil {
+		return err
+	}
 	r, err := h.ruleQ.Update(c.Request().Context(), id, p)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to update rule")
@@ -140,14 +159,23 @@ func (h *AlertHandler) CreateTransport(c echo.Context) error {
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
 	}
-	if p.Name == "" || p.Type == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "name and type are required")
+	if err := validateAlertTransport(p); err != nil {
+		return err
 	}
 	t, err := h.transQ.Create(c.Request().Context(), p)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to create transport")
 	}
 	return c.JSON(http.StatusCreated, t)
+}
+
+// validateAlertTransport checks a transport for CreateTransport and
+// UpdateTransport (both write every column).
+func validateAlertTransport(p queries.AlertTransportParams) error {
+	if p.Name == "" || p.Type == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "name and type are required")
+	}
+	return nil
 }
 
 func (h *AlertHandler) GetTransport(c echo.Context) error {
@@ -170,6 +198,9 @@ func (h *AlertHandler) UpdateTransport(c echo.Context) error {
 	var p queries.AlertTransportParams
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
+	}
+	if err := validateAlertTransport(p); err != nil {
+		return err
 	}
 	t, err := h.transQ.Update(c.Request().Context(), id, p)
 	if err != nil {
@@ -321,10 +352,10 @@ func (h *AlertHandler) AcknowledgeAlert(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid alert state id")
 	}
-	// User ID from JWT context — use nil UUID as fallback.
-	userID := uuid.Nil
-	if uid, ok := c.Get("user_id").(uuid.UUID); ok {
-		userID = uid
+	userIDStr, _ := c.Get(middleware.ContextKeyUserID).(string)
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusUnauthorized, "invalid user context")
 	}
 	if err := h.stateQ.Acknowledge(c.Request().Context(), id, userID); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to acknowledge alert")

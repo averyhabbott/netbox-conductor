@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 )
 
 // Credential represents a row in the credentials table (password_enc is never returned to callers).
@@ -69,6 +71,19 @@ func (q *CredentialQuerier) GetByKind(ctx context.Context, clusterID uuid.UUID, 
 		return nil, err
 	}
 	return &c, nil
+}
+
+// GetDecrypted returns a cluster credential's username and decrypted password,
+// or defaultUser and "" when the credential isn't set.
+func (q *CredentialQuerier) GetDecrypted(ctx context.Context, enc *crypto.Encryptor, clusterID uuid.UUID, kind, defaultUser string) (user, pass string) {
+	user = defaultUser
+	if cred, err := q.GetByKind(ctx, clusterID, kind); err == nil {
+		user = cred.Username
+		if pw, err := enc.Decrypt(cred.PasswordEnc); err == nil {
+			pass = string(pw)
+		}
+	}
+	return user, pass
 }
 
 type UpsertCredentialParams struct {

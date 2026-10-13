@@ -1,10 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
-import { eventsApi, type Event, type EventFilter } from '../api/events'
+import { eventsApi, CATEGORIES, SEVERITIES, type Event, type EventFilter } from '../api/events'
 import EventsTable from '../components/EventsTable'
 import Layout from '../components/Layout'
-
-const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
-const SEVERITIES = ['debug', 'info', 'warn', 'error', 'critical']
 
 export default function EventsPage() {
   const [events, setEvents] = useState<Event[]>([])

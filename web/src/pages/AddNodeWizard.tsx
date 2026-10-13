@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { nodesApi } from '../api/nodes'
-import client from '../api/client'
+import { nodesApi, NODE_ROLES, isInvalidHostname } from '../api/nodes'
+import client, { apiError } from '../api/client'
 import type { CreateNodeBody, Node, RegTokenResponse } from '../api/nodes'
+import { useCopy } from '../hooks/useCopy'
+import AgentEnvValues from '../components/AgentEnvValues'
 
 type Arch = 'amd64' | 'arm64'
 
@@ -19,9 +21,8 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
   const [step, setStep] = useState<Step>(1)
   const [node, setNode] = useState<Node | null>(null)
   const [regToken, setRegToken] = useState<RegTokenResponse | null>(null)
-  const [copied, setCopied] = useState(false)
-  const [copiedInstall, setCopiedInstall] = useState(false)
-  const [copiedStart, setCopiedStart] = useState(false)
+  const [copiedInstall, copyInstall] = useCopy()
+  const [copiedStart, copyStart] = useCopy()
   const [error, setError] = useState('')
   const [arch, setArch] = useState<Arch>('amd64')
 
@@ -42,7 +43,7 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
   const [resolving, setResolving] = useState(false)
   const [resolveError, setResolveError] = useState('')
 
-  const hostnameInvalid = form.hostname.length > 0 && /[^a-zA-Z0-9.\-]/.test(form.hostname)
+  const hostnameInvalid = isInvalidHostname(form.hostname)
 
   const resolveHostname = async () => {
     if (!form.hostname) return
@@ -54,7 +55,7 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
       )
       setForm((f) => ({ ...f, ip_address: data.ip }))
     } catch (e: any) {
-      setResolveError(e.response?.data?.message ?? 'Could not resolve hostname')
+      setResolveError(apiError(e, 'Could not resolve hostname'))
     } finally {
       setResolving(false)
     }
@@ -68,7 +69,7 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
       setError('')
     },
     onError: (e: any) => {
-      setError(e.response?.data?.message ?? 'Failed to create node')
+      setError(apiError(e, 'Failed to create node'))
     },
   })
 
@@ -80,31 +81,12 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
       setError('')
     },
     onError: (e: any) => {
-      setError(e.response?.data?.message ?? 'Failed to generate token')
+      setError(apiError(e, 'Failed to generate token'))
     },
   })
 
-  const copyEnv = async () => {
-    if (!regToken) return
-    await navigator.clipboard.writeText(regToken.env_snippet)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
   const installScript = (a: Arch) =>
     `# Download the agent package\ncurl -fsSLk ${window.location.origin}/api/v1/downloads/agent-linux-${a} \\\n  -o netbox-agent.tar.gz\ntar -xzf netbox-agent.tar.gz\ncd netbox-agent-installer\n\n# Run the installer — creates user/group, installs binary,\n# copies env file, installs and enables the systemd service\nsudo bash install.sh`
-
-  const copyInstall = async () => {
-    await navigator.clipboard.writeText(installScript(arch))
-    setCopiedInstall(true)
-    setTimeout(() => setCopiedInstall(false), 2000)
-  }
-
-  const copyStart = async () => {
-    await navigator.clipboard.writeText('sudo systemctl start netbox-agent')
-    setCopiedStart(true)
-    setTimeout(() => setCopiedStart(false), 2000)
-  }
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
@@ -204,9 +186,9 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
                     setForm({ ...form, role: e.target.value as CreateNodeBody['role'] })
                   }
                 >
-                  <option value="hyperconverged">Hyper-converged (NetBox + DB + Redis)</option>
-                  <option value="app">App only (NetBox + RQ + Redis)</option>
-                  <option value="db_only">DB only (Postgres + Patroni)</option>
+                  {NODE_ROLES.map((r) => (
+                    <option key={r.value} value={r.value}>{r.label} ({r.detail})</option>
+                  ))}
                 </select>
               </div>
               <div className="grid grid-cols-2 gap-4">
@@ -300,7 +282,7 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
 {installScript(arch)}
                 </pre>
                 <button
-                  onClick={copyInstall}
+                  onClick={() => copyInstall(installScript(arch))}
                   className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
                 >
                   {copiedInstall ? '✓ Copied' : 'Copy'}
@@ -338,31 +320,14 @@ export default function AddNodeWizard({ clusterId, clusterName, existingNodes, o
               <p className="text-sm text-gray-300 font-medium">
                 Step 3: Configure and start the agent
               </p>
-              <p className="text-sm text-gray-400">
-                On{' '}
-                <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">{node.hostname}</code>,
-                save the following to{' '}
-                <code className="text-xs bg-gray-800 px-1.5 py-0.5 rounded font-mono">/etc/netbox-agent/netbox-agent.env</code>:
-              </p>
-
-              <div className="relative">
-                <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto">
-{regToken.env_snippet}
-                </pre>
-                <button
-                  onClick={copyEnv}
-                  className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
-                >
-                  {copied ? '✓ Copied' : 'Copy'}
-                </button>
-              </div>
+              <AgentEnvValues hostname={node.hostname} snippet={regToken.env_snippet} />
 
               <div className="relative">
                 <pre className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300">
 {`sudo systemctl start netbox-agent`}
                 </pre>
                 <button
-                  onClick={copyStart}
+                  onClick={() => copyStart('sudo systemctl start netbox-agent')}
                   className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded transition-colors"
                 >
                   {copiedStart ? '✓ Copied' : 'Copy'}

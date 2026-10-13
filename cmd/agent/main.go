@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -60,11 +60,9 @@ func main() {
 		log.Fatalf("agent is not registered: AGENT_NODE_ID and AGENT_TOKEN must be set in %s", envFile)
 	}
 
-	// Cert-learning: one-time download of conductor's CA cert.
-	// Only runs when UPDATE_CERT=true (default); updates the env file and the
-	// in-memory config so the WS connection uses the downloaded cert.
-	if cfg.UpdateCert {
-		if err := agentconfig.LearnCert(cfg, envFile); err != nil {
+	// Cert-learning: one-time download of the conductor's CA cert.
+	if agentconfig.NeedsCert(cfg) {
+		if err := agentconfig.LearnCert(cfg); err != nil {
 			log.Printf("WARNING: cert-learning failed (%v) — continuing without pinned cert", err)
 		} else {
 			log.Printf("cert-learning succeeded; TLS CA cert saved to %s", cfg.TLSCACert)
@@ -89,6 +87,8 @@ func main() {
 	if cfg.StatusAddr != "" {
 		go statusserver.Serve(ctx, cfg.StatusAddr, cfg.NodeID, statusState)
 	}
+
+	executor.SetNetboxPaths(cfg.NetboxConfigPath, cfg.NetboxMediaRoot)
 
 	// Metrics collector
 	metrics := executor.NewMetricsCollector(cfg.NetboxConfigPath, cfg.NetboxMediaRoot, cfg.PatroniRESTURL)
@@ -126,8 +126,10 @@ func main() {
 	// Incoming file-sync chunks are written one at a time, in arrival order: a
 	// file is built by appending chunks, so concurrent writes would scramble it.
 	// When the queue is full the read loop blocks, which slows the sender instead
-	// of dropping chunks.
+	// of dropping chunks. A destination's sync tasks run here too, so they stay
+	// in order with the chunks around them.
 	chunkQueue := make(chan func(), 64)
+	syncRecv := executor.NewSyncReceiver()
 	go func() {
 		for fn := range chunkQueue {
 			fn()
@@ -138,51 +140,17 @@ func main() {
 	onMessage := func(ctx context.Context, env protocol.Envelope) error {
 		switch env.Type {
 		case protocol.TypeTaskDispatch:
-			handleTaskDispatch(ctx, cfg, wsClient, env, taskQueue)
-		case protocol.TypeMediaChunk:
-			// Server is forwarding a media chunk to us (pull_from_server mode).
+			handleTaskDispatch(ctx, cfg, wsClient, env, taskQueue, chunkQueue, syncRecv)
+		case protocol.TypeSyncChunk:
 			chunkQueue <- func() {
-				var chunk protocol.MediaChunkPayload
-				if err := json.Unmarshal(env.Payload, &chunk); err != nil {
-					slog.Warn("malformed media.chunk", "error", err)
+				var c protocol.SyncChunkPayload
+				if err := json.Unmarshal(env.Payload, &c); err != nil {
+					slog.Warn("malformed sync.chunk", "error", err)
 					return
 				}
-				if err := executor.WriteMediaChunk(chunk, cfg.NetboxMediaRoot); err != nil {
-					slog.Warn("writing media chunk", "path", chunk.RelativePath, "error", err)
-					return
+				if err := syncRecv.Chunk(c); err != nil {
+					slog.Warn("sync chunk", "sync_id", c.SyncID, "path", c.Path, "error", err)
 				}
-				// Send ack for backpressure
-				ack, _ := json.Marshal(protocol.MediaChunkAckPayload{
-					TransferID: chunk.TransferID,
-					ChunkIndex: chunk.ChunkIndex,
-				})
-				wsClient.Send(protocol.Envelope{
-					ID:      uuid.New().String(),
-					Type:    protocol.TypeMediaChunkAck,
-					Payload: json.RawMessage(ack),
-				})
-			}
-		case protocol.TypeBackupChunk:
-			// Conductor is relaying a pgBackRest repo file chunk to us (backup sync write side).
-			chunkQueue <- func() {
-				var chunk protocol.BackupChunkPayload
-				if err := json.Unmarshal(env.Payload, &chunk); err != nil {
-					slog.Warn("malformed backup.chunk", "error", err)
-					return
-				}
-				if err := executor.WriteBackupChunk(chunk, ""); err != nil {
-					slog.Warn("writing backup chunk", "path", chunk.RelativePath, "error", err)
-					return
-				}
-				ack, _ := json.Marshal(protocol.BackupChunkAckPayload{
-					TransferID: chunk.TransferID,
-					ChunkIndex: chunk.ChunkIndex,
-				})
-				wsClient.Send(protocol.Envelope{
-					ID:      uuid.New().String(),
-					Type:    protocol.TypeBackupChunkAck,
-					Payload: json.RawMessage(ack),
-				})
 			}
 
 		default:
@@ -299,8 +267,8 @@ func setupLogging(level slog.Level) {
 	log.SetOutput(io.Discard)
 }
 
-// handleTaskDispatch routes an inbound task to the appropriate executor.
-func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope, taskQueue chan<- func()) {
+// handleTaskDispatch acks an inbound task and queues it for execution.
+func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope, taskQueue, chunkQueue chan<- func(), syncRecv *executor.SyncReceiver) {
 	var task protocol.TaskDispatchPayload
 	if err := json.Unmarshal(env.Payload, &task); err != nil {
 		slog.Error("malformed task dispatch", "error", err)
@@ -319,492 +287,249 @@ func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws
 		Payload: json.RawMessage(ackPayload),
 	})
 
-	// Enqueue task for serial execution — tasks run one at a time in receive order.
-	taskQueue <- func() { executeTask(ctx, cfg, client, task) }
+	switch task.TaskType {
+	case protocol.TaskSyncReceive, protocol.TaskSyncFinish, protocol.TaskSyncDelete:
+		chunkQueue <- func() { executeTask(ctx, cfg, client, task, syncRecv) }
+	default:
+		// Serial execution — tasks run one at a time in receive order.
+		taskQueue <- func() { executeTask(ctx, cfg, client, task, syncRecv) }
+	}
 }
 
-func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, task protocol.TaskDispatchPayload) {
+// executeTask runs one task and reports its result. The task's TimeoutSecs
+// bounds the whole run: commands are stopped and waits cut short when it ends.
+func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, task protocol.TaskDispatchPayload, syncRecv *executor.SyncReceiver) {
 	start := time.Now()
-	var output, errMsg string
-	success := false
+	if task.TimeoutSecs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(task.TimeoutSecs)*time.Second)
+		defer cancel()
+	}
+
+	// Sync messages wait for buffer space: a dropped one would corrupt the sync.
+	sendWait := func(t protocol.MessageType, payload any) error {
+		raw, _ := json.Marshal(payload)
+		return client.SendWait(protocol.Envelope{ID: uuid.New().String(), Type: t, Payload: raw}, chunkSendTimeout)
+	}
+	// syncRoot maps a sync folder to a local path: "" is the NetBox media folder.
+	syncRoot := func(root string) (string, error) {
+		if root != "" {
+			return root, nil
+		}
+		if cfg.NetboxMediaRoot == "" {
+			return "", executor.ErrNoNetbox
+		}
+		return cfg.NetboxMediaRoot, nil
+	}
+
+	var output string
+	var err error
 
 	switch task.TaskType {
 	case protocol.TaskWriteConfig:
-		var params protocol.ConfigWriteParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.WriteConfig(params, cfg.NetboxConfigPath)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.ConfigWriteParams) (string, error) {
+			return executor.WriteConfig(ctx, p, cfg.NetboxConfigPath)
+		})
 
 	case protocol.TaskRestartNetbox:
-		cmd := exec.Command("sudo", "systemctl", "restart", "netbox", "netbox-rq")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "restart", "netbox", "netbox-rq")
 
 	case protocol.TaskStartNetbox:
-		cmd := exec.Command("sudo", "systemctl", "start", "netbox", "netbox-rq")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "start", "netbox", "netbox-rq")
 
 	case protocol.TaskStopNetbox:
-		cmd := exec.Command("sudo", "systemctl", "stop", "netbox", "netbox-rq")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "stop", "netbox", "netbox-rq")
 
 	case protocol.TaskRestartRQ:
-		cmd := exec.Command("sudo", "systemctl", "restart", "netbox-rq")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "restart", "netbox-rq")
 
 	case protocol.TaskWritePatroniConf:
-		var params protocol.PatroniConfigWriteParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.WritePatroniConfig(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.WritePatroniConfig)
 
 	case protocol.TaskStopSentinel:
+		// Best effort: sentinel may already be stopped or not installed.
 		for _, args := range [][]string{
 			{"systemctl", "stop", "redis-sentinel"},
 			{"systemctl", "disable", "redis-sentinel"},
 		} {
-			cmd := exec.Command("sudo", args...)
-			out, _ := cmd.CombinedOutput()
-			output += string(out)
+			out, _ := runCmd(ctx, "sudo", args...)
+			output += out
 		}
-		success = true
 
 	case protocol.TaskStopPostgresql:
-		cmd := exec.Command("sudo", "systemctl", "stop", "postgresql")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "stop", "postgresql")
 
 	case protocol.TaskRestartPatroni:
 		// patroni is enabled at agent install time (install.sh), not here.
-		cmd := exec.Command("sudo", "systemctl", "restart", "patroni")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "restart", "patroni")
 
 	case protocol.TaskStopPostgres:
-		dataDir := executor.PostgresDataDir()
-		cmd := exec.Command("sudo", "-u", "postgres",
-			"pg_ctl", "stop", "-D", dataDir, "-m", "fast", "-w")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "-u", "postgres",
+			"pg_ctl", "stop", "-D", executor.PostgresDataDir(ctx), "-m", "fast", "-w")
 
 	case protocol.TaskPatroniSwitchover:
-		var params protocol.PatroniSwitchoverParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-			break
-		}
-		if params.Candidate == "" {
-			errMsg = "candidate hostname is required"
-			break
-		}
-		clusterName := readPatroniClusterName()
-		if clusterName == "" {
-			errMsg = "could not read Patroni cluster name from /etc/patroni/patroni.yml"
-			break
-		}
-		cmd := exec.Command("patronictl", "-c", "/etc/patroni/patroni.yml",
-			"switchover", "--force", clusterName, "--candidate", params.Candidate)
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.PatroniSwitchoverParams) (string, error) {
+			if p.Candidate == "" {
+				return "", errors.New("candidate hostname is required")
+			}
+			clusterName := readPatroniClusterName()
+			if clusterName == "" {
+				return "", errors.New("could not read Patroni cluster name from /etc/patroni/patroni.yml")
+			}
+			return runCmd(ctx, "patronictl", "-c", "/etc/patroni/patroni.yml",
+				"switchover", "--force", clusterName, "--candidate", p.Candidate)
+		})
 
 	case protocol.TaskRestartRedis:
-		cmd := exec.Command("sudo", "systemctl", "restart", "redis")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "restart", "redis")
 
 	case protocol.TaskRestartSentinel:
-		cmd := exec.Command("sudo", "systemctl", "restart", "redis-sentinel")
-		out, err := cmd.CombinedOutput()
-		output = string(out)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = runCmd(ctx, "sudo", "systemctl", "restart", "redis-sentinel")
 
 	case protocol.TaskWriteSentinelConf:
-		var params protocol.SentinelConfigWriteParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.WriteSentinelConfig(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.WriteSentinelConfig)
 
 	case protocol.TaskDBRestore:
-		var params protocol.DBRestoreParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunDBRestore(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunDBRestore)
 
 	case protocol.TaskDBBackup:
-		var params protocol.DBBackupParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunDBBackup(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunDBBackup)
 
 	case protocol.TaskUpdateDBHost:
-		var params protocol.DBHostUpdateParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.UpdateDBHost(params, cfg.NetboxConfigPath)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.DBHostUpdateParams) (string, error) {
+			return executor.UpdateDBHost(ctx, p, cfg.NetboxConfigPath)
+		})
 
 	case protocol.TaskUpdateRedisHost:
-		var params protocol.RedisHostUpdateParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.UpdateRedisHost(params, cfg.NetboxConfigPath)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.RedisHostUpdateParams) (string, error) {
+			return executor.UpdateRedisHost(ctx, p, cfg.NetboxConfigPath)
+		})
 
 	case protocol.TaskRedisSetRequirepass:
-		var params protocol.RedisRequirepassParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.SetRedisRequirepass(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.SetRedisRequirepass)
 
 	case protocol.TaskRedisBindAll:
-		out, err := executor.SetRedisBindAll()
-		output = out
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			success = true
-		}
+		output, err = executor.SetRedisBindAll(ctx)
 
 	case protocol.TaskCreatePgRole:
-		var params protocol.CreatePgRoleParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.CreatePgRole(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.CreatePgRole)
 
 	case protocol.TaskInstallPatroni:
-		var params protocol.PatroniInstallParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.InstallPatroni(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
-
-	case protocol.TaskEnforceRetention:
-		var params protocol.EnforceRetentionParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.EnforceRetention(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
-
-	case protocol.TaskMediaSync:
-		var params protocol.MediaSyncParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else if params.Direction == "push_to_server" {
-			err := executor.PushMediaRoot(params, cfg.NetboxMediaRoot, func(env protocol.Envelope) error {
-				return client.SendWait(env, chunkSendTimeout)
-			})
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				output = "media push complete"
-				success = true
-			}
-		} else {
-			// pull_from_server: chunks arrive via TypeMediaChunk messages; this task
-			// just signals readiness — actual writing happens in the message handler.
-			output = "pull mode: ready to receive chunks"
-			success = true
-		}
-
-	case protocol.TaskAgentUpgrade:
-		var params protocol.AgentUpgradeParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.UpgradeAgent(params, cfg.TLSSkipVerify, cfg.TLSCACert)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.InstallPatroni)
 
 	case protocol.TaskRunCommand:
-		var params protocol.RunCommandParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunCommand(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunCommand)
 
 	case protocol.TaskReadNetboxConfig:
-		content, err := os.ReadFile(cfg.NetboxConfigPath)
-		if err != nil {
-			errMsg = err.Error()
-		} else {
-			output = string(content)
-			success = true
-		}
+		var content []byte
+		content, err = os.ReadFile(cfg.NetboxConfigPath)
+		output = string(content)
 
 	case protocol.TaskPGBackRestConfigure:
-		var params protocol.PGBackRestConfigParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.WritePGBackRestConfig(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, func(_ context.Context, p protocol.PGBackRestConfigParams) (string, error) {
+			return executor.WritePGBackRestConfig(p)
+		})
 
 	case protocol.TaskPGBackRestStanzaCreate:
-		var params protocol.PGBackRestStanzaCreateParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunPGBackRestStanzaCreate(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunPGBackRestStanzaCreate)
 
 	case protocol.TaskPGBackRestBackup:
-		var params protocol.PGBackRestBackupParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunPGBackRestBackup(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunPGBackRestBackup)
 
 	case protocol.TaskPGBackRestCatalog:
-		var params protocol.PGBackRestCatalogParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunPGBackRestCatalog(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunPGBackRestCatalog)
 
 	case protocol.TaskPGBackRestRestore:
-		var params protocol.PGBackRestRestoreParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunPGBackRestRestore(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunPGBackRestRestore)
 
 	case protocol.TaskPGBackRestTestPath:
-		var params protocol.PGBackRestTestPathParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			out, err := executor.RunPGBackRestTestPath(params)
-			output = out
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				success = true
-			}
-		}
+		output, err = run(ctx, task.Params, executor.RunPGBackRestTestPath)
 
-	case protocol.TaskBackupSyncRead:
-		var params protocol.BackupSyncReadParams
-		if err := json.Unmarshal(task.Params, &params); err != nil {
-			errMsg = "bad params: " + err.Error()
-		} else {
-			err := executor.PushBackupRepo(params, func(env protocol.Envelope) error {
-				return client.SendWait(env, chunkSendTimeout)
+	case protocol.TaskSyncList:
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.SyncListParams) (string, error) {
+			root, err := syncRoot(p.Root)
+			if err != nil {
+				return "", err
+			}
+			return executor.ListSyncFolder(ctx, p.SyncID, root, func(l protocol.SyncListingPayload) error {
+				return sendWait(protocol.TypeSyncListing, l)
 			})
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				output = "backup repo sync push complete"
-				success = true
-			}
-		}
+		})
 
-	case protocol.TaskBackupSyncWrite:
-		// Chunks arrive via TypeBackupChunk messages in the message handler.
-		// This task just signals readiness to receive.
-		output = "ready to receive backup chunks"
-		success = true
+	case protocol.TaskSyncSend:
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.SyncSendParams) (string, error) {
+			root, err := syncRoot(p.Root)
+			if err != nil {
+				return "", err
+			}
+			return executor.SendSyncFiles(ctx, p, root, func(c protocol.SyncChunkPayload) error {
+				return sendWait(protocol.TypeSyncChunk, c)
+			})
+		})
+
+	case protocol.TaskSyncReceive:
+		output, err = run(ctx, task.Params, func(_ context.Context, p protocol.SyncReceiveParams) (string, error) {
+			root, err := syncRoot(p.Root)
+			if err != nil {
+				return "", err
+			}
+			return syncRecv.Start(p, root)
+		})
+
+	case protocol.TaskSyncFinish:
+		output, err = run(ctx, task.Params, func(_ context.Context, p protocol.SyncFinishParams) (string, error) {
+			return syncRecv.Finish(p)
+		})
+
+	case protocol.TaskSyncDelete:
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.SyncDeleteParams) (string, error) {
+			root, err := syncRoot(p.Root)
+			if err != nil {
+				return "", err
+			}
+			return executor.DeleteSyncFiles(ctx, p, root)
+		})
 
 	default:
-		errMsg = "unknown task type: " + string(task.TaskType)
+		err = fmt.Errorf("unknown task type: %s", task.TaskType)
 	}
 
-	if success {
-		slog.Info("task done",
-			"task_id", task.TaskID,
-			"type", task.TaskType,
-			"duration_ms", time.Since(start).Milliseconds(),
-		)
-	} else {
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			errMsg = fmt.Sprintf("timed out after %ds: %s", task.TimeoutSecs, errMsg)
+		}
 		slog.Warn("task failed",
 			"task_id", task.TaskID,
 			"type", task.TaskType,
 			"error", errMsg,
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
+	} else {
+		slog.Info("task done",
+			"task_id", task.TaskID,
+			"type", task.TaskType,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
 	}
 
-	sendResult(client, task.TaskID, success, output, errMsg, time.Since(start).Milliseconds())
+	sendResult(client, task.TaskID, err == nil, output, errMsg, time.Since(start).Milliseconds())
+}
+
+// run decodes a task's params into P and runs fn with them.
+func run[P any](ctx context.Context, raw json.RawMessage, fn func(context.Context, P) (string, error)) (string, error) {
+	var params P
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return "", fmt.Errorf("bad params: %w", err)
+	}
+	return fn(ctx, params)
+}
+
+// runCmd runs a command under the task's deadline and returns its combined output.
+func runCmd(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := executor.Command(ctx, name, args...).CombinedOutput()
+	return string(out), err
 }
 
 // readPatroniClusterName parses the 'name:' field from /etc/patroni/patroni.yml.
@@ -829,10 +554,15 @@ func sendResult(client *ws.Client, taskID string, success bool, output, errMsg s
 		Output:     output,
 		ErrorMsg:   errMsg,
 		DurationMs: durationMs,
+		Repaired:   executor.TakeRepaired(),
 	})
-	client.Send(protocol.Envelope{
+	// Wait for buffer space: a lost result leaves the conductor waiting until
+	// the task's timeout, and a sync task can leave the buffer full of chunks.
+	if err := client.SendWait(protocol.Envelope{
 		ID:      uuid.New().String(),
 		Type:    protocol.TypeTaskResult,
 		Payload: json.RawMessage(payload),
-	})
+	}, chunkSendTimeout); err != nil {
+		slog.Error("task result not sent", "task_id", taskID, "error", err)
+	}
 }

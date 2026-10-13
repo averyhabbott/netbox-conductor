@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
+	"github.com/averyhabbott/netbox-conductor/internal/shared/env"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -40,9 +40,9 @@ func Setup(logDir, logName, levelStr string) *slog.Logger {
 	level := ParseLevel(levelStr)
 	dir := filepath.Join(logDir, logName)
 
-	maxSizeMB := envInt("LOG_MAX_SIZE_MB", 100)
-	maxBackups := envInt("LOG_MAX_BACKUPS", 10)
-	maxAgeDays := envInt("LOG_MAX_AGE_DAYS", 30)
+	maxSizeMB := env.Int("LOG_MAX_SIZE_MB", 100)
+	maxBackups := env.Int("LOG_MAX_BACKUPS", 10)
+	maxAgeDays := env.Int("LOG_MAX_AGE_DAYS", 30)
 
 	writers := []io.Writer{os.Stdout}
 	if err := os.MkdirAll(dir, 0755); err == nil {
@@ -60,15 +60,6 @@ func Setup(logDir, logName, levelStr string) *slog.Logger {
 		&slog.HandlerOptions{Level: level},
 	)
 	return slog.New(h)
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
 }
 
 // OpenAgentLog opens (or creates) the per-agent log file at

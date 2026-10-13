@@ -1,10 +1,13 @@
 // Package tlscert manages the Conductor's TLS certificate.
 //
 // At startup, EnsureExists is called with the desired cert and key paths.
-// If the files do not exist, or the cert expires within 30 days, a new
-// self-signed ECDSA P-256 certificate is generated and written. The cert
-// is its own CA (IsCA: true), so agents can trust it by pointing
-// AGENT_TLS_CA_CERT at the same file.
+// If the files do not exist, a new self-signed ECDSA P-256 certificate is
+// generated and written. The cert is its own CA (IsCA: true), so agents can
+// trust it by pointing AGENT_TLS_CA_CERT at the same file.
+//
+// An existing cert is never replaced automatically, even near expiry: agents
+// pin it, so a new one disconnects them all. Only Regenerate (the UI's
+// Regenerate button) replaces it; the UI warns 30 days before expiry.
 package tlscert
 
 import (
@@ -31,13 +34,12 @@ func Regenerate(certFile, keyFile string, dnsNames []string, ipAddrs []net.IP) e
 	return generate(certFile, keyFile, dnsNames, ipAddrs)
 }
 
-// EnsureExists checks whether certFile and keyFile exist and are not expiring
-// within 30 days. If either condition fails, a new self-signed certificate is
-// generated with the provided SANs and written to both paths.
+// EnsureExists generates a new self-signed certificate with the provided SANs
+// when certFile or keyFile is missing; otherwise it leaves both untouched.
 //
 // The containing directory is created (mode 0755) if it does not exist.
 func EnsureExists(certFile, keyFile string, dnsNames []string, ipAddrs []net.IP) (generated bool, err error) {
-	if exists(certFile) && exists(keyFile) && !expiringSoon(certFile) {
+	if exists(certFile) && exists(keyFile) {
 		return false, nil
 	}
 	return true, generate(certFile, keyFile, dnsNames, ipAddrs)
@@ -185,22 +187,4 @@ func ReadCertInfo(certFile string) (*CertInfo, error) {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-// expiringSoon returns true if the cert at path expires within 30 days,
-// or if it cannot be read / parsed.
-func expiringSoon(certFile string) bool {
-	pemData, err := os.ReadFile(certFile)
-	if err != nil {
-		return true
-	}
-	block, _ := pem.Decode(pemData)
-	if block == nil {
-		return true
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return true
-	}
-	return time.Until(cert.NotAfter) < 30*24*time.Hour
 }

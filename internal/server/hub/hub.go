@@ -18,14 +18,6 @@ type Hub struct {
 
 	taskWaitersMu sync.Mutex
 	taskWaiters   map[uuid.UUID]chan protocol.TaskResultPayload
-
-	roleWaitersMu sync.Mutex
-	roleWaiters   map[roleWatchKey][]chan struct{}
-}
-
-type roleWatchKey struct {
-	NodeID uuid.UUID
-	Role   string
 }
 
 // New creates an empty Hub.
@@ -34,7 +26,6 @@ func New() *Hub {
 		sessions:        make(map[uuid.UUID]*Session),
 		stagingSessions: make(map[uuid.UUID]*Session),
 		taskWaiters:     make(map[uuid.UUID]chan protocol.TaskResultPayload),
-		roleWaiters:     make(map[roleWatchKey][]chan struct{}),
 	}
 }
 
@@ -66,15 +57,18 @@ func (h *Hub) Unregister(nodeID uuid.UUID) {
 // UnregisterIfSame removes the session for nodeID only when the currently
 // registered session is the same object as s. This prevents a connectNode
 // defer from evicting a replacement session that was registered after this
-// one was evicted by Hub.Register.
-func (h *Hub) UnregisterIfSame(nodeID uuid.UUID, s *Session) {
+// one was evicted by Hub.Register. Returns false when a newer session has
+// replaced s, so the caller can skip its disconnect side effects.
+func (h *Hub) UnregisterIfSame(nodeID uuid.UUID, s *Session) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if existing, ok := h.sessions[nodeID]; ok && existing == s {
 		delete(h.sessions, nodeID)
 		// send is already closed (by Register's eviction or WritePump exit).
 		// pumpCtx will be cancelled by connectNode's defer pumpCancel().
+		return true
 	}
+	return false
 }
 
 // Get returns the active session for a node, or nil if not connected.
@@ -154,13 +148,6 @@ func (h *Hub) UnregisterStaging(stagingID uuid.UUID) {
 	}
 }
 
-// GetStaging returns the active staging session for a staging agent, or nil.
-func (h *Hub) GetStaging(stagingID uuid.UUID) *Session {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.stagingSessions[stagingID]
-}
-
 // IsConnectedStaging reports whether a staging agent has an active session.
 func (h *Hub) IsConnectedStaging(stagingID uuid.UUID) bool {
 	h.mu.RLock()
@@ -200,16 +187,8 @@ func (h *Hub) UnregisterCluster(clusterID uuid.UUID) {
 // WaitForTask blocks until the agent posts a result for taskID or the context /
 // timeout fires. Callers register before dispatching the task to avoid a race.
 func (h *Hub) WaitForTask(ctx context.Context, taskID uuid.UUID, timeout time.Duration) (*protocol.TaskResultPayload, error) {
-	ch := make(chan protocol.TaskResultPayload, 1)
-	h.taskWaitersMu.Lock()
-	h.taskWaiters[taskID] = ch
-	h.taskWaitersMu.Unlock()
-
-	defer func() {
-		h.taskWaitersMu.Lock()
-		delete(h.taskWaiters, taskID)
-		h.taskWaitersMu.Unlock()
-	}()
+	ch, done := h.ExpectTask(taskID)
+	defer done()
 
 	select {
 	case result := <-ch:
@@ -218,6 +197,20 @@ func (h *Hub) WaitForTask(ctx context.Context, taskID uuid.UUID, timeout time.Du
 		return nil, context.DeadlineExceeded
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+// ExpectTask registers for taskID's result; call it before dispatching the
+// task so a fast result can't be missed, and call done when no longer waiting.
+func (h *Hub) ExpectTask(taskID uuid.UUID) (result <-chan protocol.TaskResultPayload, done func()) {
+	ch := make(chan protocol.TaskResultPayload, 1)
+	h.taskWaitersMu.Lock()
+	h.taskWaiters[taskID] = ch
+	h.taskWaitersMu.Unlock()
+	return ch, func() {
+		h.taskWaitersMu.Lock()
+		delete(h.taskWaiters, taskID)
+		h.taskWaitersMu.Unlock()
 	}
 }
 
@@ -230,37 +223,6 @@ func (h *Hub) NotifyTaskResult(taskID uuid.UUID, result protocol.TaskResultPaylo
 	if ok {
 		select {
 		case ch <- result:
-		default:
-		}
-	}
-}
-
-// ── Patroni role watchers ─────────────────────────────────────────────────────
-
-// WatchPatroniRole returns a channel that receives one signal when nodeID
-// reports the given Patroni role via heartbeat or PatroniState message.
-// Register before dispatching the work that triggers the role change to avoid
-// missing a signal that arrives before the select is reached.
-func (h *Hub) WatchPatroniRole(nodeID uuid.UUID, role string) <-chan struct{} {
-	ch := make(chan struct{}, 1)
-	key := roleWatchKey{NodeID: nodeID, Role: role}
-	h.roleWaitersMu.Lock()
-	h.roleWaiters[key] = append(h.roleWaiters[key], ch)
-	h.roleWaitersMu.Unlock()
-	return ch
-}
-
-// NotifyPatroniRole signals all watchers registered for (nodeID, role).
-// Called by handleHeartbeat and handlePatroniState whenever a role is observed.
-func (h *Hub) NotifyPatroniRole(nodeID uuid.UUID, role string) {
-	key := roleWatchKey{NodeID: nodeID, Role: role}
-	h.roleWaitersMu.Lock()
-	watchers := h.roleWaiters[key]
-	delete(h.roleWaiters, key)
-	h.roleWaitersMu.Unlock()
-	for _, ch := range watchers {
-		select {
-		case ch <- struct{}{}:
 		default:
 		}
 	}

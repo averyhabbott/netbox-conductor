@@ -33,9 +33,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/averyhabbott/netbox-conductor/internal/agent/executor"
 )
 
 // State holds runtime cluster configuration delivered by the server on each
@@ -76,7 +77,7 @@ func Serve(ctx context.Context, addr string, nodeID string, state *State) {
 		Handler:     mux,
 		ReadTimeout: 5 * time.Second,
 		// Keep WriteTimeout generous enough for two systemctl checks (2 s each)
-		// plus the optional Patroni REST call (2 s) plus response serialisation.
+		// plus the optional Patroni REST call (3 s) plus response serialisation.
 		WriteTimeout: 10 * time.Second,
 	}
 
@@ -120,15 +121,15 @@ func makeStatusHandler(nodeID string, state *State) http.HandlerFunc {
 		patroniRESTURL := state.patroniRESTURL
 		state.mu.RUnlock()
 
-		netboxUp := isActive("netbox")
-		rqUp := isActive("netbox-rq")
+		netboxUp := executor.IsServiceActive("netbox")
+		rqUp := executor.IsServiceActive("netbox-rq")
 
 		var patroniPrimary *bool
 		var patroniRole string
 		if patroniConfigured {
 			// Always query Patroni role so operators can see it regardless of
 			// whether app_tier_always_available is set.
-			patroniRole = queryPatroniRole(patroniRESTURL)
+			patroniRole = executor.PatroniRole(patroniRESTURL)
 
 			// In app_tier_always_available=false mode, also gate traffic on
 			// primary status — only the primary node should serve writes.
@@ -167,38 +168,4 @@ func makeStatusHandler(nodeID string, state *State) http.HandlerFunc {
 		w.WriteHeader(code)
 		_ = json.NewEncoder(w).Encode(resp)
 	}
-}
-
-// isActive returns true if the named systemd unit is in the "active" state.
-func isActive(unit string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
-}
-
-// queryPatroniRole calls the local Patroni REST API's /patroni endpoint and
-// returns the role string ("master", "replica", "standby_leader", etc.).
-// Returns "" on any error (Patroni not running, not configured, etc.).
-func queryPatroniRole(restURL string) string {
-	if restURL == "" {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, restURL+"/patroni", nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	var state struct {
-		Role string `json:"role"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		return ""
-	}
-	return state.Role
 }

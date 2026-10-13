@@ -12,10 +12,14 @@ import (
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/configgen"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
+	"github.com/averyhabbott/netbox-conductor/internal/server/cron"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
+	"github.com/averyhabbott/netbox-conductor/internal/server/oplock"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
+	"github.com/averyhabbott/netbox-conductor/internal/server/scheduler"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -45,6 +49,7 @@ type BackupHandler struct {
 	hub         *hub.Hub
 	creds       *queries.CredentialQuerier
 	witness     *patroni.WitnessManager
+	ops         *oplock.Locks
 	emitter     events.Emitter
 }
 
@@ -65,6 +70,7 @@ func NewBackupHandler(
 	h *hub.Hub,
 	creds *queries.CredentialQuerier,
 	witness *patroni.WitnessManager,
+	ops *oplock.Locks,
 ) *BackupHandler {
 	return &BackupHandler{
 		clusters:    clusters,
@@ -81,6 +87,7 @@ func NewBackupHandler(
 		hub:         h,
 		creds:       creds,
 		witness:     witness,
+		ops:         ops,
 	}
 }
 
@@ -134,6 +141,12 @@ func (h *BackupHandler) PutBackupSchedule(c echo.Context) error {
 	}
 	if req.IncrBackupIntervalHrs <= 0 {
 		req.IncrBackupIntervalHrs = 1
+	}
+	if err := cron.Validate(req.FullBackupCron); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "full backup schedule: "+err.Error())
+	}
+	if err := cron.Validate(req.DiffBackupCron); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "differential backup schedule: "+err.Error())
 	}
 
 	schedule, err := h.schedules.Upsert(c.Request().Context(), queries.UpsertBackupScheduleParams{
@@ -237,18 +250,35 @@ func (h *BackupHandler) DeleteBackupTarget(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "backup target not found")
 	}
 
+	// Removing the last target also disables archiving, so it needs the cluster.
+	targets, _ := h.targets.ListByCluster(ctx, clusterID)
+	lastTarget := len(targets) == 1
+	unlock := func() {}
+	if lastTarget {
+		if unlock, err = lockCluster(h.ops, clusterID, "Disable Backups"); err != nil {
+			return err
+		}
+	}
+	bgOwnsLock := false // the background disable, when started, releases the lock
+	defer func() {
+		if !bgOwnsLock {
+			unlock()
+		}
+	}()
+
 	if err := h.targets.Delete(ctx, tid); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete backup target")
 	}
 
 	// If no targets remain, disable archiving in the background.
-	remaining, _ := h.targets.ListByCluster(ctx, clusterID)
-	if len(remaining) == 0 {
+	if lastTarget {
 		nodes, _ := h.nodes.ListByCluster(ctx, clusterID)
-		if primary := primaryDBNode(nodes); primary != nil {
+		if primary := nodestate.PrimaryDBNode(nodes); primary != nil {
 			capturedPrimary := *primary
 			capturedSnapshots := h.snapshots
+			bgOwnsLock = true
 			go func() {
+				defer unlock()
 				bgCtx := context.Background()
 				h.disableArchiving(bgCtx, clusterID, capturedPrimary, capturedSnapshots)
 			}()
@@ -269,11 +299,17 @@ func (h *BackupHandler) DisableBackups(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 
+	unlock, err := lockCluster(h.ops, clusterID, "Disable Backups")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
-	primary := primaryDBNode(nodes)
+	primary := nodestate.PrimaryDBNode(nodes)
 	if primary == nil {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "no connected primary node found")
 	}
@@ -288,13 +324,7 @@ func (h *BackupHandler) DisableBackups(c echo.Context) error {
 // disableArchiving snapshots the current Patroni config, then PATCHes archive_mode and
 // archive_command to null (removes them from DCS). Also clears stanza_initialized.
 func (h *BackupHandler) disableArchiving(ctx context.Context, clusterID uuid.UUID, primary queries.Node, snaps *queries.PatroniSnapshotQuerier) error {
-	restUser, restPass := CredDefaultUserPatroniREST, ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPatroniREST); err == nil {
-		restUser = cred.Username
-		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
-			restPass = string(pw)
-		}
-	}
+	restUser, restPass := patroniCreds(ctx, h.creds, h.enc, clusterID)
 	primaryIP := stripCIDR(primary.IPAddress)
 
 	disablePatch, _ := json.Marshal(map[string]any{
@@ -343,6 +373,17 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 
+	unlock, err := lockCluster(h.ops, clusterID, "Enable Backups")
+	if err != nil {
+		return err
+	}
+	bgOwnsLock := false // the background job, when started, releases the lock
+	defer func() {
+		if !bgOwnsLock {
+			unlock()
+		}
+	}()
+
 	cluster, err := h.clusters.GetByID(ctx, clusterID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
@@ -379,13 +420,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	}
 
 	// Fetch Patroni REST credentials.
-	restUser, restPass := "patroni", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
-		restUser = cred.Username
-		if pw, e := h.enc.Decrypt(cred.PasswordEnc); e == nil {
-			restPass = string(pw)
-		}
-	}
+	restUser, restPass := patroniCreds(ctx, h.creds, h.enc, clusterID)
 
 	// Render pgbackrest.conf.
 	pgbConf, err := renderPGBackRestConf(stanzaName, targetList, h.enc)
@@ -402,7 +437,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 	}
 
 	// Identify primary for background work.
-	primaryNode := primaryDBNode(nodes)
+	primaryNode := nodestate.PrimaryDBNode(nodes)
 
 	// Dispatch pgbackrest.configure to all DB nodes.
 	pgbTasks := make([]taskRef, 0, len(dbNodes))
@@ -410,16 +445,9 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 		n := &dbNodes[i]
 		pgbParams, _ := json.Marshal(protocol.PGBackRestConfigParams{Config: pgbConf})
 		pgbTaskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, pgbTaskID, string(protocol.TaskPGBackRestConfigure), pgbParams)
-		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      pgbTaskID.String(),
-			TaskType:    protocol.TaskPGBackRestConfigure,
-			Params:      json.RawMessage(pgbParams),
-			TimeoutSecs: 30,
-		}); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, n.ID, pgbTaskID, protocol.TaskPGBackRestConfigure, pgbParams, 30, 0); dispErr != nil {
 			pgbTasks = append(pgbTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
 		} else {
-			_ = h.taskResults.SetSent(ctx, pgbTaskID)
 			pgbTasks = append(pgbTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: pgbTaskID.String(), Status: "dispatched"})
 		}
 	}
@@ -445,7 +473,9 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			}
 		}
 
+		bgOwnsLock = true
 		go func() {
+			defer unlock()
 			bgCtx := context.Background()
 			primaryIP := stripCIDR(capturedPrimary.IPAddress)
 
@@ -472,8 +502,8 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 
 			// 2. Pause Patroni on the cluster to suppress automatic failover during restarts.
 			pauseCtx, pauseCancel := context.WithTimeout(bgCtx, 10*time.Second)
-			if _, pauseStatus, pauseErr := patroniREST(pauseCtx, http.MethodPost, primaryIP,
-				"/pause", restUser, restPass, nil); pauseErr != nil || pauseStatus >= 300 {
+			if _, pauseStatus, pauseErr := patroniPATCHConfigAudited(pauseCtx, h.taskResults, capturedPrimary.ID, primaryIP,
+				restUser, restPass, []byte(`{"pause":true}`), "configure-backups-pause"); pauseErr != nil || pauseStatus >= 300 {
 				slog.Warn("enable-backups: Patroni pause failed — continuing anyway",
 					"status", pauseStatus, "err", pauseErr)
 			} else {
@@ -484,8 +514,8 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			// Always resume Patroni when the goroutine exits.
 			defer func() {
 				resumeCtx, resumeCancel := context.WithTimeout(bgCtx, 10*time.Second)
-				if _, resumeStatus, resumeErr := patroniREST(resumeCtx, http.MethodPost, primaryIP,
-					"/resume", restUser, restPass, nil); resumeErr != nil || resumeStatus >= 300 {
+				if _, resumeStatus, resumeErr := patroniPATCHConfigAudited(resumeCtx, h.taskResults, capturedPrimary.ID, primaryIP,
+					restUser, restPass, []byte(`{"pause":null}`), "configure-backups-resume"); resumeErr != nil || resumeStatus >= 300 {
 					slog.Warn("enable-backups: Patroni resume failed",
 						"status", resumeStatus, "err", resumeErr)
 				} else {
@@ -501,7 +531,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			archiveOK := func(nodeIP string, checkDCS bool) bool {
 				if checkDCS {
 					cfgCtx, cfgCancel := context.WithTimeout(bgCtx, 10*time.Second)
-					body, status, err := patroniREST(cfgCtx, http.MethodGet, nodeIP, "/config", restUser, restPass, nil)
+					body, status, err := patroni.REST(cfgCtx, http.MethodGet, nodeIP, "/config", restUser, restPass, nil)
 					cfgCancel()
 					if err != nil || status != http.StatusOK {
 						return false
@@ -529,7 +559,8 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 					}
 				}
 				healthCtx, healthCancel := context.WithTimeout(bgCtx, 10*time.Second)
-				body, status, err := patroniREST(healthCtx, http.MethodGet, nodeIP, "/", restUser, restPass, nil)
+				// /patroni answers 200 on any running member; "/" is 503 on every replica.
+				body, status, err := patroni.REST(healthCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
 				healthCancel()
 				if err != nil || status != http.StatusOK {
 					return false
@@ -574,7 +605,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 				}
 
 				restartCtx, restartCancel := context.WithTimeout(bgCtx, 3*time.Minute)
-				_, restartStatus, restartErr := patroniREST(restartCtx, http.MethodPost, primaryIP,
+				_, restartStatus, restartErr := patroni.REST(restartCtx, http.MethodPost, primaryIP,
 					"/restart", restUser, restPass, []byte(`{}`))
 				restartCancel()
 				if restartErr != nil || restartStatus >= 300 {
@@ -612,7 +643,7 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 						"node", replica.Hostname, "attempt", attempt+1)
 
 					restartCtx, restartCancel := context.WithTimeout(bgCtx, 3*time.Minute)
-					_, restartStatus, restartErr := patroniREST(restartCtx, http.MethodPost, replicaIP,
+					_, restartStatus, restartErr := patroni.REST(restartCtx, http.MethodPost, replicaIP,
 						"/restart", restUser, restPass, []byte(`{}`))
 					restartCancel()
 					if restartErr != nil || restartStatus >= 300 {
@@ -656,31 +687,15 @@ func (h *BackupHandler) EnableBackups(c echo.Context) error {
 			// 6. Dispatch stanza-create to the confirmed primary.
 			stanzaParams, _ := json.Marshal(protocol.PGBackRestStanzaCreateParams{Stanza: stanzaName})
 			stanzaTaskID := uuid.New()
-			if createErr := h.taskResults.Create(bgCtx, capturedPrimary.ID, stanzaTaskID, string(protocol.TaskPGBackRestStanzaCreate), stanzaParams); createErr != nil {
-				slog.Error("enable-backups: stanza-create task record create failed — aborting",
-					"node", capturedPrimary.Hostname, "error", createErr)
-				emit(events.SeverityWarn, events.CodeBackupsEnabled,
-					"pgBackRest stanza-create could not be recorded for "+capturedPrimary.Hostname+" — aborting")
-				return
-			}
-			if dispErr := h.dispatcher.Dispatch(capturedPrimary.ID, protocol.TaskDispatchPayload{
-				TaskID:      stanzaTaskID.String(),
-				TaskType:    protocol.TaskPGBackRestStanzaCreate,
-				Params:      json.RawMessage(stanzaParams),
-				TimeoutSecs: 120,
-			}); dispErr != nil {
+			if dispErr := h.dispatcher.DispatchTask(bgCtx, h.taskResults, capturedPrimary.ID, stanzaTaskID, protocol.TaskPGBackRestStanzaCreate, stanzaParams, 120, 0); dispErr != nil {
 				slog.Warn("enable-backups: stanza-create dispatch failed",
 					"node", capturedPrimary.Hostname, "error", dispErr)
 				emit(events.SeverityWarn, events.CodeBackupsEnabled,
 					"pgBackRest stanza-create dispatch failed on "+capturedPrimary.Hostname)
 				return
 			}
-			if sentErr := h.taskResults.SetSent(bgCtx, stanzaTaskID); sentErr != nil {
-				slog.Warn("enable-backups: stanza-create SetSent failed",
-					"node", capturedPrimary.Hostname, "task", stanzaTaskID, "error", sentErr)
-			}
 
-			if ok := pollTaskSuccess(bgCtx, h.taskResults, stanzaTaskID, 5*time.Minute); !ok {
+			if ok := h.taskResults.WaitSuccess(bgCtx, stanzaTaskID, 5*time.Minute); !ok {
 				emit(events.SeverityWarn, events.CodeBackupsEnabled,
 					"pgBackRest stanza-create failed on "+capturedPrimary.Hostname)
 				return
@@ -738,17 +753,10 @@ func (h *BackupHandler) PushBackupConfig(c echo.Context) error {
 	for _, n := range dbRoleNodes(nodes) {
 		params, _ := json.Marshal(protocol.PGBackRestConfigParams{Config: pgbConf})
 		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, taskID, string(protocol.TaskPGBackRestConfigure), params)
-		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskPGBackRestConfigure,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 30,
-		}); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, n.ID, taskID, protocol.TaskPGBackRestConfigure, params, 30, 0); dispErr != nil {
 			results = append(results, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
 			continue
 		}
-		_ = h.taskResults.SetSent(ctx, taskID)
 		results = append(results, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: taskID.String(), Status: "dispatched"})
 	}
 
@@ -777,23 +785,16 @@ func (h *BackupHandler) GetBackupCatalog(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
 
-	primary := primaryDBNode(nodes)
+	primary := nodestate.PrimaryDBNode(nodes)
 	if primary == nil {
 		return echo.NewHTTPError(http.StatusConflict, "no connected database node found")
 	}
 
 	params, _ := json.Marshal(protocol.PGBackRestCatalogParams{Stanza: *schedule.StanzaName})
 	taskID := uuid.New()
-	_ = h.taskResults.Create(ctx, primary.ID, taskID, string(protocol.TaskPGBackRestCatalog), params)
-	if dispErr := h.dispatcher.Dispatch(primary.ID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskPGBackRestCatalog,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 60,
-	}); dispErr != nil {
+	if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, primary.ID, taskID, protocol.TaskPGBackRestCatalog, params, 60, 0); dispErr != nil {
 		return echo.NewHTTPError(http.StatusConflict, "primary node is not connected: "+dispErr.Error())
 	}
-	_ = h.taskResults.SetSent(ctx, taskID)
 
 	// Also return the cached catalog if available.
 	cached, _ := h.catalog.GetLatest(ctx, clusterID)
@@ -838,9 +839,14 @@ func (h *BackupHandler) RunBackup(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
 
-	primary := primaryDBNode(nodes)
+	primary := nodestate.PrimaryDBNode(nodes)
 	if primary == nil {
 		return echo.NewHTTPError(http.StatusConflict, "no connected database node found")
+	}
+
+	unlock, err := lockCluster(h.ops, clusterID, "a backup")
+	if err != nil {
+		return err
 	}
 
 	params, _ := json.Marshal(protocol.PGBackRestBackupParams{
@@ -848,16 +854,14 @@ func (h *BackupHandler) RunBackup(c echo.Context) error {
 		Type:   req.Type,
 	})
 	taskID := uuid.New()
-	_ = h.taskResults.Create(ctx, primary.ID, taskID, string(protocol.TaskPGBackRestBackup), params)
-	if dispErr := h.dispatcher.Dispatch(primary.ID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskPGBackRestBackup,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 3600,
-	}); dispErr != nil {
+	if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, primary.ID, taskID, protocol.TaskPGBackRestBackup, params, scheduler.BackupTimeoutSecs, scheduler.BackupAckTimeoutSecs); dispErr != nil {
+		unlock()
 		return echo.NewHTTPError(http.StatusConflict, "primary node is not connected: "+dispErr.Error())
 	}
-	_ = h.taskResults.SetSent(ctx, taskID)
+	go func() {
+		defer unlock()
+		h.taskResults.WaitSuccess(context.Background(), taskID, scheduler.BackupAckTimeoutSecs*time.Second)
+	}()
 
 	// Create a backup_run record for tracking.
 	run, _ := h.runs.Create(ctx, clusterID, req.Type, time.Now().UTC(), 1)
@@ -909,6 +913,17 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "a restore is already in progress for this cluster")
 	}
 
+	unlock, err := lockCluster(h.ops, clusterID, "a restore")
+	if err != nil {
+		return err
+	}
+	bgOwnsLock := false // the background job, when started, releases the lock
+	defer func() {
+		if !bgOwnsLock {
+			unlock()
+		}
+	}()
+
 	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
@@ -936,7 +951,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusBadRequest, "restore_node_id not found in cluster db nodes")
 		}
 	} else {
-		restoreNode = primaryDBNode(nodes)
+		restoreNode = nodestate.PrimaryDBNode(nodes)
 		if restoreNode == nil {
 			return echo.NewHTTPError(http.StatusConflict, "no connected primary node found; specify restore_node_id to pick an online node")
 		}
@@ -951,13 +966,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 	}
 
 	// Fetch Patroni REST credentials once — used for pause, resume, and reinitialize.
-	var restUser, restPass string
-	if cred, credErr := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); credErr == nil {
-		restUser = cred.Username
-		if pw, decErr := h.enc.Decrypt(cred.PasswordEnc); decErr == nil {
-			restPass = string(pw)
-		}
-	}
+	restUser, restPass := patroniCreds(ctx, h.creds, h.enc, clusterID)
 
 	// Step 1: Pause Patroni automation via REST API.
 	// The pause flag propagates via DCS to all cluster members automatically.
@@ -988,17 +997,10 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 			continue
 		}
 		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, n.ID, taskID, string(protocol.TaskStopPostgres), emptyParams)
-		if dispErr := h.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskStopPostgres,
-			Params:      emptyParams,
-			TimeoutSecs: 30,
-		}); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, n.ID, taskID, protocol.TaskStopPostgres, emptyParams, 30, 0); dispErr != nil {
 			stopTasks = append(stopTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, Status: "offline", Error: dispErr.Error()})
 			continue
 		}
-		_ = h.taskResults.SetSent(ctx, taskID)
 		stopTasks = append(stopTasks, taskRef{NodeID: n.ID.String(), Hostname: n.Hostname, TaskID: taskID.String(), Status: "dispatched"})
 		stopIDs = append(stopIDs, taskID)
 	}
@@ -1011,18 +1013,11 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		RestoreCmd: req.RestoreCmd,
 	})
 	restoreTaskID := uuid.New()
-	_ = h.taskResults.Create(ctx, restoreNode.ID, restoreTaskID, string(protocol.TaskPGBackRestRestore), restoreParams)
 	var restoreTask taskRef
-	if dispErr := h.dispatcher.Dispatch(restoreNode.ID, protocol.TaskDispatchPayload{
-		TaskID:      restoreTaskID.String(),
-		TaskType:    protocol.TaskPGBackRestRestore,
-		Params:      json.RawMessage(restoreParams),
-		TimeoutSecs: 3600,
-	}); dispErr != nil {
+	if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, restoreNode.ID, restoreTaskID, protocol.TaskPGBackRestRestore, restoreParams, 3600, 0); dispErr != nil {
 		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, Status: "offline", Error: dispErr.Error()}
 		_ = h.schedules.SetRestoreInProgress(ctx, clusterID, false)
 	} else {
-		_ = h.taskResults.SetSent(ctx, restoreTaskID)
 		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: restoreTaskID.String(), Status: "dispatched"}
 
 		// Capture state for background goroutine before returning 202.
@@ -1037,19 +1032,21 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 			}
 		}
 
+		bgOwnsLock = true
 		go func() {
+			defer unlock()
 			bgCtx := context.Background()
 
 			// Wait for each replica's postgres stop.
 			for _, tid := range capturedStopIDs {
 				slog.Info("restore goroutine: waiting for postgres stop", "task_id", tid)
-				ok := pollTaskSuccess(bgCtx, h.taskResults, tid, 2*time.Minute)
+				ok := h.taskResults.WaitSuccess(bgCtx, tid, 2*time.Minute)
 				slog.Info("restore goroutine: postgres stop result", "task_id", tid, "success", ok)
 			}
 
 			// Wait for restore + promotion (up to 30 min).
 			slog.Info("restore goroutine: waiting for pgbackrest.restore task", "task_id", capturedRestoreID)
-			if ok := pollTaskSuccess(bgCtx, h.taskResults, capturedRestoreID, 30*time.Minute); !ok {
+			if ok := h.taskResults.WaitSuccess(bgCtx, capturedRestoreID, 30*time.Minute); !ok {
 				slog.Error("restore goroutine: pgbackrest.restore task did not succeed", "task_id", capturedRestoreID)
 				_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
 				return
@@ -1061,7 +1058,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 			// reinitialize returns "Cluster has no leader" if sent before the lock is held.
 			primaryPollCtx, primaryPollCancel := context.WithTimeout(bgCtx, 2*time.Minute)
 			for {
-				_, primaryStatus, primaryErr := patroniREST(primaryPollCtx, http.MethodGet, capturedRestoreIP, "/", restUser, restPass, nil)
+				_, primaryStatus, primaryErr := patroni.REST(primaryPollCtx, http.MethodGet, capturedRestoreIP, "/", restUser, restPass, nil)
 				if primaryErr == nil && primaryStatus == http.StatusOK {
 					slog.Info("restore goroutine: primary Patroni ready, DCS lock held", "node", capturedRestoreNode.Hostname)
 					break
@@ -1082,7 +1079,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 			// always fails after a restore (no common ancestor) and leaves replicas stuck.
 			for _, replica := range capturedReplicas {
 				replicaIP := stripCIDR(replica.IPAddress)
-				body, status, err := patroniREST(bgCtx, http.MethodPost, replicaIP, "/reinitialize", restUser, restPass, []byte(`{}`))
+				body, status, err := patroni.REST(bgCtx, http.MethodPost, replicaIP, "/reinitialize", restUser, restPass, []byte(`{}`))
 				slog.Info("restore goroutine: patroni reinitialize", "node", replica.Hostname, "status", status, "body", string(body), "err", err)
 				if err != nil {
 					slog.Error("patroni reinitialize failed", "node", replica.Hostname, "error", err)
@@ -1102,7 +1099,7 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 				slog.Info("restore goroutine: waiting for replica to rejoin", "node", replica.Hostname)
 				replicaPollCtx, replicaPollCancel := context.WithTimeout(bgCtx, 5*time.Minute)
 				for {
-					_, replicaStatus, replicaErr := patroniREST(replicaPollCtx, http.MethodGet, replicaIP, "/replica", restUser, restPass, nil)
+					_, replicaStatus, replicaErr := patroni.REST(replicaPollCtx, http.MethodGet, replicaIP, "/replica", restUser, restPass, nil)
 					if replicaErr == nil && replicaStatus == http.StatusOK {
 						slog.Info("restore goroutine: replica rejoined", "node", replica.Hostname)
 						break
@@ -1170,7 +1167,7 @@ func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 	results := make([]nodeTestResult, 0)
 
 	for _, node := range nodes {
-		if node.Role != "db_only" && node.Role != "hyperconverged" {
+		if !nodestate.IsDBRole(node.Role) {
 			continue
 		}
 		if node.MaintenanceMode {
@@ -1190,13 +1187,7 @@ func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 			continue
 		}
 		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskPGBackRestTestPath), params)
-		if dispErr := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskPGBackRestTestPath,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 15,
-		}); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskPGBackRestTestPath, params, 15, 0); dispErr != nil {
 			results = append(results, nodeTestResult{
 				NodeID:     node.ID.String(),
 				Hostname:   node.Hostname,
@@ -1204,7 +1195,6 @@ func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 			})
 			continue
 		}
-		_ = h.taskResults.SetSent(ctx, taskID)
 		results = append(results, nodeTestResult{
 			NodeID:   node.ID.String(),
 			Hostname: node.Hostname,
@@ -1238,9 +1228,9 @@ func (h *BackupHandler) GetBackupRuns(c echo.Context) error {
 
 func dbRoleNodes(nodes []queries.Node) []queries.Node {
 	out := make([]queries.Node, 0)
-	for _, n := range nodes {
-		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			out = append(out, n)
+	for i := range nodes {
+		if nodestate.IsDBRole(nodes[i].Role) {
+			out = append(out, nodes[i])
 		}
 	}
 	return out
@@ -1252,36 +1242,10 @@ func intendedPrimaryNode(nodes []queries.Node) *queries.Node {
 	var best *queries.Node
 	for i := range nodes {
 		n := &nodes[i]
-		if n.Role != "hyperconverged" && n.Role != "db_only" {
-			continue
-		}
-		if n.AgentStatus != "connected" {
+		if !nodestate.IsDBRole(n.Role) || n.AgentStatus != "connected" {
 			continue
 		}
 		if best == nil || n.FailoverPriority > best.FailoverPriority {
-			best = n
-		}
-	}
-	return best
-}
-
-func primaryDBNode(nodes []queries.Node) *queries.Node {
-	var best *queries.Node
-	for i := range nodes {
-		n := &nodes[i]
-		if n.Role != "hyperconverged" && n.Role != "db_only" {
-			continue
-		}
-		if n.AgentStatus != "connected" {
-			continue
-		}
-		if n.PatroniState != nil {
-			var ps map[string]any
-			if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
-				return n
-			}
-		}
-		if best == nil {
 			best = n
 		}
 	}
@@ -1721,28 +1685,14 @@ func serializeRuns(runs []queries.BackupRun) []map[string]any {
 	return out
 }
 
-// pollTaskSuccess polls the DB every 3 seconds until the task reaches a terminal
-// state (success/failure/timeout), returning true only on success. This avoids
-// the WaitForTask race condition where the task completes before the waiter registers.
-func pollTaskSuccess(ctx context.Context, q *queries.TaskResultQuerier, taskID uuid.UUID, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		t, err := q.GetByTaskID(ctx, taskID)
-		if err == nil {
-			switch t.Status {
-			case "success":
-				return true
-			case "failure", "timeout":
-				return false
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(3 * time.Second):
-		}
+// lockCluster claims the cluster for op, or returns a 409 "cluster is busy"
+// error naming the operation already running there.
+func lockCluster(ops *oplock.Locks, clusterID uuid.UUID, op string) (unlock func(), err error) {
+	unlock, err = ops.TryLock(clusterID, op)
+	if err != nil {
+		return nil, echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
-	return false
+	return unlock, nil
 }
 
 func strVal(s *string) string {

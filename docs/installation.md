@@ -165,8 +165,8 @@ LOG_LEVEL=info
 NETBOX_CONDUCTOR_MASTER_KEY_FILE=/etc/netbox-conductor/master.key
 
 # TLS cert and key — auto-generated as self-signed on first startup if absent.
-# Download the CA from GET /api/v1/downloads/ca.crt and distribute to agent nodes,
-# or set UPDATE_CERT=true on each agent to have it fetched automatically.
+# Agents fetch it on first start (AGENT_TLS_CA_CERT=/etc/netbox-agent/certs/ca.crt, the
+# default), or download it from GET /api/v1/downloads/ca.crt and distribute it yourself.
 TLS_CERT_FILE=/etc/netbox-conductor/tls.crt
 TLS_KEY_FILE=/etc/netbox-conductor/tls.key
 ```
@@ -208,13 +208,31 @@ make build-all && sudo bash deployments/server/install.sh && sudo systemctl rest
    ```
 
 3. The tarball includes the agent binary, `install.sh`, `netbox-agent.service`, `netbox-agent-sudoers`, and `netbox-agent.env.example`
-4. Step 3 in the UI generates a pre-filled env snippet — copy it to `/etc/netbox-agent/netbox-agent.env`, then:
+4. Step 3 in the UI shows three values (`AGENT_NODE_ID`, `AGENT_TOKEN`, `AGENT_SERVER_URL`) — set them in `/etc/netbox-agent/netbox-agent.env`, replacing the existing lines, then:
 
    ```bash
    sudo systemctl start netbox-agent
    ```
 
+#### install.sh options
+
+| Option | Use |
+| --- | --- |
+| `--netbox-root <dir>` | NetBox isn't at `/opt/netbox`. Give the **stable** path — the one a NetBox upgrade keeps pointing at the current version (e.g. a `/srv/netbox` symlink), never a version folder like `/opt/netbox-4.2.0`. |
+| `--db-only` | The node has no NetBox (`db_only` role). |
+| `--fresh-install` | Start over with a blank `.env` (drops the node ID and token), e.g. after deleting the node from the conductor and adding it again. |
+
+The root (or db-only) is saved in the `.env` as `NETBOX_ROOT`, so upgrades just run `sudo bash install.sh` again. To change it, rerun with the new option. The installer stops before changing anything if `<root>/netbox/netbox` doesn't exist.
+
+The `.env` is owned by root (`root:netbox-agent 0640`); the agent can read it but not change it. The agent saves the conductor's CA cert in `/etc/netbox-agent/certs/`, the only folder there it can write. Delete `certs/ca.crt` to make it fetch the cert again on the next start.
+
+#### Re-keying an agent
+
+**Node → Re-key agent…** issues a new token and shows the same three values as Add Node. The old token stops working, so the agent disconnects until you set the new values in its `.env` and run `sudo systemctl restart netbox-agent`. The values are shown once.
+
 ### Option B — Manual
+
+Prefer `install.sh`: it also adds the sudoers lines that let the agent repair its NetBox folder access after a NetBox upgrade (see below).
 
 ```bash
 sudo groupadd --system netbox-agent
@@ -226,10 +244,9 @@ sudo chmod +x /usr/local/bin/netbox-agent
 sudo cp netbox-agent.service /etc/systemd/system/
 sudo install -m 440 netbox-agent-sudoers /etc/sudoers.d/netbox-agent
 
-sudo mkdir -p /etc/netbox-agent
-sudo cp netbox-agent.env.example /etc/netbox-agent/netbox-agent.env
-sudo chown -R netbox-agent:netbox-agent /etc/netbox-agent
-sudo chmod 600 /etc/netbox-agent/netbox-agent.env
+sudo install -d -o root -g netbox-agent -m 750 /etc/netbox-agent
+sudo install -d -o netbox-agent -g netbox-agent -m 750 /etc/netbox-agent/certs
+sudo install -o root -g netbox-agent -m 640 netbox-agent.env.example /etc/netbox-agent/netbox-agent.env
 ```
 
 Edit `/etc/netbox-agent/netbox-agent.env`:
@@ -241,14 +258,13 @@ AGENT_TOKEN=<token from Conductor>
 # WebSocket URL — must use wss:// and include the port if not on 443
 AGENT_SERVER_URL=wss://conductor.example.com:8443/api/v1/agent/connect
 
-# TLS — cert-learning fetches and saves the CA cert automatically on first start
-UPDATE_CERT=true
-# To supply the CA cert manually: UPDATE_CERT=false and set AGENT_TLS_CA_CERT=/etc/netbox-agent/ca.crt
+# TLS — at this path the agent fetches the conductor's CA cert on first start.
+# Point it at your own CA file instead to supply one.
+AGENT_TLS_CA_CERT=/etc/netbox-agent/certs/ca.crt
 # For development only (insecure): AGENT_TLS_SKIP_VERIFY=true
 
-# NetBox paths (adjust to your installation)
-NETBOX_CONFIG_PATH=/opt/netbox/netbox/netbox/configuration.py
-NETBOX_MEDIA_ROOT=/opt/netbox/netbox/media
+# NetBox's stable install path (empty on a db_only node)
+NETBOX_ROOT=/opt/netbox
 
 # Patroni REST API (default is fine for standard install)
 PATRONI_REST_URL=http://127.0.0.1:8008
@@ -296,11 +312,17 @@ The `install.sh` script handles all of these automatically. For reference:
 
 | Path | Setup required |
 | --- | --- |
-| `/opt/netbox/netbox/netbox/` | `usermod -aG netbox netbox-agent` + `chown :netbox <dir>` + `chmod g+ws <dir>` — setgid ensures files written by the agent inherit the `netbox` group and are readable by gunicorn and netbox-rq |
+| `/etc/netbox-agent` | `root:netbox-agent 0750`, `.env` `root:netbox-agent 0640`; `certs/` owned by `netbox-agent` |
+| `<NETBOX_ROOT>/netbox/netbox/` | `usermod -aG netbox netbox-agent` + `chown :netbox <dir>` + `chmod g+ws <dir>` — setgid ensures files written by the agent inherit the `netbox` group and are readable by gunicorn and netbox-rq |
 | `/etc/patroni` | `mkdir -p`, `chown netbox-agent:netbox-agent`, `chmod 750` |
-| Redis Sentinel config | `usermod -aG redis netbox-agent` |
+| Redis and Sentinel config (`/etc/redis`) | `usermod -aG redis netbox-agent` — the agent replaces `redis.conf` and `sentinel.conf` rather than editing them, so only the folder needs to be writable |
+| Media root and extra sync folders | `sudo netbox-agent check-sync-permissions` after configuring File Sync — not run by `install.sh`; see [File Sync](file-sync.md#preparing-folder-permissions) |
 
 > **Important:** The NetBox config directory group must be `netbox` (not `netbox-agent`) so that the `netbox` user running gunicorn and netbox-rq can read `configuration.py` after the agent writes it.
+
+### After a NetBox upgrade
+
+A NetBox upgrade installs a new version folder (e.g. `/opt/netbox-X.Y`) and points the stable root (`/opt/netbox`) at it, so the new config folder and media folder lack the access above. The agent repairs both itself the first time it is denied writing there and logs event `NBC-AGT-005`. The sudoers lines `install.sh` generates allow exactly those commands, on `<NETBOX_ROOT>/netbox/netbox` and `<NETBOX_ROOT>/netbox/media` only. Nothing to do, except: if you use extra File Sync folders, run `sudo netbox-agent check-sync-permissions` again.
 
 ---
 

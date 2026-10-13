@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -19,21 +18,23 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/alerting"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api"
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/handlers"
-	"github.com/averyhabbott/netbox-conductor/internal/server/backupsync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db"
 	dbmigrations "github.com/averyhabbott/netbox-conductor/internal/server/db/migrations"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
-	"github.com/averyhabbott/netbox-conductor/internal/server/partitions"
+	"github.com/averyhabbott/netbox-conductor/internal/server/filesync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
+	"github.com/averyhabbott/netbox-conductor/internal/server/oplock"
+	"github.com/averyhabbott/netbox-conductor/internal/server/partitions"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/server/scheduler"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	syslogfwd "github.com/averyhabbott/netbox-conductor/internal/server/syslog"
 	"github.com/averyhabbott/netbox-conductor/internal/server/tlscert"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/env"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -51,18 +52,18 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	dsn := requireEnv("DATABASE_URL")
-	dbPassword := requireEnv("DB_PASSWORD")
+	dsn := env.Require("DATABASE_URL")
+	dbPassword := env.Require("DB_PASSWORD")
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return fmt.Errorf("invalid DATABASE_URL: %w", err)
 	}
 	u.User = url.UserPassword(u.User.Username(), dbPassword)
 	dsn = u.String()
-	jwtSecret := []byte(requireEnv("JWT_SECRET"))
-	addr := envOr("LISTEN_ADDR", ":8443")
-	serverBindIP := envOr("SERVER_BIND_IP", "")
-	serverURL := envOr("SERVER_URL", "")
+	jwtSecret := []byte(env.Require("JWT_SECRET"))
+	addr := env.Or("LISTEN_ADDR", ":8443")
+	serverBindIP := env.Or("SERVER_BIND_IP", "")
+	serverURL := env.Or("SERVER_URL", "")
 
 	if serverURL == "" && serverBindIP == "" {
 		return fmt.Errorf("SERVER_URL or SERVER_BIND_IP must be set — agents cannot connect without a reachable conductor address")
@@ -96,18 +97,18 @@ func run(ctx context.Context) error {
 			}
 		}
 	}
-	logDir := envOr("LOG_DIR", "/var/log")
-	logName := envOr("LOG_NAME", "netbox-conductor")
-	logLevel := envOr("LOG_LEVEL", "info")
-	agentBinDir := envOr("AGENT_BIN_DIR", "/var/lib/netbox-conductor/bin") // directory holding pre-built agent binaries
-	tlsCertFile := envOr("TLS_CERT_FILE", "/etc/netbox-conductor/tls.crt")
-	tlsKeyFile := envOr("TLS_KEY_FILE", "/etc/netbox-conductor/tls.key")
+	logDir := env.Or("LOG_DIR", "/var/log")
+	logName := env.Or("LOG_NAME", "netbox-conductor")
+	logLevel := env.Or("LOG_LEVEL", "info")
+	agentBinDir := env.Or("AGENT_BIN_DIR", "/var/lib/netbox-conductor/bin") // directory holding pre-built agent binaries
+	tlsCertFile := env.Or("TLS_CERT_FILE", "/etc/netbox-conductor/tls.crt")
+	tlsKeyFile := env.Or("TLS_KEY_FILE", "/etc/netbox-conductor/tls.key")
 
 	// Structured logging — routes all log.Printf calls through slog at Info level.
 	logger := logging.Setup(logDir, logName, logLevel)
 	slog.SetDefault(logger)
 
-	// TLS — generate self-signed ECDSA cert on first run (or when expiring).
+	// TLS — generate self-signed ECDSA cert on first run only (see tlscert).
 	// Falls back to plain HTTP if the cert directory is not writable (e.g. dev).
 	dnsNames, ipAddrs := tlscert.SANsFromServerURL(serverURL)
 	if generated, err := tlscert.EnsureExists(tlsCertFile, tlsKeyFile, dnsNames, ipAddrs); err != nil {
@@ -149,7 +150,6 @@ func run(ctx context.Context) error {
 	regTokQ := queries.NewRegistrationTokenQuerier(store.Pool())
 	stagingTokQ := queries.NewStagingTokenQuerier(store.Pool())
 	stagingAgentQ := queries.NewStagingAgentQuerier(store.Pool())
-	retentionQ := queries.NewRetentionQuerier(store.Pool())
 	backupTargetQ := queries.NewBackupTargetQuerier(store.Pool())
 	backupScheduleQ := queries.NewBackupScheduleQuerier(store.Pool())
 	backupRunQ := queries.NewBackupRunQuerier(store.Pool())
@@ -233,15 +233,18 @@ func run(ctx context.Context) error {
 	eventsHandler := handlers.NewEventsHandler(eventQ, hbQ)
 	syslogHandler := handlers.NewSyslogHandler(syslogDestQ)
 	authHandler := handlers.NewAuthHandler(userQ, refreshQ, jwtSecret, tlsCertFile, tlsKeyFile, serverURL, enc)
-	backupSyncMgr := backupsync.New()
+	fileSyncQ := queries.NewFileSyncQuerier(store.Pool())
+	fileSync := filesync.New(h, dispatcher, taskQ, fileSyncQ)
+	fileSync.SetEmitter(emitter)
 	agentHandler := handlers.NewAgentHandler(h, dispatcher, broker, nodeQ, agentTokQ, regTokQ, stagingTokQ, stagingAgentQ, taskQ, clusterQ, enc, failoverManager, logDir, logName)
 	agentHandler.SetEmitter(emitter)
 	agentHandler.SetHeartbeatQuerier(hbQ)
 	agentHandler.SetCatalogQuerier(backupCatalogQ)
-	agentHandler.SetBackupSyncRouter(backupSyncMgr)
+	agentHandler.SetFileSync(fileSync)
 	stagingHandler := handlers.NewStagingHandler(stagingTokQ, stagingAgentQ, nodeQ, agentTokQ, h, broker)
 	clusterHandler := handlers.NewClusterHandler(clusterQ, nodeQ, regTokQ, h, witnessManager, logDir, logName)
 	clusterHandler.SetEmitter(emitter)
+	clusterHandler.SetFileSyncRecords(fileSyncQ)
 	nodeHandler := handlers.NewNodeHandler(nodeQ, regTokQ, agentTokQ, taskQ, clusterQ, h, dispatcher, broker, serverURL, logDir, logName)
 	nodeHandler.SetFailoverManager(failoverManager)
 	nodeHandler.SetEmitter(emitter)
@@ -250,14 +253,17 @@ func run(ctx context.Context) error {
 	downloadHandler := handlers.NewDownloadHandler(agentBinDir, tlsCertFile)
 	configHandler := handlers.NewConfigHandler(configQ, taskQ, nodeQ, clusterQ, credQ, enc, dispatcher, broker, h)
 	configHandler.SetEmitter(emitter)
-	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, retentionQ, eventQ, patroniSnapshotQ, patroniDesignQ, enc, dispatcher, witnessManager)
+	// One disruptive operation per cluster at a time, shared by every caller.
+	opLocks := oplock.New()
+	patroniHandler := handlers.NewPatroniHandler(clusterQ, nodeQ, credQ, configQ, taskQ, eventQ, patroniSnapshotQ, patroniDesignQ, enc, dispatcher, witnessManager, opLocks)
 	patroniHandler.SetEmitter(emitter)
 	patroniHandler.SetFailoverManager(failoverManager)
-	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, patroniSnapshotQ, patroniDesignQ, enc, dispatcher, h, credQ, witnessManager)
+	backupHandler := handlers.NewBackupHandler(clusterQ, nodeQ, backupTargetQ, backupScheduleQ, backupRunQ, backupCatalogQ, taskQ, patroniSnapshotQ, patroniDesignQ, enc, dispatcher, h, credQ, witnessManager, opLocks)
 	backupHandler.SetEmitter(emitter)
-	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, backupTargetQ, dispatcher, backupSyncMgr)
+	backupScheduler := scheduler.NewBackupScheduler(nodeQ, backupScheduleQ, backupRunQ, taskQ, backupCatalogQ, backupTargetQ, dispatcher, fileSync, opLocks)
 	backupScheduler.SetEmitter(emitter)
 	go backupScheduler.Run(ctx)
+	go scheduler.NewFileSyncScheduler(clusterQ, nodeQ, h, fileSync).Run(ctx)
 	metricsHandler := handlers.NewMetricsHandler(h, clusterQ, nodeQ)
 
 	// Router
@@ -356,7 +362,7 @@ func seedAdminIfEmpty(ctx context.Context, userQ *queries.UserQuerier) error {
 		return nil
 	}
 	password := "changeme123!"
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), handlers.BcryptCost)
 	if err != nil {
 		return err
 	}
@@ -435,19 +441,4 @@ func (r *nameResolver) ResolveNodeName(ctx context.Context, id uuid.UUID) string
 		return ""
 	}
 	return n.Hostname
-}
-
-func requireEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("required environment variable %s is not set", key)
-	}
-	return v
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

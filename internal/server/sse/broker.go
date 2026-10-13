@@ -1,5 +1,5 @@
 // Package sse provides a simple Server-Sent Events broker.
-// The frontend subscribes to GET /api/v1/events and receives real-time
+// The frontend subscribes to GET /api/v1/events/stream and receives real-time
 // updates whenever agent status, heartbeat, or task outcomes change.
 package sse
 
@@ -8,12 +8,17 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 // EventType identifies the kind of SSE event.
 type EventType string
+
+// keepaliveInterval is how often an idle stream gets a comment line, so
+// proxies and browsers don't treat a quiet connection as dead.
+const keepaliveInterval = 30 * time.Second
 
 const (
 	EventNodeStatus    EventType = "node.status"      // agent connected/disconnected
@@ -89,15 +94,26 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 
+	// The stream outlives the server's WriteTimeout, so lift the deadline for it.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
 	_, events, unsub := b.subscribe()
 	defer unsub()
 
-	// Send a heartbeat comment every 30s to keep the connection alive through proxies.
+	keepalive := time.NewTicker(keepaliveInterval)
+	defer keepalive.Stop()
+
 	// The actual data events come from Publish().
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
 		case ev, ok := <-events:
 			if !ok {
 				return

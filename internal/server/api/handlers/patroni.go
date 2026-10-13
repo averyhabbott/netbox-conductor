@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +16,8 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
+	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
+	"github.com/averyhabbott/netbox-conductor/internal/server/oplock"
 	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 	"github.com/google/uuid"
@@ -57,13 +59,13 @@ type PatroniHandler struct {
 	creds          *queries.CredentialQuerier
 	configs        *queries.ConfigQuerier
 	taskResults    *queries.TaskResultQuerier
-	retention      *queries.RetentionQuerier
 	eventQ         *queries.EventQuerier
 	snapshots      *queries.PatroniSnapshotQuerier
 	designs        *queries.PatroniDesignQuerier
 	enc            *crypto.Encryptor
 	dispatcher     *hub.Dispatcher
 	witness        *patroni.WitnessManager
+	ops            *oplock.Locks
 	emitter        events.Emitter
 	failoverMgr    PatroniFailoverManager // optional; wired in after construction
 	deployJobs     sync.Map               // uuid.UUID → *patroniDeployJob
@@ -79,13 +81,13 @@ func NewPatroniHandler(
 	creds *queries.CredentialQuerier,
 	configs *queries.ConfigQuerier,
 	taskResults *queries.TaskResultQuerier,
-	retention *queries.RetentionQuerier,
 	eventQ *queries.EventQuerier,
 	snapshots *queries.PatroniSnapshotQuerier,
 	designs *queries.PatroniDesignQuerier,
 	enc *crypto.Encryptor,
 	dispatcher *hub.Dispatcher,
 	witness *patroni.WitnessManager,
+	ops *oplock.Locks,
 ) *PatroniHandler {
 	return &PatroniHandler{
 		clusters:    clusters,
@@ -93,13 +95,13 @@ func NewPatroniHandler(
 		creds:       creds,
 		configs:     configs,
 		taskResults: taskResults,
-		retention:   retention,
 		eventQ:      eventQ,
 		snapshots:   snapshots,
 		designs:     designs,
 		enc:         enc,
 		dispatcher:  dispatcher,
 		witness:     witness,
+		ops:         ops,
 	}
 }
 
@@ -134,12 +136,7 @@ func (h *PatroniHandler) Topology(c echo.Context) error {
 			AgentStatus: n.AgentStatus,
 		}
 		if n.PatroniState != nil {
-			var ps map[string]any
-			if err := json.Unmarshal(n.PatroniState, &ps); err == nil {
-				if role, ok := ps["role"].(string); ok {
-					nt.PatroniRole = role
-				}
-			}
+			nt.PatroniRole = nodestate.ExtractPatroniRole(n.PatroniState)
 			nt.PatroniState = n.PatroniState
 		}
 		result = append(result, nt)
@@ -154,150 +151,6 @@ func (h *PatroniHandler) Topology(c echo.Context) error {
 		"cluster_id":   clusterID.String(),
 		"witness_addr": witnessAddr,
 		"nodes":        result,
-	})
-}
-
-// PushPatroniConfig renders and pushes patroni.yml to all DB-role nodes.
-// POST /api/v1/clusters/:id/patroni/push-config
-func (h *PatroniHandler) PushPatroniConfig(c echo.Context) error {
-	clusterID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
-	}
-
-	ctx := c.Request().Context()
-
-	cluster, err := h.clusters.GetByID(ctx, clusterID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
-	}
-
-	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
-	}
-
-	// Gather credentials
-	superUser, superPass := CredDefaultUserPostgresSuperuser, ""
-	replicaUser, replicaPass := CredDefaultUserPostgresReplication, ""
-	restUser, restPass := CredDefaultUserPatroniREST, ""
-
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresSuperuser); err == nil {
-		superUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			superPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresReplication); err == nil {
-		replicaUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			replicaPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPatroniREST); err == nil {
-		restUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			restPass = string(pw)
-		}
-	}
-
-	// Build Raft partner list (all nodes with patroni roles)
-	raftPeers := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
-		}
-	}
-
-	witnessAddr := ""
-	if h.witness != nil {
-		witnessAddr = h.witness.Addr(clusterID)
-	}
-
-	type nodeResult struct {
-		NodeID   string `json:"node_id"`
-		Hostname string `json:"hostname"`
-		TaskID   string `json:"task_id,omitempty"`
-		Status   string `json:"status"`
-		Error    string `json:"error,omitempty"`
-	}
-
-	results := make([]nodeResult, 0)
-
-	for _, node := range nodes {
-		if node.Role != "hyperconverged" && node.Role != "db_only" {
-			continue // only push to nodes that run Patroni
-		}
-
-		nodeIP := stripCIDR(node.IPAddress)
-
-		// Build per-node partner list (exclude self)
-		partners := make([]string, 0)
-		for _, p := range raftPeers {
-			if !strings.HasPrefix(p, nodeIP+":") {
-				partners = append(partners, p)
-			}
-		}
-
-		content, err := configgen.RenderPatroni(configgen.PatroniInput{
-			Scope:         cluster.PatroniScope,
-			NodeName:      node.Hostname,
-			NodeAddr:      nodeIP,
-			RaftSelfAddr:  nodeIP + ":" + protocol.PatroniRaftPortStr,
-			RaftPartners:  partners,
-			WitnessAddr:   witnessAddr,
-			RESTUsername:  restUser,
-			RESTPassword:  restPass,
-			DBSuperUser:   superUser,
-			DBSuperPass:   superPass,
-			DBReplicaUser: replicaUser,
-			DBReplicaPass: replicaPass,
-			Priority:      node.FailoverPriority,
-		})
-		if err != nil {
-			results = append(results, nodeResult{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "error", Error: err.Error(),
-			})
-			continue
-		}
-
-		taskID := uuid.New()
-		params, _ := json.Marshal(protocol.PatroniConfigWriteParams{
-			Content:      content,
-			RestartAfter: false,
-		})
-
-		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskWritePatroniConf), params)
-
-		if err := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskWritePatroniConf,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 30,
-		}); err != nil {
-			results = append(results, nodeResult{
-				NodeID: node.ID.String(), Hostname: node.Hostname,
-				Status: "offline", Error: err.Error(),
-			})
-			continue
-		}
-
-		_ = h.taskResults.SetSent(ctx, taskID)
-		results = append(results, nodeResult{
-			NodeID: node.ID.String(), Hostname: node.Hostname,
-			TaskID: taskID.String(), Status: "dispatched",
-		})
-	}
-
-	if h.emitter != nil {
-		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodePatroniConfigured,
-			"Patroni config pushed to cluster", actorFromCtx(c)).Cluster(clusterID).Build())
-	}
-
-	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id": clusterID.String(),
-		"nodes":      results,
 	})
 }
 
@@ -325,14 +178,9 @@ func (h *PatroniHandler) Switchover(c echo.Context) error {
 	// Find primary (patroni_state.role == "primary")
 	var primaryNode *queries.Node
 	for i := range nodes {
-		if nodes[i].PatroniState != nil {
-			var ps map[string]any
-			if err := json.Unmarshal(nodes[i].PatroniState, &ps); err == nil {
-				if ps["role"] == "primary" {
-					primaryNode = &nodes[i]
-					break
-				}
-			}
+		if nodestate.ExtractPatroniRole(nodes[i].PatroniState) == "primary" {
+			primaryNode = &nodes[i]
+			break
 		}
 	}
 
@@ -341,13 +189,7 @@ func (h *PatroniHandler) Switchover(c echo.Context) error {
 	}
 
 	// Fetch Patroni REST credentials.
-	var restUser, restPass string
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
-		restUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			restPass = string(pw)
-		}
-	}
+	restUser, restPass := patroniCreds(ctx, h.creds, h.enc, clusterID)
 
 	// Call the Patroni REST API directly — no agent exec.run required.
 	primaryIP := stripCIDR(primaryNode.IPAddress)
@@ -356,22 +198,15 @@ func (h *PatroniHandler) Switchover(c echo.Context) error {
 		switchBody["candidate"] = req.Candidate
 	}
 	bodyBytes, _ := json.Marshal(switchBody)
-	patroniURL := fmt.Sprintf("http://%s:%d/switchover", primaryIP, protocol.PatroniRESTPort)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, patroniURL, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build switchover request")
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.SetBasicAuth(restUser, restPass)
-	resp, err := http.DefaultClient.Do(httpReq)
+	switchCtx, cancel := context.WithTimeout(ctx, patroni.SwitchTimeout)
+	defer cancel()
+	respBody, status, err := patroni.REST(switchCtx, http.MethodPost, primaryIP, "/switchover", restUser, restPass, bodyBytes)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadGateway, "patroni switchover request failed: "+err.Error())
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return echo.NewHTTPError(http.StatusBadGateway,
-			fmt.Sprintf("patroni switchover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
+			fmt.Sprintf("patroni switchover returned %d: %s", status, strings.TrimSpace(string(respBody))))
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
@@ -405,13 +240,7 @@ func (h *PatroniHandler) StartWitness(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
 
-	partners := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			partners = append(partners, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
-		}
-	}
-
+	partners := patroniRaftPeers(nodes)
 	if err := h.witness.Start(clusterID, partners); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to start witness: "+err.Error())
 	}
@@ -531,7 +360,7 @@ func (h *PatroniHandler) PushPatroniConfigNode(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "node not found")
 	}
-	if node.Role != "hyperconverged" && node.Role != "db_only" {
+	if !nodestate.IsDBRole(node.Role) {
 		return echo.NewHTTPError(http.StatusBadRequest, "node does not run Patroni (role must be hyperconverged or db_only)")
 	}
 
@@ -540,79 +369,20 @@ func (h *PatroniHandler) PushPatroniConfigNode(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
 
-	superUser, superPass := "postgres", ""
-	replicaUser, replicaPass := "replicator", ""
-	restUser, restPass := "patroni", ""
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_superuser"); err == nil {
-		superUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			superPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "postgres_replication"); err == nil {
-		replicaUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			replicaPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
-		restUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			restPass = string(pw)
-		}
-	}
-
-	nodeIP := stripCIDR(node.IPAddress)
-	allPeers := make([]string, 0)
-	for _, n := range allNodes {
-		if n.Role == "hyperconverged" || n.Role == "db_only" {
-			allPeers = append(allPeers, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
-		}
-	}
-	partners := make([]string, 0)
-	for _, p := range allPeers {
-		if !strings.HasPrefix(p, nodeIP+":") {
-			partners = append(partners, p)
-		}
-	}
-
-	witnessAddr := ""
+	in := patroniClusterInput(ctx, h.creds, h.enc, cluster)
 	if h.witness != nil {
-		witnessAddr = h.witness.Addr(clusterID)
+		in.WitnessAddr = h.witness.Addr(clusterID)
 	}
-
-	content, err := configgen.RenderPatroni(configgen.PatroniInput{
-		Scope:         cluster.PatroniScope,
-		NodeName:      node.Hostname,
-		NodeAddr:      nodeIP,
-		RaftSelfAddr:  nodeIP + ":" + protocol.PatroniRaftPortStr,
-		RaftPartners:  partners,
-		WitnessAddr:   witnessAddr,
-		RESTUsername:  restUser,
-		RESTPassword:  restPass,
-		DBSuperUser:   superUser,
-		DBSuperPass:   superPass,
-		DBReplicaUser: replicaUser,
-		DBReplicaPass: replicaPass,
-	})
+	content, err := renderPatroniFor(in, patroniRaftPeers(allNodes), *node)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to render patroni config: "+err.Error())
 	}
 
 	taskID := uuid.New()
 	params, _ := json.Marshal(protocol.PatroniConfigWriteParams{Content: content, RestartAfter: false})
-	_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskWritePatroniConf), params)
-
-	if err := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskWritePatroniConf,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 30,
-	}); err != nil {
+	if err := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskWritePatroniConf, params, 30, 0); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+err.Error())
 	}
-
-	_ = h.taskResults.SetSent(ctx, taskID)
 	return c.JSON(http.StatusAccepted, map[string]any{
 		"task_id":  taskID.String(),
 		"node_id":  node.ID.String(),
@@ -662,18 +432,9 @@ func (h *PatroniHandler) DBRestore(c echo.Context) error {
 		PatroniScope: cluster.PatroniScope,
 	})
 
-	_ = h.taskResults.Create(ctx, nid, taskID, string(protocol.TaskDBRestore), params)
-
-	if err := h.dispatcher.Dispatch(nid, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskDBRestore,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 3600,
-	}); err != nil {
+	if err := h.dispatcher.DispatchTask(ctx, h.taskResults, nid, taskID, protocol.TaskDBRestore, params, 3600, 0); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+err.Error())
 	}
-
-	_ = h.taskResults.SetSent(ctx, taskID)
 	return c.JSON(http.StatusAccepted, map[string]any{
 		"task_id":  taskID.String(),
 		"node_id":  nid.String(),
@@ -721,14 +482,9 @@ func (h *PatroniHandler) PushSentinelConfig(c echo.Context) error {
 	// Determine master seed: first node with patroni_state.role == "primary", else first node
 	masterHost := ""
 	for _, n := range nodes {
-		if n.PatroniState != nil {
-			var ps map[string]any
-			if err := json.Unmarshal(n.PatroniState, &ps); err == nil {
-				if ps["role"] == "primary" {
-					masterHost = stripCIDR(n.IPAddress)
-					break
-				}
-			}
+		if nodestate.ExtractPatroniRole(n.PatroniState) == "primary" {
+			masterHost = stripCIDR(n.IPAddress)
+			break
 		}
 	}
 	if masterHost == "" && len(nodes) > 0 {
@@ -769,22 +525,13 @@ func (h *PatroniHandler) PushSentinelConfig(c echo.Context) error {
 			RestartAfter: req.RestartAfter,
 		})
 
-		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskWriteSentinelConf), params)
-
-		if err := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskWriteSentinelConf,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 30,
-		}); err != nil {
+		if err := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskWriteSentinelConf, params, 30, 0); err != nil {
 			results = append(results, nodeResult{
 				NodeID: node.ID.String(), Hostname: node.Hostname,
 				Status: "offline", Error: err.Error(),
 			})
 			continue
 		}
-
-		_ = h.taskResults.SetSent(ctx, taskID)
 		results = append(results, nodeResult{
 			NodeID: node.ID.String(), Hostname: node.Hostname,
 			TaskID: taskID.String(), Status: "dispatched",
@@ -840,13 +587,7 @@ func (h *PatroniHandler) Failover(c echo.Context) error {
 	}
 
 	// Fetch Patroni REST credentials.
-	var restUser, restPass string
-	if cred, err := h.creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
-		restUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			restPass = string(pw)
-		}
-	}
+	restUser, restPass := patroniCreds(ctx, h.creds, h.enc, clusterID)
 
 	// Call POST /failover on the target node's Patroni REST API.
 	targetIP := stripCIDR(targetNode.IPAddress)
@@ -855,22 +596,15 @@ func (h *PatroniHandler) Failover(c echo.Context) error {
 		failBody["candidate"] = req.Candidate
 	}
 	bodyBytes, _ := json.Marshal(failBody)
-	patroniURL := fmt.Sprintf("http://%s:%d/failover", targetIP, protocol.PatroniRESTPort)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, patroniURL, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build failover request")
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.SetBasicAuth(restUser, restPass)
-	resp, err := http.DefaultClient.Do(httpReq)
+	switchCtx, cancel := context.WithTimeout(ctx, patroni.SwitchTimeout)
+	defer cancel()
+	respBody, status, err := patroni.REST(switchCtx, http.MethodPost, targetIP, "/failover", restUser, restPass, bodyBytes)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadGateway, "patroni failover request failed: "+err.Error())
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return echo.NewHTTPError(http.StatusBadGateway,
-			fmt.Sprintf("patroni failover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
+			fmt.Sprintf("patroni failover returned %d: %s", status, strings.TrimSpace(string(respBody))))
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
@@ -912,16 +646,9 @@ func (h *PatroniHandler) InstallPatroni(c echo.Context) error {
 		PackageManager: req.PackageManager,
 		InstallCmd:     req.InstallCmd,
 	})
-	_ = h.taskResults.Create(ctx, nid, taskID, string(protocol.TaskInstallPatroni), params)
-
-	if err := h.dispatcher.Dispatch(nid, protocol.TaskDispatchPayload{
-		TaskID: taskID.String(), TaskType: protocol.TaskInstallPatroni,
-		Params: json.RawMessage(params), TimeoutSecs: 300,
-	}); err != nil {
+	if err := h.dispatcher.DispatchTask(ctx, h.taskResults, nid, taskID, protocol.TaskInstallPatroni, params, 300, 0); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+err.Error())
 	}
-
-	_ = h.taskResults.SetSent(ctx, taskID)
 	return c.JSON(http.StatusAccepted, map[string]any{
 		"task_id":  taskID.String(),
 		"node_id":  nid.String(),
@@ -930,119 +657,32 @@ func (h *PatroniHandler) InstallPatroni(c echo.Context) error {
 	})
 }
 
-// GetRetentionPolicy returns the backup retention policy for a cluster.
-// GET /api/v1/clusters/:id/retention-policy
-func (h *PatroniHandler) GetRetentionPolicy(c echo.Context) error {
-	clusterID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
-	}
-	policy, err := h.retention.Get(c.Request().Context(), clusterID)
-	if err != nil {
-		return c.JSON(http.StatusOK, map[string]any{
-			"cluster_id": clusterID.String(), "retention_days": 7, "expire_cmd": "",
-		})
-	}
-	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id":     policy.ClusterID.String(),
-		"retention_days": policy.RetentionDays,
-		"expire_cmd":     policy.ExpireCmd,
-		"updated_at":     policy.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-	})
-}
+// Waits in Configure Failover's background replica job. The job's overall
+// limit is derived from these (cfJobBudget), so change them here only.
+const (
+	cfPollTimeout        = 10 * time.Second // each Patroni REST poll
+	cfPollSleep          = 5 * time.Second  // longest pause between polls
+	cfSnapshotTimeout    = 10 * time.Second // snapshotPatroniConfig / recordPostChangeSnapshot
+	cfPrimaryElectWait   = 90 * time.Second
+	cfPrimaryRestartCall = 30 * time.Second
+	cfPrimaryRestartWait = 5 * time.Second
+	cfPrimaryReadyWait   = 60 * time.Second
+	cfDCSPatchCall       = 15 * time.Second
+	cfReplicaUpWait      = 60 * time.Second
+	cfReinitCall         = 15 * time.Second
+	cfStreamingWait      = 120 * time.Second
+)
 
-// SetRetentionPolicy creates or updates the backup retention policy for a cluster.
-// PUT /api/v1/clusters/:id/retention-policy
-func (h *PatroniHandler) SetRetentionPolicy(c echo.Context) error {
-	clusterID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
-	}
-	var req struct {
-		RetentionDays int    `json:"retention_days"`
-		ExpireCmd     string `json:"expire_cmd"`
-	}
-	if err := c.Bind(&req); err != nil || req.RetentionDays <= 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "retention_days must be a positive integer")
-	}
-	policy, err := h.retention.Upsert(c.Request().Context(), clusterID, req.RetentionDays, req.ExpireCmd)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to save retention policy")
-	}
-	return c.JSON(http.StatusOK, map[string]any{
-		"cluster_id":     policy.ClusterID.String(),
-		"retention_days": policy.RetentionDays,
-		"expire_cmd":     policy.ExpireCmd,
-		"updated_at":     policy.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-	})
-}
-
-// EnforceRetention dispatches a pgbackrest expire task to the primary DB node.
-// POST /api/v1/clusters/:id/retention-policy/enforce
-func (h *PatroniHandler) EnforceRetention(c echo.Context) error {
-	clusterID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
-	}
-	ctx := c.Request().Context()
-	cluster, err := h.clusters.GetByID(ctx, clusterID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
-	}
-	policy, _ := h.retention.Get(ctx, clusterID)
-
-	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
-	}
-
-	var targetNode *queries.Node
-	for i := range nodes {
-		n := &nodes[i]
-		if n.AgentStatus != "connected" || (n.Role != "hyperconverged" && n.Role != "db_only") {
-			continue
-		}
-		if targetNode == nil {
-			targetNode = n
-		}
-		if n.PatroniState != nil {
-			var ps map[string]any
-			if err := json.Unmarshal(n.PatroniState, &ps); err == nil && ps["role"] == "primary" {
-				targetNode = n
-				break
-			}
-		}
-	}
-	if targetNode == nil {
-		return echo.NewHTTPError(http.StatusConflict, "no connected DB node found")
-	}
-
-	expireCmd := ""
-	if policy != nil {
-		expireCmd = policy.ExpireCmd
-	}
-
-	taskID := uuid.New()
-	params, _ := json.Marshal(protocol.EnforceRetentionParams{
-		PatroniScope: cluster.PatroniScope,
-		ExpireCmd:    expireCmd,
-	})
-	_ = h.taskResults.Create(ctx, targetNode.ID, taskID, string(protocol.TaskEnforceRetention), params)
-
-	if err := h.dispatcher.Dispatch(targetNode.ID, protocol.TaskDispatchPayload{
-		TaskID: taskID.String(), TaskType: protocol.TaskEnforceRetention,
-		Params: json.RawMessage(params), TimeoutSecs: 300,
-	}); err != nil {
-		return echo.NewHTTPError(http.StatusConflict, "target node is not connected: "+err.Error())
-	}
-
-	_ = h.taskResults.SetSent(ctx, taskID)
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"task_id":  taskID.String(),
-		"node_id":  targetNode.ID.String(),
-		"hostname": targetNode.Hostname,
-		"status":   "dispatched",
-	})
+// cfJobBudget is the sum of every wait in the background job. Replicas are
+// handled one after another, so the budget grows with their number. A poll
+// loop can overrun its deadline by one poll plus one pause.
+func cfJobBudget(replicas int) time.Duration {
+	overrun := cfPollTimeout + cfPollSleep
+	primary := cfPrimaryElectWait + overrun +
+		cfPrimaryRestartCall + cfPrimaryRestartWait + cfPrimaryReadyWait + overrun +
+		2*cfSnapshotTimeout + cfDCSPatchCall
+	perReplica := cfReplicaUpWait + overrun + cfReinitCall + cfStreamingWait + overrun
+	return primary + time.Duration(replicas)*perReplica
 }
 
 // ConfigureFailover is the single-button HA setup endpoint.
@@ -1086,6 +726,17 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 
 	ctx := c.Request().Context()
 
+	unlock, err := lockCluster(h.ops, clusterID, "Configure Failover")
+	if err != nil {
+		return err
+	}
+	bgOwnsLock := false // the background replica job, when started, releases the lock
+	defer func() {
+		if !bgOwnsLock {
+			unlock()
+		}
+	}()
+
 	slog.Info("configure-failover: request received",
 		"cluster", clusterID,
 		"auto_failover", req.AutoFailover,
@@ -1107,6 +758,10 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	}
 	if len(nodes) < 2 {
 		return echo.NewHTTPError(http.StatusBadRequest, "cluster must have at least 2 nodes before configuring failover")
+	}
+	// Only nodes that run PostgreSQL join Patroni; app nodes just get configuration.py.
+	if !slices.ContainsFunc(nodes, func(n queries.Node) bool { return nodestate.IsDBRole(n.Role) }) {
+		return echo.NewHTTPError(http.StatusBadRequest, "cluster has no database node (hyperconverged or db_only)")
 	}
 
 	// Persist failover settings
@@ -1138,59 +793,17 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		{CredKindRedisTasks, "", nil},
 	} {
 		if _, err := h.creds.GetByKind(ctx, clusterID, def.kind); err != nil {
-			raw, genErr := crypto.GenerateToken(32)
-			if genErr != nil {
-				warnings = append(warnings, fmt.Sprintf("could not generate %s credential: %v", def.kind, genErr))
-				continue
-			}
-			enc, encErr := h.enc.Encrypt([]byte(raw))
-			if encErr != nil {
-				warnings = append(warnings, fmt.Sprintf("could not encrypt %s credential: %v", def.kind, encErr))
-				continue
-			}
-			if err := h.creds.Upsert(ctx, queries.UpsertCredentialParams{
-				ClusterID:   clusterID,
-				Kind:        def.kind,
-				Username:    def.username,
-				PasswordEnc: enc,
-				DBName:      def.dbName,
-			}); err != nil {
-				slog.Warn("configure-failover: failed to store auto-generated credential",
+			if _, err := generateCredential(ctx, h.creds, h.enc, clusterID, def.kind, def.username, def.dbName); err != nil {
+				slog.Warn("configure-failover: failed to auto-generate credential",
 					"cluster", clusterID, "kind", def.kind, "error", err)
-				warnings = append(warnings, fmt.Sprintf("failed to store %s credential: %v", def.kind, err))
+				warnings = append(warnings, fmt.Sprintf("could not generate %s credential: %v", def.kind, err))
 			}
 		}
 	}
 
 	// Decrypt credentials for config rendering
-	superUser, superPass := CredDefaultUserPostgresSuperuser, ""
-	replicaUser, replicaPass := CredDefaultUserPostgresReplication, ""
-	restUser, restPass := CredDefaultUserPatroniREST, ""
-	redisPassword := ""
-
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresSuperuser); err == nil {
-		superUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			superPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPostgresReplication); err == nil {
-		replicaUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			replicaPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindPatroniREST); err == nil {
-		restUser = cred.Username
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			restPass = string(pw)
-		}
-	}
-	if cred, err := h.creds.GetByKind(ctx, clusterID, CredKindRedisTasks); err == nil {
-		if pw, err := h.enc.Decrypt(cred.PasswordEnc); err == nil {
-			redisPassword = string(pw)
-		}
-	}
+	patroniIn := patroniClusterInput(ctx, h.creds, h.enc, cluster)
+	_, redisPassword := h.creds.GetDecrypted(ctx, h.enc, clusterID, CredKindRedisTasks, "")
 
 	// Identify primary using the following priority chain:
 	//  1. Explicit override — primary_node_id in the request body.
@@ -1216,18 +829,18 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		if primaryNode == nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "primary_node_id does not belong to this cluster")
 		}
+		if !nodestate.IsDBRole(primaryNode.Role) {
+			return echo.NewHTTPError(http.StatusBadRequest, "primary_node_id must be a hyperconverged or db_only node")
+		}
 	}
 
 	// (2) Patroni state
 	if primaryNode == nil {
 		for i := range nodes {
 			n := &nodes[i]
-			if n.PatroniState != nil {
-				var ps map[string]any
-				if json.Unmarshal(n.PatroniState, &ps) == nil && ps["role"] == "primary" {
-					primaryNode = n
-					break
-				}
+			if nodestate.IsDBRole(n.Role) && nodestate.ExtractPatroniRole(n.PatroniState) == "primary" {
+				primaryNode = n
+				break
 			}
 		}
 	}
@@ -1236,7 +849,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	if primaryNode == nil {
 		for i := range nodes {
 			n := &nodes[i]
-			if n.NetboxRunning == nil || !*n.NetboxRunning || n.AgentStatus != "connected" {
+			if !nodestate.IsDBRole(n.Role) || n.NetboxRunning == nil || !*n.NetboxRunning || n.AgentStatus != "connected" {
 				continue
 			}
 			if primaryNode == nil || n.FailoverPriority > primaryNode.FailoverPriority {
@@ -1247,15 +860,12 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 
 	if primaryNode == nil {
 		return echo.NewHTTPError(http.StatusConflict,
-			"cannot identify primary node: no connected node reports netbox_running=true or patroni role=primary. "+
-				"Ensure at least one node is connected and running NetBox.")
+			"cannot identify primary node: no connected database node (hyperconverged or db_only) reports "+
+				"netbox_running=true or patroni role=primary. Ensure one is connected and running NetBox, or choose the primary explicitly.")
 	}
 
-	// Build Raft peer list (all nodes participate in Raft consensus)
-	raftPeers := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		raftPeers = append(raftPeers, stripCIDR(n.IPAddress)+":"+protocol.PatroniRaftPortStr)
-	}
+	// Database nodes participate in Raft consensus.
+	raftPeers := patroniRaftPeers(nodes)
 
 	// Start witness on conductor (idempotent — no-op if already running)
 	witnessAddr := ""
@@ -1266,6 +876,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			warnings = append(warnings, "witness start failed: "+err.Error())
 		} else {
 			witnessAddr = h.witness.Addr(clusterID)
+			patroniIn.WitnessAddr = witnessAddr
 			slog.Info("configure-failover: Patroni witness started",
 				"cluster", clusterID, "witness_addr", witnessAddr)
 		}
@@ -1287,16 +898,9 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	mkDispatch := func(useCtx context.Context) func(uuid.UUID, protocol.TaskType, []byte, int) (string, error) {
 		return func(nodeID uuid.UUID, taskType protocol.TaskType, params []byte, timeoutSecs int) (string, error) {
 			tid := uuid.New()
-			_ = h.taskResults.Create(useCtx, nodeID, tid, string(taskType), params)
-			if err := h.dispatcher.Dispatch(nodeID, protocol.TaskDispatchPayload{
-				TaskID:      tid.String(),
-				TaskType:    taskType,
-				Params:      json.RawMessage(params),
-				TimeoutSecs: timeoutSecs,
-			}); err != nil {
+			if err := h.dispatcher.DispatchTask(useCtx, h.taskResults, nodeID, tid, taskType, params, timeoutSecs, 0); err != nil {
 				return "", err
 			}
-			_ = h.taskResults.SetSent(useCtx, tid)
 			return tid.String(), nil
 		}
 	}
@@ -1339,16 +943,16 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// instance, avoiding the race where Patroni is mid-bootstrap when psql runs.
 	// The pgrole executor retries for up to 120 seconds as a safety net.
 	rp, _ := json.Marshal(protocol.CreatePgRoleParams{
-		RoleName: replicaUser,
-		Password: replicaPass,
+		RoleName: patroniIn.DBReplicaUser,
+		Password: patroniIn.DBReplicaPass,
 		Options:  []string{"LOGIN", "REPLICATION"},
 	})
 	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, rp, 150); err != nil {
 		dispatchWarn(err, "create replicator role")
 	}
 	sp, _ := json.Marshal(protocol.CreatePgRoleParams{
-		RoleName: superUser,
-		Password: superPass,
+		RoleName: patroniIn.DBSuperUser,
+		Password: patroniIn.DBSuperPass,
 		Options:  []string{},
 	})
 	if _, err := dispatch(primaryNode.ID, protocol.TaskCreatePgRole, sp, 150); err != nil {
@@ -1359,7 +963,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// in a clean, writable state when pg_dump executes.
 	var backupTask *taskRef
 	if req.SaveBackup {
-		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: superUser})
+		bp, _ := json.Marshal(protocol.DBBackupParams{DBName: "netbox", DBUser: patroniIn.DBSuperUser})
 		tid, err := dispatch(primaryNode.ID, protocol.TaskDBBackup, bp, 600)
 		if err != nil {
 			dispatchWarn(err, "backup")
@@ -1384,7 +988,6 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// dispatchPatroniForNode renders and dispatches stop_postgresql→install→write_config→restart for one node.
 	dispatchPatroniForNode := func(d func(uuid.UUID, protocol.TaskType, []byte, int) (string, error), node queries.Node) []taskRef {
 		refs := make([]taskRef, 0, 4)
-		nodeIP := stripCIDR(node.IPAddress)
 
 		// Stop the systemd-managed postgres before Patroni takes over. Without this,
 		// Patroni can't start its own postgres process because the old one holds shared memory.
@@ -1403,27 +1006,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 		}
 		refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, TaskID: tid, Status: "dispatched"})
 
-		partners := make([]string, 0, len(raftPeers)-1)
-		for _, p := range raftPeers {
-			if !strings.HasPrefix(p, nodeIP+":") {
-				partners = append(partners, p)
-			}
-		}
-		content, err := configgen.RenderPatroni(configgen.PatroniInput{
-			Scope:         cluster.PatroniScope,
-			NodeName:      node.Hostname,
-			NodeAddr:      nodeIP,
-			RaftSelfAddr:  nodeIP + ":" + protocol.PatroniRaftPortStr,
-			RaftPartners:  partners,
-			WitnessAddr:   witnessAddr,
-			RESTUsername:  restUser,
-			RESTPassword:  restPass,
-			DBSuperUser:   superUser,
-			DBSuperPass:   superPass,
-			DBReplicaUser: replicaUser,
-			DBReplicaPass: replicaPass,
-			Priority:      node.FailoverPriority,
-		})
+		content, err := renderPatroniFor(patroniIn, raftPeers, node)
 		if err != nil {
 			refs = append(refs, taskRef{NodeID: node.ID.String(), Hostname: node.Hostname, Status: "error", Error: "render: " + err.Error()})
 			return refs
@@ -1582,15 +1165,21 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 	// a race where a replica with an existing PostgreSQL data directory wins the initial
 	// Raft leader election before the intended primary can establish itself.
 	replicaNodes := make([]queries.Node, 0, len(nodes)-1)
+	appNodes := make([]queries.Node, 0)
 	for _, node := range nodes {
-		if node.ID != primaryNode.ID {
+		switch {
+		case node.ID == primaryNode.ID:
+		case nodestate.IsDBRole(node.Role):
 			replicaNodes = append(replicaNodes, node)
+		default:
+			appNodes = append(appNodes, node)
 		}
 	}
-	if len(replicaNodes) > 0 {
-		go func(replicas []queries.Node, primaryNodeID uuid.UUID, primaryIP, restU, restP string) {
-			// Overall backstop: derived from poll ceilings (90s + 65s) plus buffer.
-			bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	if len(replicaNodes) > 0 || len(appNodes) > 0 {
+		bgOwnsLock = true
+		go func(replicas, appNodes []queries.Node, primaryNodeID uuid.UUID, primaryIP, restU, restP string) {
+			defer unlock()
+			bgCtx, bgCancel := context.WithTimeout(context.Background(), cfJobBudget(len(replicas)))
 			defer bgCancel()
 
 			bgDispatch := mkDispatch(bgCtx)
@@ -1607,10 +1196,11 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			}
 
 			// Poll GET /primary — returns 200 when this node is the Patroni leader.
-			deadline := time.Now().Add(90 * time.Second)
+			primaryUp := false
+			deadline := time.Now().Add(cfPrimaryElectWait)
 			for time.Now().Before(deadline) {
-				pollCtx, pollCancel := context.WithTimeout(bgCtx, 10*time.Second)
-				body, status, err := patroniREST(pollCtx, http.MethodGet, primaryIP, "/primary", restU, restP, nil)
+				pollCtx, pollCancel := context.WithTimeout(bgCtx, cfPollTimeout)
+				body, status, err := patroni.REST(pollCtx, http.MethodGet, primaryIP, "/primary", restU, restP, nil)
 				pollCancel()
 				if err == nil && status == http.StatusOK {
 					var patroniState struct {
@@ -1618,15 +1208,19 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					}
 					_ = json.Unmarshal(body, &patroniState)
 					if patroniState.State == "running" {
+						primaryUp = true
 						break
 					}
 				}
-				time.Sleep(5 * time.Second)
+				time.Sleep(cfPollSleep)
 			}
 
-			if bgCtx.Err() != nil {
+			if !primaryUp {
 				slog.Error("configure-failover: background goroutine timed out waiting for primary election",
 					"cluster", clusterID, "primary", primaryIP)
+				if h.emitter == nil {
+					return
+				}
 				h.emitter.Emit(events.New(events.CategoryHA, events.SeverityError,
 					"NBC-HA-REPLICA-CONFIGURE-TIMEOUT",
 					"replica Patroni configuration timed out waiting for primary election — replicas may need manual intervention",
@@ -1645,15 +1239,15 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			// wal_log_hints) that require a PostgreSQL restart. Patroni detects these
 			// as "pending restart" but won't apply them automatically; we must call
 			// POST /restart on the primary so replicas can connect for pg_basebackup.
-			restartCtx, restartCancel := context.WithTimeout(bgCtx, 30*time.Second)
-			if _, _, err := patroniREST(restartCtx, http.MethodPost, primaryIP, "/restart",
+			restartCtx, restartCancel := context.WithTimeout(bgCtx, cfPrimaryRestartCall)
+			if _, _, err := patroni.REST(restartCtx, http.MethodPost, primaryIP, "/restart",
 				restU, restP, []byte(`{"restart_pending":true}`)); err == nil {
 				// Give PostgreSQL time to stop then start, then wait for primary to be ready.
-				time.Sleep(5 * time.Second)
-				deadline2 := time.Now().Add(60 * time.Second)
+				time.Sleep(cfPrimaryRestartWait)
+				deadline2 := time.Now().Add(cfPrimaryReadyWait)
 				for time.Now().Before(deadline2) {
-					pollCtx, pollCancel := context.WithTimeout(bgCtx, 10*time.Second)
-					_, status, err := patroniREST(pollCtx, http.MethodGet, primaryIP, "/primary", restU, restP, nil)
+					pollCtx, pollCancel := context.WithTimeout(bgCtx, cfPollTimeout)
+					_, status, err := patroni.REST(pollCtx, http.MethodGet, primaryIP, "/primary", restU, restP, nil)
 					pollCancel()
 					if err == nil && status == http.StatusOK {
 						break
@@ -1687,7 +1281,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					},
 				},
 			})
-			patchCtx, patchCancel := context.WithTimeout(bgCtx, 15*time.Second)
+			patchCtx, patchCancel := context.WithTimeout(bgCtx, cfDCSPatchCall)
 			if _, patchStatus, patchErr := patroniPATCHConfigAudited(patchCtx, h.taskResults, primaryNodeID, primaryIP,
 				restU, restP, configPatch, "configure-failover"); patchErr != nil || patchStatus >= 300 {
 				slog.Warn("configure-failover: PATCH /config failed", "primary", primaryIP,
@@ -1708,20 +1302,35 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 			patchCancel()
 
 			for _, node := range replicas {
-				dispatchPatroniForNode(bgDispatch, node)
-
 				replicaIP := stripCIDR(node.IPAddress)
 
-				// Wait for Patroni to come up on the replica before triggering reinitialize.
-				reinitDeadline := time.Now().Add(60 * time.Second)
+				// These tasks restart Patroni on the replica. Wait for them to finish, then
+				// for Patroni to answer; otherwise /reinitialize hits a stopping Patroni (503).
+				reinitDeadline := time.Now().Add(cfReplicaUpWait)
+				setupOK := true
+				for _, ref := range dispatchPatroniForNode(bgDispatch, node) {
+					id, err := uuid.Parse(ref.TaskID)
+					if err != nil || !h.taskResults.WaitSuccess(bgCtx, id, time.Until(reinitDeadline)) {
+						setupOK = false
+						break
+					}
+				}
+				if !setupOK {
+					slog.Error("configure-failover: Patroni setup on replica failed or timed out — skipping replica",
+						"replica", node.Hostname)
+					emit(events.SeverityWarn,
+						"replica "+node.Hostname+" Patroni setup failed or did not finish within "+cfReplicaUpWait.String()+" — needs manual intervention to join cluster")
+					continue
+				}
 				for time.Now().Before(reinitDeadline) {
 					if bgCtx.Err() != nil {
 						break
 					}
-					pollCtx, pollCancel := context.WithTimeout(bgCtx, 10*time.Second)
-					_, _, err := patroniREST(pollCtx, http.MethodGet, replicaIP, "/", restU, restP, nil)
+					pollCtx, pollCancel := context.WithTimeout(bgCtx, cfPollTimeout)
+					// /patroni answers 200 on any running member; "/" is 503 on every replica.
+					_, status, err := patroni.REST(pollCtx, http.MethodGet, replicaIP, "/patroni", restU, restP, nil)
 					pollCancel()
-					if err == nil {
+					if err == nil && status == http.StatusOK {
 						break
 					}
 					time.Sleep(3 * time.Second)
@@ -1732,8 +1341,8 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				// looks "okay enough" — without it, stale credentials from a prior
 				// bootstrap leave a non-replicating replica untouched.
 				if bgCtx.Err() == nil {
-					reinitCtx, reinitCancel := context.WithTimeout(bgCtx, 15*time.Second)
-					_, status, err := patroniREST(reinitCtx, http.MethodPost, replicaIP, "/reinitialize",
+					reinitCtx, reinitCancel := context.WithTimeout(bgCtx, cfReinitCall)
+					_, status, err := patroni.REST(reinitCtx, http.MethodPost, replicaIP, "/reinitialize",
 						restU, restP, []byte(`{"force": true}`))
 					reinitCancel()
 					if err != nil {
@@ -1760,13 +1369,13 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				// which stays true even when streaming is broken (e.g., bad creds).
 				streamingVerified := false
 				var lastState string
-				replicaReadyDeadline := time.Now().Add(120 * time.Second)
+				replicaReadyDeadline := time.Now().Add(cfStreamingWait)
 				for time.Now().Before(replicaReadyDeadline) {
 					if bgCtx.Err() != nil {
 						break
 					}
-					pollCtx, pollCancel := context.WithTimeout(bgCtx, 10*time.Second)
-					body, status, err := patroniREST(pollCtx, http.MethodGet, primaryIP, "/cluster", restU, restP, nil)
+					pollCtx, pollCancel := context.WithTimeout(bgCtx, cfPollTimeout)
+					body, status, err := patroni.REST(pollCtx, http.MethodGet, primaryIP, "/cluster", restU, restP, nil)
 					pollCancel()
 					if err == nil && status == http.StatusOK {
 						var clusterView struct {
@@ -1796,7 +1405,7 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 					slog.Error("configure-failover: replica streaming verify timed out — skipping replica",
 						"replica", node.Hostname, "primary", primaryIP, "last_state", lastState)
 					emit(events.SeverityWarn,
-						"replica "+node.Hostname+" did not reach streaming state within 2 minutes (last state: "+lastState+") — needs investigation; subsequent config tasks were skipped")
+						"replica "+node.Hostname+" did not reach streaming state within "+cfStreamingWait.String()+" (last state: "+lastState+") — needs investigation; subsequent config tasks were skipped")
 					continue
 				}
 				slog.Info("configure-failover: replica streaming verified",
@@ -1813,7 +1422,11 @@ func (h *PatroniHandler) ConfigureFailover(c echo.Context) error {
 				}
 				dispatchConfigForNode(bgCtx, bgDispatch, node, req.AppTierAlwaysAvailable)
 			}
-		}(replicaNodes, primaryNode.ID, masterHost, restUser, restPass)
+
+			for _, node := range appNodes {
+				dispatchConfigForNode(bgCtx, bgDispatch, node, req.AppTierAlwaysAvailable)
+			}
+		}(replicaNodes, appNodes, primaryNode.ID, masterHost, patroniIn.RESTUsername, patroniIn.RESTPassword)
 	}
 
 	if err := h.clusters.SetPatroniConfigured(ctx, clusterID); err != nil {
@@ -1865,7 +1478,7 @@ func (h *PatroniHandler) GetPatroniConfig(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
-	primary := primaryDBNode(nodes)
+	primary := nodestate.PrimaryDBNode(nodes)
 	if primary == nil {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "no connected primary node found")
 	}
@@ -1875,7 +1488,7 @@ func (h *PatroniHandler) GetPatroniConfig(c echo.Context) error {
 
 	getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	body, status, err := patroniREST(getCtx, http.MethodGet, primaryIP, "/config", restUser, restPass, nil)
+	body, status, err := patroni.REST(getCtx, http.MethodGet, primaryIP, "/config", restUser, restPass, nil)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadGateway, "failed to reach Patroni: "+err.Error())
 	}
@@ -1948,7 +1561,7 @@ func (h *PatroniHandler) PatchPatroniConfig(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
-	primary := primaryDBNode(nodes)
+	primary := nodestate.PrimaryDBNode(nodes)
 	if primary == nil {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "no connected primary node found")
 	}
@@ -1973,12 +1586,20 @@ func (h *PatroniHandler) PatchPatroniConfig(c echo.Context) error {
 		}
 	}
 
+	unlock, err := lockCluster(h.ops, clusterID, "a Patroni config deploy")
+	if err != nil {
+		return err
+	}
+
 	// Start the async deploy goroutine.
 	jobID := uuid.New()
 	job := &patroniDeployJob{status: "pending"}
 	h.deployJobs.Store(jobID, job)
 
-	go h.runPatroniDeploy(clusterID, jobID, job, nodes, primary.ID, primaryIP, restUser, restPass, req)
+	go func() {
+		defer unlock()
+		h.runPatroniDeploy(clusterID, jobID, job, nodes, primary.ID, primaryIP, restUser, restPass, req)
+	}()
 
 	return c.JSON(http.StatusAccepted, map[string]string{"job_id": jobID.String()})
 }
@@ -2023,7 +1644,7 @@ func (h *PatroniHandler) runPatroniDeploy(
 
 	// Fetch current DCS config to compute the diff.
 	getCurrentCtx, getCurrentCancel := context.WithTimeout(bgCtx, 10*time.Second)
-	currentBody, currentStatus, currentErr := patroniREST(getCurrentCtx, http.MethodGet, primaryIP, "/config", restUser, restPass, nil)
+	currentBody, currentStatus, currentErr := patroni.REST(getCurrentCtx, http.MethodGet, primaryIP, "/config", restUser, restPass, nil)
 	getCurrentCancel()
 	if currentErr != nil || currentStatus != http.StatusOK {
 		job.set("fail", "failed to fetch current Patroni config", false)
@@ -2207,7 +1828,7 @@ func (h *PatroniHandler) pollPendingRestart(ctx context.Context, nodes []queries
 			}
 			nodeIP := stripCIDR(node.IPAddress)
 			pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			body, status, err := patroniREST(pollCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
+			body, status, err := patroni.REST(pollCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
 			cancel()
 			if err != nil || status != http.StatusOK {
 				continue
@@ -2239,7 +1860,7 @@ func (h *PatroniHandler) pollPendingRestart(ctx context.Context, nodes []queries
 // is gone and the node is in the expected role. Returns true on success.
 func (h *PatroniHandler) restartAndWait(ctx context.Context, nodeIP, restUser, restPass, expectedRole string) bool {
 	restartCtx, restartCancel := context.WithTimeout(ctx, 10*time.Second)
-	_, status, err := patroniREST(restartCtx, http.MethodPost, nodeIP, "/restart", restUser, restPass, []byte(`{}`))
+	_, status, err := patroni.REST(restartCtx, http.MethodPost, nodeIP, "/restart", restUser, restPass, []byte(`{}`))
 	restartCancel()
 	if err != nil || status >= 300 {
 		slog.Warn("patroni deploy: POST /restart failed", "node", nodeIP, "status", status, "err", err)
@@ -2250,7 +1871,7 @@ func (h *PatroniHandler) restartAndWait(ctx context.Context, nodeIP, restUser, r
 	for time.Now().Before(deadline) {
 		time.Sleep(5 * time.Second)
 		pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		body, pollStatus, pollErr := patroniREST(pollCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
+		body, pollStatus, pollErr := patroni.REST(pollCtx, http.MethodGet, nodeIP, "/patroni", restUser, restPass, nil)
 		cancel()
 		if pollErr != nil || pollStatus != http.StatusOK {
 			continue
@@ -2330,14 +1951,7 @@ func (h *PatroniHandler) GetPatroniSnapshots(c echo.Context) error {
 
 // patroniCreds fetches the Patroni REST credentials for a cluster.
 func patroniCreds(ctx context.Context, creds *queries.CredentialQuerier, enc *crypto.Encryptor, clusterID uuid.UUID) (user, pass string) {
-	user = "patroni"
-	if cred, err := creds.GetByKind(ctx, clusterID, "patroni_rest_password"); err == nil {
-		user = cred.Username
-		if pw, e := enc.Decrypt(cred.PasswordEnc); e == nil {
-			pass = string(pw)
-		}
-	}
-	return
+	return creds.GetDecrypted(ctx, enc, clusterID, CredKindPatroniREST, CredDefaultUserPatroniREST)
 }
 
 // ListFailoverEvents returns the most recent HA events (category=ha) for a cluster.

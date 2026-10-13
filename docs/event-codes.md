@@ -19,6 +19,9 @@ Events are stored in the `events` table and can be queried via `GET /api/v1/even
 | NBC-CLU-003 | info | Cluster failover settings updated | Review new settings in the cluster detail page. |
 | NBC-CLU-004 | info | Node added to cluster | Complete cluster setup via Configure Failover if applicable. |
 | NBC-CLU-005 | warn | Node removed from cluster | Ensure remaining nodes have quorum if Patroni is active. |
+| NBC-CLU-006 | info | Folder sync to a node finished (backups, media or an extra folder) | — |
+| NBC-CLU-007 | error | Folder sync to a node failed | Read the message. Permission errors: run `sudo netbox-agent check-sync-permissions` on the node. Failed files are retried on the next sync. |
+| NBC-CLU-008 | warn | Two-way folder sync (media or an extra folder) found a file changed on more than one node, or changed on one and deleted on another; the newest change was kept everywhere | Check the named files. The overwritten version is gone; restore it from a backup if it was needed. |
 
 ---
 
@@ -30,6 +33,7 @@ Events are stored in the `events` table and can be queried via `GET /api/v1/even
 | NBC-AGT-002 | warn | Agent disconnected | Check the node is reachable and the agent service is running. |
 | NBC-AGT-003 | info | Agent registered (new node) | Complete node setup (credentials, Configure Failover) if required. |
 | NBC-AGT-004 | info | Agent upgraded | Verify the new version appears in the node detail page. |
+| NBC-AGT-005 | warn | Agent was denied writing its NetBox config or media folder (`<NETBOX_ROOT>/netbox/netbox` or `<NETBOX_ROOT>/netbox/media`), restored its access and retried | Expected once after a NetBox upgrade. Otherwise, find out what changed the folder's permissions. |
 
 ---
 

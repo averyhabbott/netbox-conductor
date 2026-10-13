@@ -21,16 +21,15 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
+	"github.com/averyhabbott/netbox-conductor/internal/shared/env"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -38,7 +37,7 @@ func main() {
 	inPlace := flag.Bool("in-place", false, "overwrite the current key file instead of writing to NEW_MASTER_KEY_FILE")
 	flag.Parse()
 
-	dsn := requireEnv("DATABASE_URL")
+	dsn := env.Require("DATABASE_URL")
 
 	// Load current key
 	oldKey, err := crypto.LoadMasterKey(false)
@@ -217,44 +216,28 @@ func loadOrGenerateNewKey() (key *crypto.MasterKey, path string, fromFile bool, 
 	}
 
 	if hexKey := os.Getenv("NEW_MASTER_KEY"); hexKey != "" {
-		raw, err := hex.DecodeString(hexKey)
-		if err != nil || len(raw) != 32 {
-			return nil, path, false, fmt.Errorf("NEW_MASTER_KEY must be a 64-char hex string (32 bytes)")
+		mk, err := crypto.ParseMasterKey(hexKey)
+		if err != nil {
+			return nil, path, false, fmt.Errorf("NEW_MASTER_KEY: %w", err)
 		}
-		var mk crypto.MasterKey
-		copy(mk[:], raw)
-		return &mk, path, false, nil
+		return mk, path, false, nil
 	}
 
 	// Check if the new key file already exists
 	if data, err := os.ReadFile(path); err == nil {
-		hexStr := string(data)
-		if len(hexStr) > 0 && hexStr[len(hexStr)-1] == '\n' {
-			hexStr = hexStr[:len(hexStr)-1]
+		mk, err := crypto.ParseMasterKey(string(data))
+		if err != nil {
+			return nil, path, false, fmt.Errorf("invalid key in %s: %w", path, err)
 		}
-		raw, err := hex.DecodeString(hexStr)
-		if err != nil || len(raw) != 32 {
-			return nil, path, false, fmt.Errorf("invalid key in %s", path)
-		}
-		var mk crypto.MasterKey
-		copy(mk[:], raw)
 		log.Printf("loaded new key from %s", path)
-		return &mk, path, true, nil
+		return mk, path, true, nil
 	}
 
 	// Generate a fresh key
-	var mk crypto.MasterKey
-	if _, err := io.ReadFull(rand.Reader, mk[:]); err != nil {
-		return nil, path, false, fmt.Errorf("generating new key: %w", err)
+	mk, err := crypto.GenerateMasterKey()
+	if err != nil {
+		return nil, path, false, err
 	}
 	log.Printf("generated new master key")
-	return &mk, path, false, nil
-}
-
-func requireEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("required environment variable %s is not set", key)
-	}
-	return v
+	return mk, path, false, nil
 }

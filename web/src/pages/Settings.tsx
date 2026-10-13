@@ -1,8 +1,11 @@
 import { useState, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Layout from '../components/Layout'
+import TabBtn from '../components/TabBtn'
 import { useAuthStore } from '../store/auth'
 import { usersApi, type UserItem } from '../api/users'
+import { apiError } from '../api/client'
+import { CATEGORIES, SEVERITIES } from '../api/events'
 import { authApi } from '../api/auth'
 import { syslogApi, retentionApi, type SyslogDestination, type SyslogDestinationBody } from '../api/syslog'
 
@@ -52,29 +55,6 @@ export default function Settings() {
   )
 }
 
-function TabBtn({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean
-  onClick: () => void
-  children: React.ReactNode
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-        active
-          ? 'border-blue-500 text-white'
-          : 'border-transparent text-gray-400 hover:text-white'
-      }`}
-    >
-      {children}
-    </button>
-  )
-}
-
 // ── Users Tab ────────────────────────────────────────────────────────────────
 
 function UsersTab({ currentUserId }: { currentUserId: string }) {
@@ -101,7 +81,7 @@ function UsersTab({ currentUserId }: { currentUserId: string }) {
       setCreateError('')
     },
     onError: (err: any) => {
-      setCreateError(err?.response?.data?.message ?? 'Failed to create user')
+      setCreateError(apiError(err, 'Failed to create user'))
     },
   })
 
@@ -334,7 +314,7 @@ function SystemTab() {
     },
     onError: (err: any) => {
       setRegenResult('error')
-      setRegenError(err?.response?.data?.message ?? 'Failed to regenerate certificate')
+      setRegenError(apiError(err, 'Failed to regenerate certificate'))
     },
   })
 
@@ -543,7 +523,7 @@ function ChangePasswordTab() {
       setError('')
     },
     onError: (err: any) => {
-      setError(err?.response?.data?.message ?? 'Failed to change password')
+      setError(apiError(err, 'Failed to change password'))
     },
   })
 
@@ -824,9 +804,6 @@ function TOTPTab() {
 
 // ── Syslog Tab ────────────────────────────────────────────────────────────────
 
-const SEVERITIES = ['debug', 'info', 'warn', 'error', 'critical']
-const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
-
 const emptySyslog = (): SyslogDestinationBody => ({
   name: '', protocol: 'udp', host: '', port: 514, min_severity: 'info', categories: [], enabled: true,
 })
@@ -938,7 +915,7 @@ function SyslogTab() {
       </div>
 
       {showCreate && (
-        <SyslogForm initial={emptySyslog()} onSave={(b) => create.mutate(b)} onCancel={() => setShowCreate(false)} isPending={create.isPending} error={(create.error as any)?.response?.data?.message} />
+        <SyslogForm initial={emptySyslog()} onSave={(b) => create.mutate(b)} onCancel={() => setShowCreate(false)} isPending={create.isPending} error={apiError(create.error)} />
       )}
 
       {isLoading ? (
@@ -955,7 +932,7 @@ function SyslogTab() {
                 onSave={(b) => update.mutate({ id: d.id, body: b })}
                 onCancel={() => setEditId(null)}
                 isPending={update.isPending}
-                error={(update.error as any)?.response?.data?.message}
+                error={apiError(update.error)}
               />
             ) : (
               <div key={d.id} className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">

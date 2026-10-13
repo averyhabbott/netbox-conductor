@@ -1,11 +1,10 @@
 package jwtutil
 
 import (
-	"crypto/rand"
 	"fmt"
-	"io"
 	"time"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -61,8 +60,8 @@ func ParseAccess(raw string, secret []byte) (*Claims, error) {
 }
 
 const (
-	TOTPPendingTTL  = 5 * time.Minute
-	TOTPEnrollTTL   = 10 * time.Minute
+	TOTPPendingTTL = 5 * time.Minute
+	TOTPEnrollTTL  = 10 * time.Minute
 )
 
 // TOTPPendingClaims is a short-lived token issued after password verification
@@ -150,10 +149,5 @@ func ParseTOTPEnroll(raw string, signingKey []byte) (uuid.UUID, string, error) {
 
 // GenerateRefreshToken returns a cryptographically random hex-encoded refresh token.
 func GenerateRefreshToken() (string, error) {
-	raw := make([]byte, refreshTokenLen)
-	if _, err := io.ReadFull(rand.Reader, raw); err != nil {
-		return "", fmt.Errorf("generating refresh token: %w", err)
-	}
-	// hex encode for safe storage in cookies/headers
-	return fmt.Sprintf("%x", raw), nil
+	return crypto.GenerateToken(refreshTokenLen)
 }

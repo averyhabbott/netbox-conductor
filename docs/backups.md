@@ -14,9 +14,9 @@ Up to four storage locations can be configured per cluster (matching pgBackRest'
 |------|-------------|
 | **Local Disk** | A path on the node's filesystem. Works for NFS/SMB mounts — use a network path to make backups available from multiple nodes. |
 | **Amazon S3** | AWS S3 or any S3-compatible service (MinIO, Wasabi, Backblaze B2). Supply a custom endpoint for non-AWS providers. |
-| **Google Cloud Storage** | GCS bucket with a service account JSON key. |
 | **Azure Blob Storage** | Azure storage account and container with an access key. |
-| **SFTP Server** | Remote server accessible via SSH key authentication. |
+| **Google Cloud Storage** *(future)* | GCS bucket with a service account JSON key. Not offered for new storage locations yet. |
+| **SFTP Server** *(future)* | Remote server accessible via SSH key authentication. Not offered for new storage locations yet. |
 
 ### Recovery window
 
@@ -24,7 +24,7 @@ Each storage location has a **recovery window** (days). This single value contro
 
 ### Local disk sync
 
-When using a local disk location, backups written on the primary node are not automatically available on replica nodes. Enable **Sync backups to other nodes** on the storage location and select which nodes should receive a copy after each backup. The conductor relays repo files through its WebSocket connection after every successful backup.
+When using a local disk location, backups written on the primary node are not automatically available on replica nodes. Enable **Sync backups to other nodes** on the storage location and select which nodes should receive a copy after each backup. After every successful backup the conductor makes each selected node's copy of the repository identical to the primary's: new and changed files are copied, and backups pgBackRest expired on the primary are deleted. See [File Sync](file-sync.md) for how it works and its safety rules.
 
 For large databases (many GB), a shared storage location (cloud or NFS mount) is strongly recommended over local disk sync — sync throughput is limited by the conductor relay bandwidth.
 
@@ -42,7 +42,7 @@ Three automatic backup tiers run on configurable schedules:
 | **Daily snapshot** | Daily (Mon–Sat), 1:00 AM UTC | Incremental from the last full backup |
 | **Log snapshot** | Every hour | Captures changes since the last snapshot |
 
-Schedules are stored as cron expressions internally. The UI presents them as plain-language dropdowns; no cron syntax is exposed.
+The full and differential schedules are cron expressions in UTC, entered on the **Automatic Backups** card. See [Cron schedules](file-sync.md#cron-schedules) for the format; an invalid schedule is refused when you save it, with the reason.
 
 Disable the schedule toggle to pause all automatic backups. Manual backups can still be triggered with **Run full backup now**.
 

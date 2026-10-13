@@ -1,11 +1,14 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
@@ -46,19 +49,31 @@ func (d *Dispatcher) Dispatch(nodeID uuid.UUID, task protocol.TaskDispatchPayloa
 	return d.SendRaw(nodeID, env)
 }
 
-// ServerHello sends a server.hello acknowledgement to a node.
-func (d *Dispatcher) ServerHello(nodeID uuid.UUID, accepted bool, reason, version string) error {
-	payload, err := json.Marshal(protocol.ServerHelloPayload{
-		Accepted:      accepted,
-		RejectReason:  reason,
-		ServerVersion: version,
-	})
+// DispatchTask records a queued task in task_results, sends it to the node and
+// marks it sent. A task that can't be recorded is not sent, so every dispatched
+// task is tracked. ackTimeoutSecs > 0 overrides the sweeper's default ack
+// timeout for long-running tasks.
+func (d *Dispatcher) DispatchTask(ctx context.Context, tasks *queries.TaskResultQuerier, nodeID, taskID uuid.UUID,
+	taskType protocol.TaskType, params json.RawMessage, timeoutSecs, ackTimeoutSecs int) error {
+	var err error
+	if ackTimeoutSecs > 0 {
+		err = tasks.CreateWithAckTimeout(ctx, nodeID, taskID, string(taskType), params, ackTimeoutSecs)
+	} else {
+		err = tasks.Create(ctx, nodeID, taskID, string(taskType), params)
+	}
 	if err != nil {
+		return fmt.Errorf("recording %s task: %w", taskType, err)
+	}
+	if err := d.Dispatch(nodeID, protocol.TaskDispatchPayload{
+		TaskID:      taskID.String(),
+		TaskType:    taskType,
+		Params:      params,
+		TimeoutSecs: timeoutSecs,
+	}); err != nil {
 		return err
 	}
-	return d.SendRaw(nodeID, protocol.Envelope{
-		ID:      uuid.New().String(),
-		Type:    protocol.TypeServerHello,
-		Payload: json.RawMessage(payload),
-	})
+	if err := tasks.SetSent(ctx, taskID); err != nil {
+		slog.Warn("dispatch: SetSent failed", "node", nodeID, "task", taskID, "type", taskType, "error", err)
+	}
+	return nil
 }

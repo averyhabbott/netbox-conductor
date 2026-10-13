@@ -16,7 +16,7 @@ export interface SSEEvent {
 type SSEHandler = (event: SSEEvent) => void
 
 /**
- * Connects to the /api/v1/events SSE stream and calls `onEvent` for each message.
+ * Connects to the /api/v1/events/stream SSE stream and calls `onEvent` for each message.
  * Automatically reconnects on error (with a short delay).
  * Disconnects when the component unmounts.
  */
@@ -36,7 +36,7 @@ export function useSSE(onEvent: SSEHandler, enabled = true) {
     // Use a fetch-based approach via ReadableStream instead.
     const ctrl = new AbortController()
 
-    fetch('/api/v1/events', {
+    fetch('/api/v1/events/stream', {
       headers: { Authorization: `Bearer ${token}` },
       signal: ctrl.signal,
     }).then(async (res) => {

@@ -1,8 +1,8 @@
 package executor
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -11,10 +11,10 @@ import (
 
 // RunDBRestore executes a database restore operation.
 // "pitr" — runs a configurable restore command targeting a specific recovery time.
-func RunDBRestore(params protocol.DBRestoreParams) (string, error) {
+func RunDBRestore(ctx context.Context, params protocol.DBRestoreParams) (string, error) {
 	switch params.Method {
 	case "pitr":
-		return runPITR(params)
+		return runPITR(ctx, params)
 	default:
 		return "", fmt.Errorf("unknown restore method: %q (must be 'pitr')", params.Method)
 	}
@@ -22,7 +22,7 @@ func RunDBRestore(params protocol.DBRestoreParams) (string, error) {
 
 // runPITR executes a point-in-time recovery.
 // Uses the RestoreCmd if provided, otherwise falls back to pgBackRest.
-func runPITR(params protocol.DBRestoreParams) (string, error) {
+func runPITR(ctx context.Context, params protocol.DBRestoreParams) (string, error) {
 	// Validate target time format (ISO 8601)
 	if params.TargetTime == "" {
 		return "", fmt.Errorf("target_time is required for pitr")
@@ -50,7 +50,7 @@ func runPITR(params protocol.DBRestoreParams) (string, error) {
 		return "", fmt.Errorf("empty restore command")
 	}
 
-	cmd := exec.Command(parts[0], parts[1:]...) //nolint:gosec — operator-supplied command, admin-only
+	cmd := Command(ctx, parts[0], parts[1:]...) //nolint:gosec — operator-supplied command, admin-only
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("pitr restore failed: %w", err)

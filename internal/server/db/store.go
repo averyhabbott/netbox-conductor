@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -43,17 +42,4 @@ func (s *Store) Close() {
 // Pool exposes the underlying pool for use with golang-migrate.
 func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
-}
-
-// withTx runs fn inside a transaction, rolling back on error.
-func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("beginning transaction: %w", err)
-	}
-	if err := fn(tx); err != nil {
-		_ = tx.Rollback(ctx)
-		return err
-	}
-	return tx.Commit(ctx)
 }

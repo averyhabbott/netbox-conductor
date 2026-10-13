@@ -18,6 +18,8 @@ export interface Cluster {
   media_sync_enabled: boolean
   extra_folders_sync_enabled: boolean
   extra_sync_folders: string[]
+  file_sync_cron: string
+  file_sync_schedule_enabled: boolean
   patroni_configured: boolean
   redis_sentinel_master: string
   created_at: string
@@ -59,15 +61,17 @@ export interface ConfigureFailoverResult {
 }
 
 export interface ClusterSyncResult {
-  source_node_id: string
-  source_hostname: string
-  syncs: {
-    target_node_id: string
-    target_hostname: string
-    transfer_id: string
-    task_id: string
-    source_path?: string
-  }[]
+  hostnames: string[]
+  started: string[]          // folder names: "media" or the folder path
+  already_running: string[] | null
+}
+
+export interface MediaSyncSettings {
+  media_sync_enabled: boolean
+  extra_folders_sync_enabled: boolean
+  extra_sync_folders: string[]
+  file_sync_cron: string
+  file_sync_schedule_enabled: boolean
 }
 
 export interface CreateClusterBody {
@@ -267,10 +271,7 @@ export const clustersApi = {
   ) =>
     client.patch<Cluster>(`/clusters/${id}/failover-settings`, body).then((r) => r.data),
 
-  updateMediaSyncSettings: (
-    id: string,
-    body: { media_sync_enabled: boolean; extra_folders_sync_enabled: boolean; extra_sync_folders: string[] }
-  ) =>
+  updateMediaSyncSettings: (id: string, body: MediaSyncSettings) =>
     client.patch<Cluster>(`/clusters/${id}/media-sync-settings`, body).then((r) => r.data),
 
   syncMedia: (id: string) =>

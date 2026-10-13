@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/averyhabbott/netbox-conductor/internal/server/crypto"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
@@ -220,7 +220,7 @@ func (h *NodeHandler) Create(c echo.Context) error {
 	if req.IPAddress == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "ip_address is required")
 	}
-	if req.Role != "hyperconverged" && req.Role != "app" && req.Role != "db_only" {
+	if !nodestate.ValidRole(req.Role) {
 		return echo.NewHTTPError(http.StatusBadRequest, "role must be hyperconverged, app, or db_only")
 	}
 	if req.FailoverPriority == 0 {
@@ -311,7 +311,7 @@ func (h *NodeHandler) Update(c echo.Context) error {
 		if req.IPAddress != nil && *req.IPAddress == "" {
 			return echo.NewHTTPError(http.StatusBadRequest, "ip_address cannot be empty")
 		}
-		if req.Role != nil && *req.Role != "hyperconverged" && *req.Role != "app" && *req.Role != "db_only" {
+		if req.Role != nil && !nodestate.ValidRole(*req.Role) {
 			return echo.NewHTTPError(http.StatusBadRequest, "role must be hyperconverged, app, or db_only")
 		}
 		if _, err := h.nodes.UpdateNode(ctx, queries.UpdateNodeParams{
@@ -419,20 +419,9 @@ func (h *NodeHandler) GenerateRegToken(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "node not found")
 	}
 
-	// Revoke any existing agent tokens so only this new one is valid.
-	_ = h.agentToks.Revoke(c.Request().Context(), nid)
-
-	rawToken, err := crypto.GenerateToken(48)
+	rawToken, wsURL, err := h.reissueAgentToken(c.Request().Context(), nid)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate token")
-	}
-	if err := h.agentToks.Create(c.Request().Context(), nid, crypto.HashToken(rawToken)); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to store token")
-	}
-
-	wsURL := strings.NewReplacer("https://", "wss://", "http://", "ws://").Replace(h.serverURL)
-	if wsURL == "" {
-		wsURL = "wss://your-conductor"
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to issue token")
 	}
 	envSnippet := fmt.Sprintf(
 		"# Assigned by the conductor during node registration\n"+
@@ -449,6 +438,26 @@ func (h *NodeHandler) GenerateRegToken(c echo.Context) error {
 		"node_id":     node.ID.String(),
 		"hostname":    node.Hostname,
 	})
+}
+
+// reissueAgentToken revokes the node's agent tokens and stores a fresh one, so
+// only the returned token is valid. It also returns the WebSocket URL agents
+// connect to.
+func (h *NodeHandler) reissueAgentToken(ctx context.Context, nid uuid.UUID) (rawToken, wsURL string, err error) {
+	_ = h.agentToks.Revoke(ctx, nid)
+	rawToken, hash, err := newAgentToken()
+	if err != nil {
+		return "", "", err
+	}
+	if err := h.agentToks.Create(ctx, nid, hash); err != nil {
+		return "", "", err
+	}
+	conductorURL := h.serverURL
+	if conductorURL == "" {
+		conductorURL = "https://your-conductor"
+	}
+	wsURL = strings.NewReplacer("https://", "wss://", "http://", "ws://").Replace(conductorURL)
+	return rawToken, wsURL, nil
 }
 
 // ServiceAction dispatches a start/stop/restart task for NetBox on a node.
@@ -474,30 +483,16 @@ func (h *NodeHandler) ServiceAction(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "unknown service action")
 	}
 
-	taskID := uuid.New()
-	payload, _ := json.Marshal(protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    taskType,
-		Params:      json.RawMessage(`{}`),
-		TimeoutSecs: 30,
-	})
-
-	sess := h.hub.Get(nid)
-	if sess == nil {
+	// Checked before recording so an offline node doesn't get a queued
+	// service task that would run unexpectedly on reconnect.
+	if h.hub.Get(nid) == nil {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected")
 	}
 
-	// Record the task before dispatching so it appears in history and can time out.
-	_ = h.taskResults.Create(c.Request().Context(), nid, taskID, string(taskType), payload)
-
-	if !sess.Send(protocol.Envelope{
-		ID:      taskID.String(),
-		Type:    protocol.TypeTaskDispatch,
-		Payload: json.RawMessage(payload),
-	}) {
-		return echo.NewHTTPError(http.StatusConflict, "node send buffer full")
+	taskID := uuid.New()
+	if err := h.dispatcher.DispatchTask(c.Request().Context(), h.taskResults, nid, taskID, taskType, json.RawMessage(`{}`), 30, 0); err != nil {
+		return echo.NewHTTPError(http.StatusConflict, "dispatch failed: "+err.Error())
 	}
-	_ = h.taskResults.SetSent(c.Request().Context(), taskID)
 
 	return c.JSON(http.StatusAccepted, map[string]any{
 		"task_id":   taskID.String(),
@@ -645,98 +640,6 @@ func (h *NodeHandler) GetLogs(c echo.Context) error {
 	})
 }
 
-// DownloadAgentEnv generates a fresh permanent agent token and returns a
-// pre-populated netbox-agent.env file ready to install on the agent node.
-// Revokes any existing tokens first so only the new token is valid.
-// POST /api/v1/clusters/:id/nodes/:nid/agent-env
-func (h *NodeHandler) DownloadAgentEnv(c echo.Context) error {
-	nid, err := uuid.Parse(c.Param("nid"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid node id")
-	}
-
-	node, err := h.nodes.GetByID(c.Request().Context(), nid)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusNotFound, "node not found")
-	}
-
-	// Revoke existing tokens and issue a fresh permanent agent token.
-	_ = h.agentToks.Revoke(c.Request().Context(), nid)
-	rawToken, err := crypto.GenerateToken(48)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate token")
-	}
-	if err := h.agentToks.Create(c.Request().Context(), nid, crypto.HashToken(rawToken)); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to store token")
-	}
-
-	conductorURL := h.serverURL
-	if conductorURL == "" {
-		conductorURL = "https://your-conductor"
-	}
-	wsURL := strings.NewReplacer("https://", "wss://", "http://", "ws://").Replace(conductorURL)
-
-	content := fmt.Sprintf(`# NetBox Agent configuration for %s
-# Generated by NetBox Conductor on %s
-
-# ── Identity ──────────────────────────────────────────────────────────────────
-
-AGENT_NODE_ID=%s
-AGENT_TOKEN=%s
-
-# ── Server connection ─────────────────────────────────────────────────────────
-
-AGENT_SERVER_URL=%s/api/v1/agent/connect
-
-# ── TLS ───────────────────────────────────────────────────────────────────────
-
-# On first start the agent downloads the conductor's CA cert, saves it to
-# /etc/netbox-agent/ca.crt, and sets UPDATE_CERT=false automatically.
-UPDATE_CERT=true
-
-# Set to true ONLY for development — emits a warning at runtime
-AGENT_TLS_SKIP_VERIFY=false
-
-# Path to CA certificate — populated automatically by cert-learning:
-# AGENT_TLS_CA_CERT=/etc/netbox-agent/ca.crt
-
-AGENT_RECONNECT_INTERVAL_SECS=10
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-
-AGENT_LOG_LEVEL=info
-
-# ── NetBox paths ──────────────────────────────────────────────────────────────
-
-NETBOX_CONFIG_PATH=/opt/netbox/netbox/netbox/configuration.py
-NETBOX_MEDIA_ROOT=/opt/netbox/netbox/media
-
-# ── Patroni ───────────────────────────────────────────────────────────────────
-
-PATRONI_REST_URL=http://127.0.0.1:8008
-
-# ── Status server ─────────────────────────────────────────────────────────────
-# Local HTTP health endpoint used by the node's nginx/Apache reverse proxy.
-# The proxy exposes GET /status on HTTPS so health-checkers never need to reach
-# the agent port directly. Default binds to loopback only (127.0.0.1:8081).
-# Set to 0.0.0.0:8081 only if your LB must reach the agent port directly.
-# Leave empty to disable the status server entirely.
-
-AGENT_STATUS_ADDR=127.0.0.1:8081
-`,
-		node.Hostname,
-		time.Now().UTC().Format(time.RFC3339),
-		node.ID.String(),
-		rawToken,
-		wsURL,
-	)
-
-	filename := "netbox-agent-" + node.Hostname + ".env"
-	c.Response().Header().Set("Content-Disposition", "attachment; filename="+filename)
-	c.Response().Header().Set("Content-Type", "text/plain; charset=utf-8")
-	return c.String(http.StatusOK, content)
-}
-
 // GetNetboxLogNames returns the list of NetBox log names that have been forwarded
 // and stored for this node (e.g. "netbox.log", "django.log").
 // GET /api/v1/clusters/:id/nodes/:nid/netbox-log-names
@@ -768,65 +671,6 @@ func (h *NodeHandler) GetNetboxLogNames(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{"names": names})
-}
-
-// UpgradeAgent dispatches an agent.upgrade task to the node.
-// POST /api/v1/clusters/:id/nodes/:nid/upgrade-agent
-func (h *NodeHandler) UpgradeAgent(c echo.Context) error {
-	nid, err := uuid.Parse(c.Param("nid"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid node id")
-	}
-
-	ctx := c.Request().Context()
-
-	node, err := h.nodes.GetByID(ctx, nid)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusNotFound, "node not found")
-	}
-
-	sess := h.hub.Get(nid)
-	if sess == nil {
-		return echo.NewHTTPError(http.StatusConflict, "node is not connected")
-	}
-
-	// Use the arch reported in the agent's hello payload; fall back to amd64.
-	arch := sess.Arch
-	if arch == "" {
-		arch = "amd64"
-	}
-	conductorURL := h.serverURL
-	if conductorURL == "" {
-		conductorURL = "https://localhost:8443"
-	}
-	downloadURL := conductorURL + "/api/v1/downloads/agent-linux-" + arch
-
-	taskID := uuid.New()
-	params, _ := json.Marshal(protocol.AgentUpgradeParams{
-		DownloadURL: downloadURL,
-		Arch:        arch,
-	})
-	dispatch := protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskAgentUpgrade,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 120,
-	}
-
-	_ = h.taskResults.Create(ctx, nid, taskID, string(protocol.TaskAgentUpgrade), mustMarshal(dispatch))
-
-	if err := h.dispatcher.Dispatch(nid, dispatch); err != nil {
-		return echo.NewHTTPError(http.StatusConflict, "dispatch failed: "+err.Error())
-	}
-	_ = h.taskResults.SetSent(ctx, taskID)
-
-	_ = node // used for hostname in future logging
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"task_id":   taskID.String(),
-		"task_type": protocol.TaskAgentUpgrade,
-		"node_id":   nid.String(),
-		"status":    "dispatched",
-	})
 }
 
 func mustMarshal(v any) json.RawMessage {

@@ -6,6 +6,8 @@ package nodestate
 import (
 	"encoding/json"
 	"errors"
+
+	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 )
 
 // ErrPatroniStateCorrupt is returned by ExtractPatroniRoleStrict when the
@@ -40,6 +42,40 @@ func ExtractPatroniRoleStrict(state json.RawMessage) (string, error) {
 	}
 	role, _ := ps["role"].(string)
 	return role, nil
+}
+
+// IsDBRole reports whether a node with this role runs PostgreSQL/Patroni.
+func IsDBRole(role string) bool {
+	return role == "hyperconverged" || role == "db_only"
+}
+
+// IsAppRole reports whether a node with this role runs NetBox and RQ.
+func IsAppRole(role string) bool {
+	return role == "hyperconverged" || role == "app"
+}
+
+// ValidRole reports whether role is one of the known node roles.
+func ValidRole(role string) bool {
+	return IsDBRole(role) || IsAppRole(role)
+}
+
+// PrimaryDBNode returns the connected DB node Patroni reports as "primary",
+// else the first connected DB node, or nil if there is none.
+func PrimaryDBNode(nodes []queries.Node) *queries.Node {
+	var best *queries.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if !IsDBRole(n.Role) || n.AgentStatus != "connected" {
+			continue
+		}
+		if ExtractPatroniRole(n.PatroniState) == "primary" {
+			return n
+		}
+		if best == nil {
+			best = n
+		}
+	}
+	return best
 }
 
 // ComputeNodeHealth returns "healthy", "unhealthy", or "offline" for a node

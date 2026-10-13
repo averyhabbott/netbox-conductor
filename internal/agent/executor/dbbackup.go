@@ -1,9 +1,9 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -28,7 +28,7 @@ const (
 //
 // The full path of the dump file is returned as the task output so it can be
 // surfaced in the conductor UI and used by the future restore-from-backup feature.
-func RunDBBackup(params protocol.DBBackupParams) (string, error) {
+func RunDBBackup(ctx context.Context, params protocol.DBBackupParams) (string, error) {
 	dbName := params.DBName
 	if dbName == "" {
 		dbName = defaultBackupDB
@@ -44,7 +44,7 @@ func RunDBBackup(params protocol.DBBackupParams) (string, error) {
 
 	// Create the backup directory as the postgres OS user so peer auth works and
 	// the directory lands in postgres-owned space.
-	if mkdirOut, err := exec.Command("sudo", "-u", "postgres", "mkdir", "-p", outputDir).CombinedOutput(); err != nil {
+	if mkdirOut, err := Command(ctx, "sudo", "-u", "postgres", "mkdir", "-p", outputDir).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("creating backup directory %s: %w\n%s", outputDir, err, mkdirOut)
 	}
 
@@ -60,7 +60,7 @@ func RunDBBackup(params protocol.DBBackupParams) (string, error) {
 	var out []byte
 	var err error
 	for {
-		cmd := exec.Command(
+		cmd := Command(ctx, 
 			"sudo", "-u", "postgres",
 			"pg_dump",
 			"-Fc",
@@ -75,8 +75,7 @@ func RunDBBackup(params protocol.DBBackupParams) (string, error) {
 			break
 		}
 		_ = os.Remove(destPath)
-		if pgIsUnavailable(out) && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Second)
+		if pgIsUnavailable(out) && time.Now().Before(deadline) && sleep(ctx, 5*time.Second) == nil {
 			continue
 		}
 		return string(out), fmt.Errorf("pg_dump failed: %w\n%s", err, out)

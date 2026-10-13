@@ -7,65 +7,64 @@ type MessageType string
 
 const (
 	// Agent → Server
-	TypeAgentHello          MessageType = "agent.hello"
-	TypeAgentHeartbeat      MessageType = "agent.heartbeat"
-	TypePatroniState        MessageType = "patroni.state"
-	TypeServiceStateChange  MessageType = "agent.service_state_change"
-	TypeTaskAck             MessageType = "task.ack"
-	TypeTaskResult          MessageType = "task.result"
-	TypeMediaChunk          MessageType = "media.chunk"
-	TypeMediaChunkAck       MessageType = "media.chunk.ack"
-	TypeBackupChunk         MessageType = "backup.chunk"
-	TypeBackupChunkAck      MessageType = "backup.chunk.ack"
-	TypeNetboxLog           MessageType = "netbox.log"
+	TypeAgentHello         MessageType = "agent.hello"
+	TypeAgentHeartbeat     MessageType = "agent.heartbeat"
+	TypePatroniState       MessageType = "patroni.state"
+	TypeServiceStateChange MessageType = "agent.service_state_change"
+	TypeTaskAck            MessageType = "task.ack"
+	TypeTaskResult         MessageType = "task.result"
+	TypeSyncListing        MessageType = "sync.listing" // one piece of a folder listing (sync.list)
+	TypeSyncChunk          MessageType = "sync.chunk"   // source → conductor → destinations (sync.send)
+	TypeNetboxLog          MessageType = "netbox.log"
 
 	// Server → Agent
 	TypeServerHello  MessageType = "server.hello"
 	TypeTaskDispatch MessageType = "task.dispatch"
-	TypeMediaRequest MessageType = "media.request"
 )
 
 // TaskType identifies the operation an agent should perform.
 type TaskType string
 
 const (
-	TaskWriteConfig       TaskType = "config.write"
+	TaskWriteConfig         TaskType = "config.write"
 	TaskUpdateDBHost        TaskType = "config.update_db_host"
 	TaskUpdateRedisHost     TaskType = "config.update_redis_host"
 	TaskRedisSetRequirepass TaskType = "config.redis_requirepass"
 	TaskRedisBindAll        TaskType = "config.redis_bind_all"
-	TaskStartNetbox       TaskType = "service.start.netbox"
-	TaskStopNetbox        TaskType = "service.stop.netbox"
-	TaskRestartNetbox     TaskType = "service.restart.netbox"
-	TaskRestartRQ         TaskType = "service.restart.rq"
-	TaskStopPostgresql    TaskType = "service.stop.postgresql"
-	TaskInstallPatroni    TaskType = "patroni.install"
-	TaskCreatePgRole      TaskType = "postgres.create_role"
-	TaskWritePatroniConf  TaskType = "patroni.write_config"
-	TaskRestartPatroni    TaskType = "service.restart.patroni"
-	TaskStopPostgres      TaskType = "postgres.stop"
-	TaskPatroniSwitchover TaskType = "patroni.switchover"
-	TaskRestartRedis      TaskType = "service.restart.redis"
-	TaskRestartSentinel   TaskType = "service.restart.redis-sentinel"
-	TaskStopSentinel      TaskType = "service.stop.sentinel"
-	TaskWriteSentinelConf TaskType = "sentinel.write_config"
-	TaskMediaSync         TaskType = "media.sync"
-	TaskDBRestore         TaskType = "db.restore"     // reinitialize a replica or restore from backup
-	TaskDBBackup          TaskType = "db.backup"      // pg_dump the primary database before destructive ops
-	TaskRunCommand        TaskType = "exec.run"        // admin-only ad-hoc
-	TaskEnforceRetention  TaskType = "backup.expire"   // run pgbackrest expire / retention enforcement
-	TaskAgentUpgrade      TaskType = "agent.upgrade"   // self-upgrade the agent binary
-	TaskReadNetboxConfig  TaskType = "config.read"     // read /opt/netbox/.../configuration.py from agent
+	TaskStartNetbox         TaskType = "service.start.netbox"
+	TaskStopNetbox          TaskType = "service.stop.netbox"
+	TaskRestartNetbox       TaskType = "service.restart.netbox"
+	TaskRestartRQ           TaskType = "service.restart.rq"
+	TaskStopPostgresql      TaskType = "service.stop.postgresql"
+	TaskInstallPatroni      TaskType = "patroni.install"
+	TaskCreatePgRole        TaskType = "postgres.create_role"
+	TaskWritePatroniConf    TaskType = "patroni.write_config"
+	TaskRestartPatroni      TaskType = "service.restart.patroni"
+	TaskStopPostgres        TaskType = "postgres.stop"
+	TaskPatroniSwitchover   TaskType = "patroni.switchover"
+	TaskRestartRedis        TaskType = "service.restart.redis"
+	TaskRestartSentinel     TaskType = "service.restart.redis-sentinel"
+	TaskStopSentinel        TaskType = "service.stop.sentinel"
+	TaskWriteSentinelConf   TaskType = "sentinel.write_config"
+	TaskDBRestore           TaskType = "db.restore"  // reinitialize a replica or restore from backup
+	TaskDBBackup            TaskType = "db.backup"   // pg_dump the primary database before destructive ops
+	TaskRunCommand          TaskType = "exec.run"    // admin-only ad-hoc
+	TaskReadNetboxConfig    TaskType = "config.read" // read /opt/netbox/.../configuration.py from agent
 
 	// pgBackRest backup management
-	TaskPGBackRestConfigure    TaskType = "pgbackrest.configure"    // write /etc/pgbackrest/pgbackrest.conf
+	TaskPGBackRestConfigure    TaskType = "pgbackrest.configure"     // write /etc/pgbackrest/pgbackrest.conf
 	TaskPGBackRestStanzaCreate TaskType = "pgbackrest.stanza-create" // stanza-create + stanza-check (one-time bootstrap)
-	TaskPGBackRestBackup       TaskType = "pgbackrest.backup"       // run pgbackrest backup (full|diff|incr)
-	TaskPGBackRestCatalog      TaskType = "pgbackrest.catalog"      // pgbackrest info --output=json
-	TaskPGBackRestRestore      TaskType = "pgbackrest.restore"      // full cluster restore (stops Patroni, runs pgBackRest restore)
-	TaskPGBackRestTestPath     TaskType = "pgbackrest.test_path"    // verify a posix backup path is writable by the postgres user
-	TaskBackupSyncRead         TaskType = "backup.sync.read"        // read local pgBackRest repo for conductor-relayed sync
-	TaskBackupSyncWrite        TaskType = "backup.sync.write"       // write conductor-relayed backup repo chunks to disk
+	TaskPGBackRestBackup       TaskType = "pgbackrest.backup"        // run pgbackrest backup (full|diff|incr)
+	TaskPGBackRestCatalog      TaskType = "pgbackrest.catalog"       // pgbackrest info --output=json
+	TaskPGBackRestRestore      TaskType = "pgbackrest.restore"       // full cluster restore (stops Patroni, runs pgBackRest restore)
+	TaskPGBackRestTestPath     TaskType = "pgbackrest.test_path"     // verify a posix backup path is writable by the postgres user
+
+	// Folder sync (backups, media, extra folders); see internal/server/filesync.
+	TaskSyncList    TaskType = "sync.list"    // list path/size/SHA-256 of every file, plus free space
+	TaskSyncSend    TaskType = "sync.send"    // stream the named files as sync.chunk messages
+	TaskSyncReceive TaskType = "sync.receive" // start accepting sync.chunk messages for a sync
+	TaskSyncFinish  TaskType = "sync.finish"  // stop accepting chunks; report what arrived
+	TaskSyncDelete  TaskType = "sync.delete"  // delete the named files
 )
 
 // SafeToRetryOnReconnect reports whether re-dispatching a task to an agent that
@@ -80,18 +79,20 @@ const (
 // is bootstrap-only but the agent guards against double-init).
 //
 // NOT idempotent: anything that does work twice if run twice (backups,
-// pg_dump, full restore, exec.run admin commands, agent self-upgrade).
+// pg_dump, full restore, exec.run admin commands).
 func SafeToRetryOnReconnect(t TaskType) bool {
 	switch t {
 	case TaskPGBackRestBackup,
 		TaskPGBackRestRestore,
 		TaskDBBackup,
 		TaskDBRestore,
-		TaskMediaSync,
 		TaskRunCommand,
-		TaskAgentUpgrade,
-		TaskBackupSyncRead,
-		TaskBackupSyncWrite:
+		// Sync tasks belong to one run, which the conductor fails when the agent disconnects.
+		TaskSyncList,
+		TaskSyncSend,
+		TaskSyncReceive,
+		TaskSyncFinish,
+		TaskSyncDelete:
 		return false
 	}
 	return true
@@ -122,21 +123,21 @@ type AgentHelloPayload struct {
 
 // HeartbeatPayload is sent by the agent every 15 seconds.
 type HeartbeatPayload struct {
-	NodeID        string   `json:"node_id"`
-	LoadAvg1      float64  `json:"load_avg_1"`
-	LoadAvg5      float64  `json:"load_avg_5"`
-	MemUsedPct    float64  `json:"mem_used_pct"`
-	DiskUsedPct   float64  `json:"disk_used_pct"`
-	NetboxRunning bool     `json:"netbox_running"`
-	RQRunning     bool     `json:"rq_running"`
-	NetboxVersion string   `json:"netbox_version,omitempty"` // e.g. "4.1.0"
-	PatroniRole   string   `json:"patroni_role"`   // "primary", "replica", "standby_leader", ""
-	PatroniLagB   *int64   `json:"patroni_lag_bytes,omitempty"`
+	NodeID        string           `json:"node_id"`
+	LoadAvg1      float64          `json:"load_avg_1"`
+	LoadAvg5      float64          `json:"load_avg_5"`
+	MemUsedPct    float64          `json:"mem_used_pct"`
+	DiskUsedPct   float64          `json:"disk_used_pct"`
+	NetboxRunning bool             `json:"netbox_running"`
+	RQRunning     bool             `json:"rq_running"`
+	NetboxVersion string           `json:"netbox_version,omitempty"` // e.g. "4.1.0"
+	PatroniRole   string           `json:"patroni_role"`             // "primary", "replica", "standby_leader", ""
+	PatroniLagB   *int64           `json:"patroni_lag_bytes,omitempty"`
 	PatroniState  *json.RawMessage `json:"patroni_state,omitempty"` // full Patroni /patroni response
 
 	// Service-level health indicators added in v0.1.1+.
 	RedisRunning    bool   `json:"redis_running"`
-	RedisRole       string `json:"redis_role,omitempty"`    // "master" | "slave" | ""
+	RedisRole       string `json:"redis_role,omitempty"` // "master" | "slave" | ""
 	SentinelRunning bool   `json:"sentinel_running"`
 	PatroniRunning  bool   `json:"patroni_running"`
 	PostgresRunning bool   `json:"postgres_running"`
@@ -172,40 +173,42 @@ type TaskResultPayload struct {
 	Output     string `json:"output,omitempty"`
 	ErrorMsg   string `json:"error,omitempty"`
 	DurationMs int64  `json:"duration_ms"`
+	// Repaired lists folders whose access the agent restored (e.g. after a
+	// NetBox upgrade) since its previous task result, not only in this task.
+	Repaired []string `json:"repaired,omitempty"`
 }
 
-// MediaChunkPayload carries a chunk of a file being relayed through the server.
-type MediaChunkPayload struct {
-	TransferID   string `json:"transfer_id"`
-	RelativePath string `json:"relative_path"`
-	ChunkIndex   int    `json:"chunk_index"`
-	TotalChunks  int    `json:"total_chunks"`
-	Data         []byte `json:"data"` // raw bytes; JSON marshals as base64
-	EOF          bool   `json:"eof"`
+// SyncListingPayload carries one piece of a sync.list result. A listing is
+// split across messages because agent↔conductor messages are capped at 4 MB.
+type SyncListingPayload struct {
+	SyncID string     `json:"sync_id"`
+	Files  []SyncFile `json:"files"`
 }
 
-// MediaChunkAckPayload acknowledges receipt of a chunk (backpressure).
-type MediaChunkAckPayload struct {
-	TransferID string `json:"transfer_id"`
-	ChunkIndex int    `json:"chunk_index"`
+// SyncFile is one regular file in a sync folder.
+type SyncFile struct {
+	Path   string `json:"path"` // relative to the sync folder, slash-separated
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+	MTime  int64  `json:"mtime"` // modification time, Unix nanoseconds; picks the newest of two edits
 }
 
-// BackupChunkPayload carries a chunk of a pgBackRest repo file relayed through the server.
-// Mirrors MediaChunkPayload. Files are skipped on the write side if they already exist
-// (pgBackRest repo files are immutable once written — same relative path = same content).
-type BackupChunkPayload struct {
-	TransferID   string `json:"transfer_id"`
-	RelativePath string `json:"relative_path"` // path relative to the repo root
-	ChunkIndex   int    `json:"chunk_index"`
-	Data         []byte `json:"data"`
-	EOF          bool   `json:"eof"`
+// SyncChunkPayload carries one chunk of a file being synced. A file's chunks
+// arrive in order; the last one has EOF set. Gone or Err end a file early.
+type SyncChunkPayload struct {
+	SyncID string `json:"sync_id"`
+	Path   string `json:"path"`
+	Index  int    `json:"index"`
+	Data   []byte `json:"data,omitempty"` // JSON marshals as base64
+	EOF    bool   `json:"eof,omitempty"`
+	SHA256 string `json:"sha256,omitempty"` // with EOF: hash of all the data sent
+	Gone   bool   `json:"gone,omitempty"`   // file vanished on the source since the listing
+	Err    string `json:"err,omitempty"`    // source couldn't read the file
 }
 
-// BackupChunkAckPayload acknowledges receipt of a backup chunk (backpressure).
-type BackupChunkAckPayload struct {
-	TransferID string `json:"transfer_id"`
-	ChunkIndex int    `json:"chunk_index"`
-}
+// SyncPartialSuffix marks a file still being received; it is renamed into
+// place only once its hash matches.
+const SyncPartialSuffix = ".nbc-partial"
 
 // NetboxLogPayload carries a batch of NetBox application log lines from the agent.
 type NetboxLogPayload struct {
@@ -240,13 +243,6 @@ type TaskDispatchPayload struct {
 	TaskType    TaskType        `json:"task_type"`
 	Params      json.RawMessage `json:"params"`
 	TimeoutSecs int             `json:"timeout_secs"`
-}
-
-// MediaRequestPayload instructs the agent to begin streaming a file to the server.
-type MediaRequestPayload struct {
-	TransferID   string `json:"transfer_id"`
-	RelativePath string `json:"relative_path"` // empty = full MEDIA_ROOT
-	ChunkSize    int    `json:"chunk_size"`    // bytes per chunk
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -315,10 +311,10 @@ type SentinelConfigWriteParams struct {
 //   - "reinitialize": run `patronictl reinitialize` (re-clones replica from primary)
 //   - "pitr": run a custom restore command with a target recovery time (requires pgBackRest/WAL-E)
 type DBRestoreParams struct {
-	Method        string `json:"method"`          // "reinitialize" | "pitr"
-	TargetTime    string `json:"target_time"`     // ISO8601 — used for pitr
-	RestoreCmd    string `json:"restore_command"` // optional: override default restore command
-	PatroniScope  string `json:"patroni_scope"`   // cluster scope for patronictl
+	Method       string `json:"method"`          // "reinitialize" | "pitr"
+	TargetTime   string `json:"target_time"`     // ISO8601 — used for pitr
+	RestoreCmd   string `json:"restore_command"` // optional: override default restore command
+	PatroniScope string `json:"patroni_scope"`   // cluster scope for patronictl
 }
 
 // DBBackupParams are the params for TaskDBBackup.
@@ -329,15 +325,6 @@ type DBBackupParams struct {
 	DBName    string `json:"db_name"`    // database to dump; default "netbox"
 	DBUser    string `json:"db_user"`    // Postgres role to connect as; default "postgres"
 	OutputDir string `json:"output_dir"` // directory for the dump file; default "/var/lib/postgresql/backups"
-}
-
-// MediaSyncParams are the params for TaskMediaSync.
-type MediaSyncParams struct {
-	Direction    string `json:"direction"`      // "push_to_server" | "pull_from_server"
-	RelativePath string `json:"relative_path"`  // "" = full sync within SourcePath
-	SourcePath   string `json:"source_path"`    // absolute path override; "" = use MEDIA_ROOT
-	ChunkSizeB   int    `json:"chunk_size"`
-	TransferID   string `json:"transfer_id"`
 }
 
 // PatroniInstallParams are the params for TaskInstallPatroni.
@@ -354,18 +341,6 @@ type CreatePgRoleParams struct {
 	RoleName string   `json:"role_name"`
 	Password string   `json:"password"`
 	Options  []string `json:"options"` // e.g. ["LOGIN", "REPLICATION"]
-}
-
-// EnforceRetentionParams are the params for TaskEnforceRetention.
-type EnforceRetentionParams struct {
-	PatroniScope string `json:"patroni_scope"` // pgBackRest stanza name (defaults to "main")
-	ExpireCmd    string `json:"expire_cmd"`    // optional override for the expire command
-}
-
-// AgentUpgradeParams are the params for TaskAgentUpgrade.
-type AgentUpgradeParams struct {
-	DownloadURL string `json:"download_url"` // full URL of the tarball (e.g. https://conductor:8443/api/v1/downloads/agent-linux-amd64)
-	Arch        string `json:"arch"`         // "amd64" | "arm64"
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -413,21 +388,49 @@ type PGBackRestTestPathParams struct {
 	Path string `json:"path"` // absolute path to test for write access by the postgres user
 }
 
-// BackupSyncReadParams are the params for TaskBackupSyncRead.
-// The agent walks the local pgBackRest repo, hashes each file, and streams
-// new/changed files as chunks through the conductor relay to target nodes.
-// This mirrors the MediaSyncParams chunked-transfer pattern.
-type BackupSyncReadParams struct {
-	RepoPath    string   `json:"repo_path"`    // local pgBackRest repo dir; default /var/lib/pgbackrest
-	TransferID  string   `json:"transfer_id"`  // correlates read and write sides
-	ChunkSizeB  int      `json:"chunk_size"`   // bytes per chunk; default 65536
-	TargetNodes []string `json:"target_nodes"` // node IDs to relay chunks to
+// SyncListParams are the params for TaskSyncList. Root "" means the node's
+// NetBox media folder. The task's output is a SyncListResult as JSON.
+type SyncListParams struct {
+	SyncID string `json:"sync_id"`
+	Root   string `json:"root"`
 }
 
-// BackupSyncWriteParams are the params for TaskBackupSyncWrite.
-// The agent receives chunks relayed by the conductor and writes them into
-// its local pgBackRest repo directory.
-type BackupSyncWriteParams struct {
-	RepoPath   string `json:"repo_path"`   // destination pgBackRest repo dir
-	TransferID string `json:"transfer_id"` // matches BackupSyncReadParams.TransferID
+// SyncListResult is the output of TaskSyncList.
+type SyncListResult struct {
+	Files     int    `json:"files"`      // entries sent in sync.listing messages
+	FreeBytes uint64 `json:"free_bytes"` // space available to the agent in Root
+}
+
+// SyncSendParams are the params for TaskSyncSend.
+type SyncSendParams struct {
+	SyncID string   `json:"sync_id"`
+	Root   string   `json:"root"`
+	Paths  []string `json:"paths"` // sent in this order
+}
+
+// SyncReceiveParams are the params for TaskSyncReceive.
+type SyncReceiveParams struct {
+	SyncID   string `json:"sync_id"`
+	Root     string `json:"root"`
+	FileMode uint32 `json:"file_mode"` // os.FileMode for written files
+	DirMode  uint32 `json:"dir_mode"`  // os.FileMode for created dirs (os.ModeSetgid, not 0o2000)
+}
+
+// SyncFinishParams are the params for TaskSyncFinish. Output is a SyncFinishResult as JSON.
+type SyncFinishParams struct {
+	SyncID string `json:"sync_id"`
+}
+
+// SyncFinishResult is the output of TaskSyncFinish.
+type SyncFinishResult struct {
+	Copied  int      `json:"copied"`
+	Skipped int      `json:"skipped"` // vanished on the source mid-sync
+	Failed  []string `json:"failed"`  // "path: reason", capped
+	Errors  int      `json:"errors"`  // total failures (Failed may be capped)
+}
+
+// SyncDeleteParams are the params for TaskSyncDelete.
+type SyncDeleteParams struct {
+	Root  string   `json:"root"`
+	Paths []string `json:"paths"`
 }

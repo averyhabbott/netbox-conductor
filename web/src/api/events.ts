@@ -1,5 +1,17 @@
 import client from './client'
 
+export const SEVERITIES = ['debug', 'info', 'warn', 'error', 'critical']
+export const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
+
+// Text colour per event severity.
+export const SEV_TEXT: Record<string, string> = {
+  debug:    'text-gray-400',
+  info:     'text-blue-400',
+  warn:     'text-amber-400',
+  error:    'text-red-400',
+  critical: 'text-red-300 font-semibold',
+}
+
 export interface Event {
   id: string
   cluster_id?: string

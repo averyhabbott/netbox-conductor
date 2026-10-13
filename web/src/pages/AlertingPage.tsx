@@ -7,34 +7,16 @@ import {
   type ActiveAlertState,
   type AlertFireLog,
 } from '../api/alerts'
+import { apiError } from '../api/client'
+import { CATEGORIES, SEVERITIES, SEV_TEXT } from '../api/events'
 import { clustersApi, type Cluster } from '../api/clusters'
 import { nodesApi, type Node } from '../api/nodes'
 import Layout from '../components/Layout'
+import TabBtn from '../components/TabBtn'
 
 type Tab = 'active' | 'history' | 'rules' | 'transports' | 'schedules'
 
-function TabBtn({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-        active ? 'border-blue-500 text-white' : 'border-transparent text-gray-400 hover:text-white'
-      }`}
-    >
-      {label}
-    </button>
-  )
-}
-
 // ─── Shared style tokens ──────────────────────────────────────────────────────
-
-const SEV: Record<string, string> = {
-  debug:    'text-gray-400',
-  info:     'text-blue-400',
-  warn:     'text-amber-400',
-  error:    'text-red-400',
-  critical: 'text-red-300 font-semibold',
-}
 
 const SEV_BG: Record<string, string> = {
   debug:    'bg-gray-800 text-gray-400',
@@ -350,7 +332,7 @@ function TransportForm({
     setErr('')
     setSaving(true)
     try { await onSave({ name, type, config: buildConfig(), enabled }) }
-    catch (ex: unknown) { setErr(ex instanceof Error ? ex.message : 'Save failed') }
+    catch (ex: unknown) { setErr(apiError(ex, 'Save failed')) }
     finally { setSaving(false) }
   }
 
@@ -490,7 +472,7 @@ function TransportsTab() {
       await alertsApi.testTransport(id)
       alert('Test notification sent successfully.')
     } catch (ex: unknown) {
-      alert('Test failed: ' + (ex instanceof Error ? ex.message : String(ex)))
+      alert('Test failed: ' + apiError(ex, String(ex)))
     } finally { setTesting(null) }
   }
 
@@ -551,9 +533,6 @@ function TransportsTab() {
 }
 
 // ─── Rules ────────────────────────────────────────────────────────────────────
-
-const CATEGORIES = ['cluster', 'service', 'ha', 'config', 'agent']
-const SEVERITIES = ['debug', 'info', 'warn', 'error', 'critical']
 
 const METRIC_FIELDS: { value: string; label: string }[] = [
   { value: 'disk_used_pct',         label: 'Disk used %' },
@@ -650,7 +629,7 @@ function RuleForm({
     }
     setSaving(true)
     try { await onSave(body) } catch (ex: unknown) {
-      setErr(ex instanceof Error ? ex.message : 'Save failed')
+      setErr(apiError(ex, 'Save failed'))
     } finally { setSaving(false) }
   }
 
@@ -922,7 +901,7 @@ function RulesTab() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 mb-1">
                       <span className="text-white text-sm font-medium">{r.name}</span>
-                      <span className={`text-xs ${SEV[r.min_severity]}`}>{r.min_severity}+</span>
+                      <span className={`text-xs ${SEV_TEXT[r.min_severity]}`}>{r.min_severity}+</span>
                       <span className="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded">
                         {FIRE_MODE_SHORT[r.fire_mode] ?? r.fire_mode}
                       </span>
@@ -1129,11 +1108,11 @@ export default function AlertingPage() {
         <h1 className="text-xl font-semibold text-white mb-6">Alerting</h1>
 
         <div className="flex gap-1 mb-6 border-b border-gray-800">
-          <TabBtn label="Active Alerts" active={tab === 'active'}     onClick={() => setTab('active')} />
-          <TabBtn label="History"       active={tab === 'history'}    onClick={() => setTab('history')} />
-          <TabBtn label="Rules"         active={tab === 'rules'}      onClick={() => setTab('rules')} />
-          <TabBtn label="Transports"    active={tab === 'transports'} onClick={() => setTab('transports')} />
-          <TabBtn label="Schedules"     active={tab === 'schedules'}  onClick={() => setTab('schedules')} />
+          <TabBtn active={tab === 'active'}     onClick={() => setTab('active')}>Active Alerts</TabBtn>
+          <TabBtn active={tab === 'history'}    onClick={() => setTab('history')}>History</TabBtn>
+          <TabBtn active={tab === 'rules'}      onClick={() => setTab('rules')}>Rules</TabBtn>
+          <TabBtn active={tab === 'transports'} onClick={() => setTab('transports')}>Transports</TabBtn>
+          <TabBtn active={tab === 'schedules'}  onClick={() => setTab('schedules')}>Schedules</TabBtn>
         </div>
 
         {tab === 'active'     && <ActiveTab />}

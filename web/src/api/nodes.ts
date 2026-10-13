@@ -29,6 +29,17 @@ export interface Node {
   postgres_running?: boolean | null
 }
 
+export const NODE_ROLES: { value: Node['role']; label: string; detail: string }[] = [
+  { value: 'hyperconverged', label: 'Hyperconverged', detail: 'NetBox + DB + Redis' },
+  { value: 'app',            label: 'App only',       detail: 'NetBox + RQ + Redis' },
+  { value: 'db_only',        label: 'DB only',        detail: 'Postgres + Patroni' },
+]
+
+export const roleLabel = (role: string) => NODE_ROLES.find((r) => r.value === role)?.label ?? role
+
+// True when the hostname contains characters outside letters, digits, dots and hyphens.
+export const isInvalidHostname = (hostname: string) => /[^a-zA-Z0-9.-]/.test(hostname)
+
 export interface CreateNodeBody {
   hostname: string
   ip_address: string
@@ -89,25 +100,6 @@ export const nodesApi = {
       )
       .then((r) => r.data),
 
-  fetchAgentEnvText: (clusterId: string, nodeId: string) =>
-    client
-      .post<string>(`/clusters/${clusterId}/nodes/${nodeId}/agent-env`, {}, { responseType: 'text' })
-      .then((r) => r.data as unknown as string),
-
-  downloadAgentEnv: async (clusterId: string, nodeId: string, hostname: string) => {
-    const response = await client.post(
-      `/clusters/${clusterId}/nodes/${nodeId}/agent-env`,
-      {},
-      { responseType: 'blob' }
-    )
-    const url = window.URL.createObjectURL(response.data as Blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `netbox-agent-${hostname}.env`
-    a.click()
-    window.URL.revokeObjectURL(url)
-  },
-
   setMaintenance: (clusterId: string, nodeId: string, enabled: boolean) =>
     client
       .put<Node>(`/clusters/${clusterId}/nodes/${nodeId}/maintenance`, { enabled })
@@ -133,10 +125,4 @@ export const nodesApi = {
       .get<{ names: string[] }>(`/clusters/${clusterId}/nodes/${nodeId}/netbox-log-names`)
       .then((r) => r.data),
 
-  upgradeAgent: (clusterId: string, nodeId: string) =>
-    client
-      .post<{ task_id: string; status: string }>(
-        `/clusters/${clusterId}/nodes/${nodeId}/upgrade-agent`
-      )
-      .then((r) => r.data),
 }

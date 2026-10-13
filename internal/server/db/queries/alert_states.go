@@ -37,32 +37,40 @@ func NewAlertStateQuerier(pool *pgxpool.Pool) *AlertStateQuerier {
 	return &AlertStateQuerier{pool: pool}
 }
 
-// UpsertActive inserts a new active state or returns the existing one.
-// Returns (state, isNew, error).
-func (q *AlertStateQuerier) UpsertActive(ctx context.Context, ruleID uuid.UUID, clusterID, nodeID *uuid.UUID) (*AlertState, bool, error) {
+const alertStateCols = `id, rule_id, cluster_id, node_id, state, re_alert_count, escalated,
+	first_fired_at, last_fired_at, last_alerted_at,
+	resolved_at, acknowledged_at, acknowledged_by`
+
+// scanAlertState scans alertStateCols; ListActive scans its joined columns itself.
+func scanAlertState(row interface{ Scan(...any) error }) (*AlertState, error) {
 	var s AlertState
-	err := q.pool.QueryRow(ctx, `
-		INSERT INTO active_alert_states (rule_id, cluster_id, node_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING
-		RETURNING id, rule_id, cluster_id, node_id, state, re_alert_count, escalated,
-		          first_fired_at, last_fired_at, last_alerted_at,
-		          resolved_at, acknowledged_at, acknowledged_by`,
-		ruleID, clusterID, nodeID,
-	).Scan(
+	if err := row.Scan(
 		&s.ID, &s.RuleID, &s.ClusterID, &s.NodeID, &s.State,
 		&s.ReAlertCount, &s.Escalated,
 		&s.FirstFiredAt, &s.LastFiredAt, &s.LastAlertedAt,
 		&s.ResolvedAt, &s.AcknowledgedAt, &s.AcknowledgedBy,
-	)
+	); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// UpsertActive inserts a new active state or returns the existing one.
+// Returns (state, isNew, error).
+func (q *AlertStateQuerier) UpsertActive(ctx context.Context, ruleID uuid.UUID, clusterID, nodeID *uuid.UUID) (*AlertState, bool, error) {
+	s, err := scanAlertState(q.pool.QueryRow(ctx, `
+		INSERT INTO active_alert_states (rule_id, cluster_id, node_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT DO NOTHING
+		RETURNING `+alertStateCols,
+		ruleID, clusterID, nodeID,
+	))
 	if err == nil {
-		return &s, true, nil
+		return s, true, nil
 	}
 	// Row already existed — fetch it.
-	err = q.pool.QueryRow(ctx, `
-		SELECT id, rule_id, cluster_id, node_id, state, re_alert_count, escalated,
-		       first_fired_at, last_fired_at, last_alerted_at,
-		       resolved_at, acknowledged_at, acknowledged_by
+	s, err = scanAlertState(q.pool.QueryRow(ctx, `
+		SELECT `+alertStateCols+`
 		FROM active_alert_states
 		WHERE rule_id     = $1
 		  AND cluster_id  IS NOT DISTINCT FROM $2
@@ -70,13 +78,8 @@ func (q *AlertStateQuerier) UpsertActive(ctx context.Context, ruleID uuid.UUID, 
 		  AND state      != 'resolved'
 		LIMIT 1`,
 		ruleID, clusterID, nodeID,
-	).Scan(
-		&s.ID, &s.RuleID, &s.ClusterID, &s.NodeID, &s.State,
-		&s.ReAlertCount, &s.Escalated,
-		&s.FirstFiredAt, &s.LastFiredAt, &s.LastAlertedAt,
-		&s.ResolvedAt, &s.AcknowledgedAt, &s.AcknowledgedBy,
-	)
-	return &s, false, err
+	))
+	return s, false, err
 }
 
 // MarkAlerted updates last_fired_at, last_alerted_at, and increments re_alert_count.
@@ -97,28 +100,16 @@ func (q *AlertStateQuerier) MarkEscalated(ctx context.Context, id uuid.UUID) err
 
 // Resolve marks an alert state as resolved.
 func (q *AlertStateQuerier) Resolve(ctx context.Context, ruleID uuid.UUID, clusterID, nodeID *uuid.UUID) (*AlertState, error) {
-	var s AlertState
-	err := q.pool.QueryRow(ctx, `
+	return scanAlertState(q.pool.QueryRow(ctx, `
 		UPDATE active_alert_states
 		SET state = 'resolved', resolved_at = now()
 		WHERE rule_id    = $1
 		  AND cluster_id IS NOT DISTINCT FROM $2
 		  AND node_id    IS NOT DISTINCT FROM $3
 		  AND state      = 'active'
-		RETURNING id, rule_id, cluster_id, node_id, state, re_alert_count, escalated,
-		          first_fired_at, last_fired_at, last_alerted_at,
-		          resolved_at, acknowledged_at, acknowledged_by`,
+		RETURNING `+alertStateCols,
 		ruleID, clusterID, nodeID,
-	).Scan(
-		&s.ID, &s.RuleID, &s.ClusterID, &s.NodeID, &s.State,
-		&s.ReAlertCount, &s.Escalated,
-		&s.FirstFiredAt, &s.LastFiredAt, &s.LastAlertedAt,
-		&s.ResolvedAt, &s.AcknowledgedAt, &s.AcknowledgedBy,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &s, nil
+	))
 }
 
 // ResolveByID marks a specific active alert state as resolved by its state ID.

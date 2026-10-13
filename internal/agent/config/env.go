@@ -4,9 +4,10 @@ package config
 import (
 	"fmt"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 
+	"github.com/averyhabbott/netbox-conductor/internal/shared/env"
 	"github.com/joho/godotenv"
 )
 
@@ -17,20 +18,15 @@ type Config struct {
 	Token  string
 
 	// Server connection
-	ServerURL             string
-	TLSSkipVerify         bool
-	TLSCACert             string
-	ReconnectIntervalSecs int
-
-	// Cert auto-learning
-	// When true the agent downloads the conductor's CA cert on startup,
-	// saves it to /etc/netbox-agent/ca.crt, and updates the env file.
-	UpdateCert bool
+	ServerURL     string
+	TLSSkipVerify bool
+	TLSCACert     string
 
 	// Logging
 	LogLevel string
 
-	// NetBox paths
+	// NetBox paths, derived from NETBOX_ROOT. Empty when the node has no NetBox
+	// (db_only nodes; install.sh --db-only writes NETBOX_ROOT empty).
 	NetboxConfigPath string
 	NetboxMediaRoot  string
 	NetboxLogPath    string
@@ -58,24 +54,23 @@ func Load(envFile string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		NodeID:                os.Getenv("AGENT_NODE_ID"),
-		Token:                 os.Getenv("AGENT_TOKEN"),
-		ServerURL:             os.Getenv("AGENT_SERVER_URL"),
-		TLSCACert:             os.Getenv("AGENT_TLS_CA_CERT"),
-		LogLevel:              envOr("AGENT_LOG_LEVEL", "info"),
-		NetboxConfigPath:      envOr("NETBOX_CONFIG_PATH", "/opt/netbox/netbox/netbox/configuration.py"),
-		NetboxMediaRoot:       envOr("NETBOX_MEDIA_ROOT", "/opt/netbox/netbox/media"),
-		NetboxLogPath:         os.Getenv("NETBOX_LOG_PATH"),
-		PatroniRESTURL:        envOr("PATRONI_REST_URL", "http://127.0.0.1:8008"),
-		ReconnectIntervalSecs: envInt("AGENT_RECONNECT_INTERVAL_SECS", 10),
-		StatusAddr:            envStatusAddr(),
+		NodeID:         os.Getenv("AGENT_NODE_ID"),
+		Token:          os.Getenv("AGENT_TOKEN"),
+		ServerURL:      os.Getenv("AGENT_SERVER_URL"),
+		TLSCACert:      os.Getenv("AGENT_TLS_CA_CERT"),
+		LogLevel:       env.Or("AGENT_LOG_LEVEL", "info"),
+		NetboxLogPath:  os.Getenv("NETBOX_LOG_PATH"),
+		PatroniRESTURL: env.Or("PATRONI_REST_URL", "http://127.0.0.1:8008"),
+		StatusAddr:     envStatusAddr(),
 	}
 
 	skipVerify := strings.ToLower(os.Getenv("AGENT_TLS_SKIP_VERIFY"))
 	cfg.TLSSkipVerify = skipVerify == "true" || skipVerify == "1" || skipVerify == "yes"
 
-	updateCert := strings.ToLower(os.Getenv("UPDATE_CERT"))
-	cfg.UpdateCert = updateCert == "true" || updateCert == "1" || updateCert == "yes"
+	if root := os.Getenv("NETBOX_ROOT"); root != "" {
+		cfg.NetboxConfigPath = filepath.Join(root, "netbox/netbox/configuration.py")
+		cfg.NetboxMediaRoot = filepath.Join(root, "netbox/media")
+	}
 
 	return cfg, cfg.validate()
 }
@@ -113,24 +108,8 @@ func envStatusAddr() string {
 	if v := os.Getenv("AGENT_STATUS_ADDR"); v != "" {
 		return v
 	}
-	if port := envInt("AGENT_STATUS_PORT", 0); port > 0 {
+	if port := env.Int("AGENT_STATUS_PORT", 0); port > 0 {
 		return fmt.Sprintf("127.0.0.1:%d", port)
 	}
 	return "127.0.0.1:8081"
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return fallback
 }

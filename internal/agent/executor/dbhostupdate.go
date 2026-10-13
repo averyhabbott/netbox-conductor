@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -19,9 +20,9 @@ var hostLineRe = regexp.MustCompile(`'HOST'\s*:\s*'[^']*'`)
 // This is dispatched by the conductor when the Patroni primary changes on an
 // app_tier_always_available cluster, so every app-tier node reconnects to the
 // new writable primary without a full config rewrite.
-func UpdateDBHost(params protocol.DBHostUpdateParams, configPath string) (string, error) {
+func UpdateDBHost(ctx context.Context, params protocol.DBHostUpdateParams, configPath string) (string, error) {
 	if configPath == "" {
-		return "", fmt.Errorf("NETBOX_CONFIG_PATH is not configured")
+		return "", ErrNoNetbox
 	}
 	if params.Host == "" {
 		return "", fmt.Errorf("host must not be empty")
@@ -44,21 +45,10 @@ func UpdateDBHost(params protocol.DBHostUpdateParams, configPath string) (string
 		return fmt.Sprintf("DATABASE.HOST already set to %s — no change needed", params.Host), nil
 	}
 
-	if err := os.WriteFile(configPath, []byte(updated), 0640); err != nil {
-		return "", fmt.Errorf("writing %s: %w", configPath, err)
+	if err := writeNetboxConfig(ctx, configPath, updated, false); err != nil {
+		return "", err
 	}
 
 	output := fmt.Sprintf("updated DATABASE.HOST to %s in %s", params.Host, configPath)
-
-	if params.RestartAfter {
-		restartOut, err := restartNetbox()
-		output += "\n" + restartOut
-		if err != nil {
-			// Non-fatal: config was updated; log the restart failure but don't
-			// mark the task as failed — the next systemd restart will pick it up.
-			output += "\nwarn: restart failed: " + err.Error()
-		}
-	}
-
-	return output, nil
+	return withNetboxRestart(ctx, output, params.RestartAfter), nil
 }

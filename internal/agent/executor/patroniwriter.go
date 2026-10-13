@@ -1,15 +1,11 @@
 package executor
 
 import (
-	"crypto/sha256"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -17,14 +13,11 @@ import (
 const defaultPatroniConfigPath = "/etc/patroni/patroni.yml"
 
 // WritePatroniConfig atomically writes patroni.yml and optionally restarts Patroni.
-func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error) {
+func WritePatroniConfig(ctx context.Context, params protocol.PatroniConfigWriteParams) (string, error) {
 	configPath := defaultPatroniConfigPath
 
-	if params.Sha256 != "" {
-		sum := sha256.Sum256([]byte(params.Content))
-		if actual := fmt.Sprintf("%x", sum[:]); actual != params.Sha256 {
-			return "", fmt.Errorf("sha256 mismatch: expected %s got %s", params.Sha256, actual)
-		}
+	if _, err := checkSHA256(params.Content, params.Sha256); err != nil {
+		return "", err
 	}
 
 	dir := filepath.Dir(configPath)
@@ -33,29 +26,19 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 	}
 
 	// patroni.yml holds DB passwords, so only the postgres group (Patroni,
-	// patronictl) may read it. If the agent can't hand the file to that group
-	// (not a member), fall back to world-readable so Patroni still starts.
-	fileMode, dirMode := os.FileMode(0644), os.FileMode(0755)
-	pgGID := -1
-	if pg, err := user.LookupGroup("postgres"); err == nil {
-		if gid, err := strconv.Atoi(pg.Gid); err == nil && os.Chown(dir, -1, gid) == nil {
-			pgGID, fileMode, dirMode = gid, 0640, 0750
-		}
+	// patronictl) may read it.
+	pgGID := groupID("postgres")
+	if pgGID < 0 {
+		return "", fmt.Errorf("postgres group not found — install PostgreSQL, then rerun install.sh")
+	}
+	if err := os.Chown(dir, -1, pgGID); err != nil {
+		return "", fmt.Errorf("giving %s to the postgres group: %w — rerun install.sh (it adds netbox-agent to that group)", dir, err)
 	}
 	// Explicit chmod bypasses any restrictive umask on the agent service.
-	_ = os.Chmod(dir, dirMode)
+	_ = os.Chmod(dir, 0750)
 
-	tmpPath := filepath.Join(dir, fmt.Sprintf(".patroni-config.tmp.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpPath, []byte(params.Content), 0600); err != nil {
-		return "", fmt.Errorf("writing temp config: %w", err)
-	}
-	if pgGID >= 0 {
-		_ = os.Chown(tmpPath, -1, pgGID)
-	}
-	_ = os.Chmod(tmpPath, fileMode)
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("atomic rename failed: %w", err)
+	if err := writeFileAtomic(configPath, params.Content, 0640, pgGID); err != nil {
+		return "", err
 	}
 
 	// The Debian/Ubuntu Patroni systemd unit ships with
@@ -74,14 +57,14 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 	// rather than in the data directory. Patroni requires postgresql.conf to be present
 	// in the data dir (or config_dir) before it can start. Copy any missing conf files
 	// from the Debian location into the data dir so the first Patroni start succeeds.
-	if confNote := ensurePostgresConfsInDataDir(); confNote != "" {
+	if confNote := ensurePostgresConfsInDataDir(ctx); confNote != "" {
 		symlinkNote += confNote
 	}
 
 	output := fmt.Sprintf("wrote %d bytes to %s%s", len(params.Content), configPath, symlinkNote)
 
 	if params.RestartAfter {
-		cmd := exec.Command("systemctl", "restart", "patroni")
+		cmd := Command(ctx, "systemctl", "restart", "patroni")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return output, fmt.Errorf("patroni restart failed: %w\n%s", err, out)
 		}
@@ -94,9 +77,9 @@ func WritePatroniConfig(params protocol.PatroniConfigWriteParams) (string, error
 // ensurePostgresConfsInDataDir copies postgresql.conf, pg_hba.conf, and pg_ident.conf
 // from the Debian/Ubuntu /etc/postgresql/<ver>/main/ directory into the PostgreSQL
 // data directory if they are not already present. Returns a short status note.
-func ensurePostgresConfsInDataDir() string {
+func ensurePostgresConfsInDataDir(ctx context.Context) string {
 	// Find the first PostgreSQL cluster via pg_lsclusters
-	out, err := exec.Command("pg_lsclusters", "-h").Output()
+	out, err := Command(ctx, "pg_lsclusters", "-h").Output()
 	if err != nil {
 		return "" // pg_lsclusters not available (non-Debian) — nothing to do
 	}
@@ -130,7 +113,7 @@ func ensurePostgresConfsInDataDir() string {
 			continue
 		}
 		// Ensure postgres can read it
-		_ = exec.Command("chown", "postgres:postgres", dst).Run()
+		_ = Command(ctx, "chown", "postgres:postgres", dst).Run()
 		copied++
 	}
 	if copied > 0 {
@@ -140,11 +123,11 @@ func ensurePostgresConfsInDataDir() string {
 }
 
 // RunCommand executes an arbitrary command (admin-only exec.run task).
-func RunCommand(params protocol.RunCommandParams) (string, error) {
+func RunCommand(ctx context.Context, params protocol.RunCommandParams) (string, error) {
 	if params.Command == "" {
 		return "", fmt.Errorf("command is required")
 	}
-	cmd := exec.Command(params.Command, params.Args...)
+	cmd := Command(ctx, params.Command, params.Args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("command failed: %w", err)

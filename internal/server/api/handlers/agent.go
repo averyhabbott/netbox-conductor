@@ -18,27 +18,14 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
 	"github.com/averyhabbott/netbox-conductor/internal/server/failover"
+	"github.com/averyhabbott/netbox-conductor/internal/server/filesync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
-	"github.com/averyhabbott/netbox-conductor/internal/server/media"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
 
 const serverVersion = "0.1.0"
-
-// BackupChunkRouter fan-outs backup.chunk messages to registered target nodes.
-// Implemented by backupsync.Manager; interface avoids import cycle.
-type BackupChunkRouter interface {
-	GetTargets(transferID uuid.UUID) ([]uuid.UUID, bool)
-	DropTarget(transferID, nodeID uuid.UUID)
-	Remove(transferID uuid.UUID)
-}
-
-// relaySendTimeout bounds how long relaying one sync chunk may block the source
-// agent's read loop. Must stay well under the 10 s pong deadline (hub/session.go),
-// or the source agent's connection is dropped while we wait.
-const relaySendTimeout = 5 * time.Second
 
 // AgentHandler handles agent WebSocket connections and registration.
 type AgentHandler struct {
@@ -54,8 +41,7 @@ type AgentHandler struct {
 	taskResults   *queries.TaskResultQuerier
 	catalog       *queries.BackupCatalogQuerier
 	enc           *crypto.Encryptor
-	media         *media.Manager
-	backupSync    BackupChunkRouter
+	fileSync      *filesync.Manager
 	failover      *failover.Manager
 	emitter       events.Emitter
 	hbQ           *queries.HeartbeatQuerier
@@ -91,7 +77,6 @@ func NewAgentHandler(
 		stagingAgents: stagingAgents,
 		taskResults:   taskResults,
 		enc:           enc,
-		media:         media.NewManager(),
 		failover:      fo,
 		logDir:        logDir,
 		logName:       logName,
@@ -101,8 +86,8 @@ func NewAgentHandler(
 // SetCatalogQuerier wires the backup catalog querier for catalog task processing.
 func (h *AgentHandler) SetCatalogQuerier(q *queries.BackupCatalogQuerier) { h.catalog = q }
 
-// SetBackupSyncRouter wires the backup sync relay manager.
-func (h *AgentHandler) SetBackupSyncRouter(r BackupChunkRouter) { h.backupSync = r }
+// SetFileSync wires the folder sync manager (backups, media, extra folders).
+func (h *AgentHandler) SetFileSync(m *filesync.Manager) { h.fileSync = m }
 
 // SetEmitter wires up the event emitter (called from main after construction).
 func (h *AgentHandler) SetEmitter(e events.Emitter) { h.emitter = e }
@@ -137,6 +122,15 @@ type stagingRegisterResponse struct {
 	AgentToken     string `json:"agent_token"`
 }
 
+// newAgentToken returns a fresh raw agent token and the hash to store for it.
+func newAgentToken() (rawToken, hash string, err error) {
+	rawToken, err = crypto.GenerateToken(48)
+	if err != nil {
+		return "", "", err
+	}
+	return rawToken, crypto.HashToken(rawToken), nil
+}
+
 // Register exchanges a one-time registration token for a permanent agent token.
 // POST /api/v1/agent/register
 func (h *AgentHandler) Register(c echo.Context) error {
@@ -160,11 +154,11 @@ func (h *AgentHandler) Register(c echo.Context) error {
 	}
 
 	// Generate permanent agent token
-	rawToken, err := crypto.GenerateToken(48)
+	rawToken, tokenHash, err := newAgentToken()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "token generation failed")
 	}
-	if err := h.agentToks.Create(c.Request().Context(), nodeID, crypto.HashToken(rawToken)); err != nil {
+	if err := h.agentToks.Create(c.Request().Context(), nodeID, tokenHash); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "token storage failed")
 	}
 
@@ -194,7 +188,7 @@ func (h *AgentHandler) StagingRegister(c echo.Context) error {
 	}
 
 	// Generate permanent agent token
-	rawToken, err := crypto.GenerateToken(48)
+	rawToken, tokenHash, err := newAgentToken()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "token generation failed")
 	}
@@ -206,7 +200,7 @@ func (h *AgentHandler) StagingRegister(c echo.Context) error {
 		OS:           req.OS,
 		Arch:         req.Arch,
 		AgentVersion: req.AgentVersion,
-		TokenHash:    crypto.HashToken(rawToken),
+		TokenHash:    tokenHash,
 	})
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "agent registration failed")
@@ -314,7 +308,12 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	defer func() {
 		agentLog.Logger.Info("agent disconnected")
 		agentLog.Close()
-		h.hub.UnregisterIfSame(nodeID, sess)
+		if !h.hub.UnregisterIfSame(nodeID, sess) {
+			// A reconnect already replaced this session; announcing a disconnect
+			// now would cancel its failback timer and raise a false alert.
+			slog.Info("agent session replaced by reconnect", "node", nodeID, "hostname", node.Hostname)
+			return
+		}
 		_ = h.nodes.UpdateAgentStatus(context.Background(), nodeID, "disconnected")
 		h.broker.Publish(sse.Event{
 			Type:   sse.EventNodeStatus,
@@ -395,7 +394,7 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	// Dispatch pending tasks on reconnect:
 	//   "sent"   tasks were in-flight before the last disconnect.
 	//            - Idempotent task types: re-send (running again converges to the same state).
-	//            - Non-idempotent (backups, restores, exec.run, agent.upgrade): the
+	//            - Non-idempotent (backups, restores, exec.run): the
 	//              agent may have already executed it before disconnecting; re-running
 	//              would double the work or worse. Mark as timeout so the operator
 	//              can verify state and re-trigger if needed.
@@ -585,12 +584,10 @@ func (h *AgentHandler) handleInbound(ctx context.Context, sess *hub.Session, env
 		h.handleTaskAck(ctx, sess, env, logger)
 	case protocol.TypeTaskResult:
 		h.handleTaskResult(ctx, sess, env, logger)
-	case protocol.TypeMediaChunk:
-		h.handleMediaChunk(ctx, sess, env, logger)
-	case protocol.TypeMediaChunkAck:
-		h.handleMediaChunkAck(ctx, sess, env, logger)
-	case protocol.TypeBackupChunk:
-		h.handleBackupChunk(sess, env, logger)
+	case protocol.TypeSyncListing:
+		h.fileSync.HandleListing(sess.NodeID, env.Payload)
+	case protocol.TypeSyncChunk:
+		h.fileSync.HandleChunk(sess.NodeID, env)
 	case protocol.TypeNetboxLog:
 		h.handleNetboxLog(ctx, sess, env, logger)
 	default:
@@ -675,10 +672,6 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 		}
 	}
 
-	if hb.PatroniRole != "" {
-		h.hub.NotifyPatroniRole(sess.NodeID, hb.PatroniRole)
-	}
-
 	// Heartbeats are Debug — they fire every 15s and would flood Info logs.
 	logger.Debug("heartbeat",
 		"load", hb.LoadAvg1,
@@ -717,7 +710,6 @@ func (h *AgentHandler) handlePatroniState(_ context.Context, sess *hub.Session, 
 	}
 	logger.Info("patroni role change", "prev_role", ps.PrevRole, "role", ps.Role)
 	slog.Info("patroni role change", "node", sess.NodeID, "prev_role", ps.PrevRole, "role", ps.Role)
-	h.hub.NotifyPatroniRole(sess.NodeID, ps.Role)
 	h.broker.Publish(sse.Event{
 		Type:   sse.EventPatroniState,
 		NodeID: sess.NodeID,
@@ -848,16 +840,9 @@ func (h *AgentHandler) dispatchDBHostUpdate(ctx context.Context, newPrimaryNodeI
 			continue
 		}
 		taskID := uuid.New()
-		_ = h.taskResults.Create(ctx, node.ID, taskID, string(protocol.TaskUpdateDBHost), params)
-		if err := h.dispatcher.Dispatch(node.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskUpdateDBHost,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 60,
-		}); err != nil {
+		if err := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskUpdateDBHost, params, 60, 0); err != nil {
 			slog.Warn("db-host-update: dispatch failed", "node", node.Hostname, "error", err)
 		} else {
-			_ = h.taskResults.SetSent(ctx, taskID)
 			slog.Info("db-host-update: dispatched", "node", node.Hostname, "host", primaryIP)
 		}
 	}
@@ -890,6 +875,15 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 			"error", result.ErrorMsg,
 			"output", result.Output,
 			"duration_ms", result.DurationMs)
+	}
+
+	if len(result.Repaired) > 0 && h.emitter != nil {
+		h.emitter.Emit(events.New(
+			events.CategoryAgent, events.SeverityWarn,
+			events.CodeAgentRepairedAccess,
+			"Agent restored its access to "+strings.Join(result.Repaired, ", "),
+			events.ActorSystem,
+		).Cluster(sess.ClusterID).Node(sess.NodeID).Build())
 	}
 
 	if taskID, err := uuid.Parse(result.TaskID); err == nil {
@@ -926,46 +920,6 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 	})
 }
 
-// handleMediaChunk receives a chunk from the source agent and:
-//  1. Writes it into the relay pipe so the relay goroutine forwards it to the target.
-func (h *AgentHandler) handleMediaChunk(_ context.Context, _ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
-	var chunk protocol.MediaChunkPayload
-	if err := json.Unmarshal(env.Payload, &chunk); err != nil {
-		logger.Warn("malformed media.chunk", "error", err)
-		return
-	}
-
-	transferID, err := uuid.Parse(chunk.TransferID)
-	if err != nil {
-		logger.Warn("media.chunk: invalid transfer_id", "transfer_id", chunk.TransferID)
-		return
-	}
-
-	t, ok := h.media.Get(transferID)
-	if !ok {
-		// Debug: an aborted transfer's remaining chunks all land here.
-		logger.Debug("media.chunk: unknown transfer", "transfer_id", chunk.TransferID)
-		return
-	}
-
-	// Forward chunk envelope directly to target agent session. On failure the
-	// transfer is dropped: the target keeps the partial file as a temp file and
-	// never renames it into place.
-	targetSess := h.hub.Get(t.TargetNode)
-	if targetSess == nil || !targetSess.SendWait(env, relaySendTimeout) {
-		h.media.Remove(transferID)
-		logger.Error("media transfer aborted: target agent offline or not keeping up",
-			"transfer_id", chunk.TransferID, "target_node", t.TargetNode)
-		return
-	}
-
-	// Signal EOF into the pipe so the relay goroutine can clean up.
-	if chunk.EOF && chunk.RelativePath == "" {
-		h.media.Remove(transferID)
-		logger.Info("media transfer complete", "transfer_id", chunk.TransferID)
-	}
-}
-
 func (h *AgentHandler) handleNetboxLog(_ context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {
 	if sess.NetboxLogPathFn == nil {
 		return
@@ -987,133 +941,9 @@ func (h *AgentHandler) handleNetboxLog(_ context.Context, sess *hub.Session, env
 	}
 }
 
-// handleMediaChunkAck receives a backpressure ack from the target agent.
-// Currently just logged; future: signal source agent to pace sends.
-func (h *AgentHandler) handleMediaChunkAck(_ context.Context, _ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
-	var ack protocol.MediaChunkAckPayload
-	if err := json.Unmarshal(env.Payload, &ack); err != nil {
-		return
-	}
-	logger.Debug("media chunk ack", "transfer_id", ack.TransferID, "chunk", ack.ChunkIndex)
-}
-
-// handleBackupChunk fans out a backup repo chunk to all registered target nodes.
-func (h *AgentHandler) handleBackupChunk(_ *hub.Session, env protocol.Envelope, logger *slog.Logger) {
-	var chunk protocol.BackupChunkPayload
-	if err := json.Unmarshal(env.Payload, &chunk); err != nil {
-		return
-	}
-	tid, err := uuid.Parse(chunk.TransferID)
-	if err != nil {
-		return
-	}
-	if h.backupSync == nil {
-		return
-	}
-	targets, ok := h.backupSync.GetTargets(tid)
-	if !ok {
-		logger.Warn("backup.chunk: unknown transfer", "transfer_id", chunk.TransferID)
-		return
-	}
-	for _, nodeID := range targets {
-		if s := h.hub.Get(nodeID); s == nil || !s.SendWait(env, relaySendTimeout) {
-			// Stop feeding this target; its partial files stay as temp files.
-			h.backupSync.DropTarget(tid, nodeID)
-			logger.Error("backup sync to node aborted: target agent offline or not keeping up",
-				"transfer_id", chunk.TransferID, "target_node", nodeID)
-		}
-	}
-	if chunk.EOF && chunk.RelativePath == "" {
-		h.backupSync.Remove(tid)
-		logger.Info("backup sync transfer complete", "transfer_id", chunk.TransferID)
-	}
-}
-
-// StartMediaSync initiates a media sync from sourceNode → targetNode.
-// POST /api/v1/clusters/:id/nodes/:nid/media-sync
-func (h *AgentHandler) StartMediaSync(c echo.Context) error {
-	clusterID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid cluster id")
-	}
-	sourceNodeID, err := uuid.Parse(c.Param("nid"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid node id")
-	}
-
-	var req struct {
-		TargetNodeID string `json:"target_node_id"`
-		RelativePath string `json:"relative_path"`
-		ChunkSize    int    `json:"chunk_size"`
-	}
-	if err := c.Bind(&req); err != nil || req.TargetNodeID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "target_node_id is required")
-	}
-	targetNodeID, err := uuid.Parse(req.TargetNodeID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid target_node_id")
-	}
-
-	ctx := c.Request().Context()
-
-	// Verify both nodes belong to this cluster
-	sourceNode, err := h.nodes.GetByID(ctx, sourceNodeID)
-	if err != nil || sourceNode.ClusterID != clusterID {
-		return echo.NewHTTPError(http.StatusNotFound, "source node not found in cluster")
-	}
-	targetNode, err := h.nodes.GetByID(ctx, targetNodeID)
-	if err != nil || targetNode.ClusterID != clusterID {
-		return echo.NewHTTPError(http.StatusNotFound, "target node not found in cluster")
-	}
-
-	if !h.hub.IsConnected(sourceNodeID) {
-		return echo.NewHTTPError(http.StatusConflict, "source node is not connected")
-	}
-	if !h.hub.IsConnected(targetNodeID) {
-		return echo.NewHTTPError(http.StatusConflict, "target node is not connected")
-	}
-
-	chunkSize := req.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 64 * 1024
-	}
-
-	transfer := h.media.Create(sourceNodeID, targetNodeID)
-
-	taskID := uuid.New()
-	params, _ := json.Marshal(protocol.MediaSyncParams{
-		Direction:    "push_to_server",
-		RelativePath: req.RelativePath,
-		ChunkSizeB:   chunkSize,
-		TransferID:   transfer.ID.String(),
-	})
-
-	_ = h.taskResults.Create(ctx, sourceNodeID, taskID, string(protocol.TaskMediaSync), params)
-
-	if err := h.dispatcher.Dispatch(sourceNodeID, protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    protocol.TaskMediaSync,
-		Params:      json.RawMessage(params),
-		TimeoutSecs: 3600, // media sync can take a while
-	}); err != nil {
-		h.media.Remove(transfer.ID)
-		return echo.NewHTTPError(http.StatusConflict, "source node dispatch failed: "+err.Error())
-	}
-
-	_ = h.taskResults.SetSent(ctx, taskID)
-
-	return c.JSON(http.StatusAccepted, map[string]any{
-		"transfer_id":    transfer.ID.String(),
-		"task_id":        taskID.String(),
-		"source_node_id": sourceNodeID.String(),
-		"target_node_id": targetNodeID.String(),
-	})
-}
-
-// ClusterMediaSync initiates a cluster-level media sync.
-// It auto-selects the most recently active connected app-tier or hyperconverged node
-// as the source, and dispatches sync tasks to all other connected app-tier or
-// hyperconverged nodes as targets.
+// ClusterMediaSync starts a two-way sync of the media root and each extra
+// folder across the connected app-tier and hyperconverged nodes. Results
+// arrive as events.
 // POST /api/v1/clusters/:id/media-sync
 func (h *AgentHandler) ClusterMediaSync(c echo.Context) error {
 	clusterID, err := uuid.Parse(c.Param("id"))
@@ -1129,100 +959,34 @@ func (h *AgentHandler) ClusterMediaSync(c echo.Context) error {
 	if !cluster.MediaSyncEnabled {
 		return echo.NewHTTPError(http.StatusConflict, "media sync is not enabled for this cluster")
 	}
-
-	allNodes, err := h.nodes.ListByCluster(ctx, clusterID)
+	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
 	}
-
-	// Only app-tier and hyperconverged nodes participate in media sync.
-	var appNodes []queries.Node
-	for _, n := range allNodes {
-		if n.Role == "app" || n.Role == "hyperconverged" {
-			appNodes = append(appNodes, n)
-		}
-	}
-	if len(appNodes) == 0 {
-		return echo.NewHTTPError(http.StatusConflict, "no app-tier or hyperconverged nodes in cluster")
+	jobs, err := filesync.MediaJobs(cluster, nodes, h.hub.IsConnected)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
 
-	// Source: most recently seen connected app node.
-	var source *queries.Node
-	for i := range appNodes {
-		n := &appNodes[i]
-		if !h.hub.IsConnected(n.ID) {
+	var started, busy []string
+	for _, j := range jobs {
+		if err := h.fileSync.Start(j, false); err != nil {
+			busy = append(busy, j.Name)
 			continue
 		}
-		if source == nil || (n.LastSeenAt != nil && (source.LastSeenAt == nil || n.LastSeenAt.After(*source.LastSeenAt))) {
-			source = n
-		}
+		started = append(started, j.Name)
 	}
-	if source == nil {
-		return echo.NewHTTPError(http.StatusConflict, "no connected app-tier or hyperconverged node available as sync source")
+	if len(started) == 0 {
+		return echo.NewHTTPError(http.StatusConflict, "a sync of every folder is already running")
 	}
-
-	// Paths to sync: always includes MEDIA_ROOT (""), plus extra folders when enabled.
-	syncPaths := []string{""}
-	if cluster.ExtraFoldersSyncEnabled {
-		for _, p := range cluster.ExtraSyncFolders {
-			if p != "" {
-				syncPaths = append(syncPaths, p)
-			}
-		}
+	hostnames := make([]string, 0, len(jobs[0].Nodes))
+	for _, n := range jobs[0].Nodes {
+		hostnames = append(hostnames, n.Hostname)
 	}
-
-	type syncResult struct {
-		TargetNodeID   string `json:"target_node_id"`
-		TargetHostname string `json:"target_hostname"`
-		TransferID     string `json:"transfer_id"`
-		TaskID         string `json:"task_id"`
-		SourcePath     string `json:"source_path,omitempty"`
-	}
-	var syncs []syncResult
-
-	for i := range appNodes {
-		target := &appNodes[i]
-		if target.ID == source.ID || !h.hub.IsConnected(target.ID) {
-			continue
-		}
-		for _, syncPath := range syncPaths {
-			transfer := h.media.Create(source.ID, target.ID)
-			taskID := uuid.New()
-			params, _ := json.Marshal(protocol.MediaSyncParams{
-				Direction:  "push_to_server",
-				SourcePath: syncPath,
-				ChunkSizeB: 64 * 1024,
-				TransferID: transfer.ID.String(),
-			})
-			_ = h.taskResults.Create(ctx, source.ID, taskID, string(protocol.TaskMediaSync), params)
-			if err := h.dispatcher.Dispatch(source.ID, protocol.TaskDispatchPayload{
-				TaskID:      taskID.String(),
-				TaskType:    protocol.TaskMediaSync,
-				Params:      json.RawMessage(params),
-				TimeoutSecs: 3600,
-			}); err != nil {
-				h.media.Remove(transfer.ID)
-				continue
-			}
-			_ = h.taskResults.SetSent(ctx, taskID)
-			syncs = append(syncs, syncResult{
-				TargetNodeID:   target.ID.String(),
-				TargetHostname: target.Hostname,
-				TransferID:     transfer.ID.String(),
-				TaskID:         taskID.String(),
-				SourcePath:     syncPath,
-			})
-		}
-	}
-
-	if len(syncs) == 0 {
-		return echo.NewHTTPError(http.StatusConflict, "no eligible target nodes to sync to")
-	}
-
 	return c.JSON(http.StatusAccepted, map[string]any{
-		"source_node_id":  source.ID.String(),
-		"source_hostname": source.Hostname,
-		"syncs":           syncs,
+		"hostnames":       hostnames,
+		"started":         started,
+		"already_running": busy,
 	})
 }
 

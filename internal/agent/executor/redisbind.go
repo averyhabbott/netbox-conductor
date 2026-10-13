@@ -1,9 +1,9 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 )
@@ -14,10 +14,10 @@ var bindLineRe = regexp.MustCompile(`(?m)^bind\s+.*$`)
 // to listen on all interfaces, and restarts the redis service. Compatible
 // with Redis 4.0+; does not rely on runtime CONFIG SET support for bind.
 //
-// The install script sets redis.conf to 660 (redis:redis) and adds the
-// netbox-agent user to the redis group, so no sudo is needed for the file write.
+// The install script adds the netbox-agent user to the redis group, which can
+// write /etc/redis, so no sudo is needed for the file write.
 // The systemctl restart uses the existing sudoers entry for 'redis'.
-func SetRedisBindAll() (string, error) {
+func SetRedisBindAll(ctx context.Context) (string, error) {
 	const confPath = "/etc/redis/redis.conf"
 
 	data, err := os.ReadFile(confPath)
@@ -35,11 +35,13 @@ func SetRedisBindAll() (string, error) {
 		// Already set to the target value — still restart to ensure it's applied.
 	}
 
-	if err := os.WriteFile(confPath, []byte(updated), 0660); err != nil {
-		return "", fmt.Errorf("write %s: %w", confPath, err)
+	// Replace rather than edit in place: only /etc/redis needs to be writable,
+	// so Debian's 640 statoverride on redis.conf can't block it.
+	if err := writeFileAtomic(confPath, updated, 0660, groupID("redis")); err != nil {
+		return "", err
 	}
 
-	cmd := exec.Command("sudo", "systemctl", "restart", "redis")
+	cmd := Command(ctx, "sudo", "systemctl", "restart", "redis")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return strings.TrimSpace(string(out)), fmt.Errorf("restart redis: %w", err)

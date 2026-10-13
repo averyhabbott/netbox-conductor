@@ -11,11 +11,9 @@
 package failover
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -30,6 +28,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
+	"github.com/averyhabbott/netbox-conductor/internal/server/patroni"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -470,7 +469,7 @@ func (m *Manager) attemptFailback(nodeID, clusterID uuid.UUID) {
 	if err != nil || reconnected.MaintenanceMode || reconnected.SuppressAutoStart {
 		return
 	}
-	if reconnected.Role == "db_only" {
+	if !nodestate.IsAppRole(reconnected.Role) {
 		return
 	}
 
@@ -872,7 +871,7 @@ func (m *Manager) bestCandidate(ctx context.Context, clusterID, excludeNodeID uu
 		if n.ID == excludeNodeID {
 			continue
 		}
-		if n.MaintenanceMode || n.SuppressAutoStart || n.Role == "db_only" {
+		if n.MaintenanceMode || n.SuppressAutoStart || !nodestate.IsAppRole(n.Role) {
 			continue
 		}
 		if !m.h.IsConnected(n.ID) {
@@ -901,23 +900,6 @@ func (m *Manager) bestCandidate(ctx context.Context, clusterID, excludeNodeID uu
 		}
 	}
 	return eligible[0], nil // fallback: best priority regardless of health
-}
-
-// patroniRestCreds fetches and decrypts the Patroni REST API credentials for a cluster.
-// Returns empty strings if no credentials are found (e.g. Patroni not yet configured).
-func (m *Manager) patroniRestCreds(ctx context.Context, clusterID uuid.UUID) (user, pass string) {
-	if m.creds == nil || m.enc == nil {
-		return
-	}
-	cred, err := m.creds.GetByKind(ctx, clusterID, "patroni_rest_password")
-	if err != nil {
-		return
-	}
-	user = cred.Username
-	if pw, err := m.enc.Decrypt(cred.PasswordEnc); err == nil {
-		pass = string(pw)
-	}
-	return
 }
 
 // triggerPatroniSwitchover calls the Patroni REST API to move the primary to the candidate node.
@@ -970,7 +952,7 @@ func (m *Manager) triggerPatroniSwitchover(
 		}
 	}
 
-	restUser, restPass := m.patroniRestCreds(ctx, cluster.ID)
+	restUser, restPass := m.creds.GetDecrypted(ctx, m.enc, cluster.ID, "patroni_rest_password", "patroni")
 
 	if primary != nil {
 		// Graceful switchover: POST /switchover to the current primary's REST API.
@@ -979,18 +961,14 @@ func (m *Manager) triggerPatroniSwitchover(
 			"leader":    primary.Hostname,
 			"candidate": candidate.Hostname,
 		})
-		url := fmt.Sprintf("http://%s:%d/switchover", primaryIP, protocol.PatroniRESTPort)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.SetBasicAuth(restUser, restPass)
-		resp, err := http.DefaultClient.Do(req)
+		switchCtx, cancel := context.WithTimeout(ctx, patroni.SwitchTimeout)
+		defer cancel()
+		out, status, err := patroni.REST(switchCtx, http.MethodPost, primaryIP, "/switchover", restUser, restPass, body)
 		if err != nil {
 			return false, fmt.Errorf("patroni switchover request: %w", err)
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			out, _ := io.ReadAll(resp.Body)
-			return false, fmt.Errorf("patroni switchover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
+		if status != http.StatusOK {
+			return false, fmt.Errorf("patroni switchover returned %d: %s", status, strings.TrimSpace(string(out)))
 		}
 		slog.Info("failover: patroni switchover triggered via REST API",
 			"from", primary.Hostname, "to", candidate.Hostname)
@@ -1008,18 +986,14 @@ func (m *Manager) triggerPatroniSwitchover(
 			"master":    failingHostname,
 			"candidate": candidate.Hostname,
 		})
-		url := fmt.Sprintf("http://%s:%d/failover", candidateIP, protocol.PatroniRESTPort)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.SetBasicAuth(restUser, restPass)
-		resp, err := http.DefaultClient.Do(req)
+		switchCtx, cancel := context.WithTimeout(ctx, patroni.SwitchTimeout)
+		defer cancel()
+		out, status, err := patroni.REST(switchCtx, http.MethodPost, candidateIP, "/failover", restUser, restPass, body)
 		if err != nil {
 			return false, fmt.Errorf("patroni failover request: %w", err)
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			out, _ := io.ReadAll(resp.Body)
-			return false, fmt.Errorf("patroni failover returned %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
+		if status != http.StatusOK {
+			return false, fmt.Errorf("patroni failover returned %d: %s", status, strings.TrimSpace(string(out)))
 		}
 		slog.Info("failover: patroni forced failover triggered via REST API",
 			"dead_primary", failingHostname, "candidate", candidate.Hostname)
@@ -1037,22 +1011,8 @@ func (m *Manager) dispatchDBHostUpdate(ctx context.Context, nodes []queries.Node
 		if !m.h.IsConnected(n.ID) {
 			continue
 		}
-		taskID := uuid.New()
-		if err := m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateDBHost), params); err != nil {
-			slog.Error("failover: db-host-update task record create failed — skipping dispatch", "node", n.Hostname, "error", err)
-			continue
-		}
-		if err := m.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskUpdateDBHost,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 30,
-		}); err != nil {
+		if err := m.dispatcher.DispatchTask(ctx, m.tasks, n.ID, uuid.New(), protocol.TaskUpdateDBHost, params, 30, 0); err != nil {
 			slog.Warn("failover: db-host-update dispatch failed", "node", n.Hostname, "error", err)
-			continue
-		}
-		if err := m.tasks.SetSent(ctx, taskID); err != nil {
-			slog.Warn("failover: db-host-update SetSent failed", "node", n.Hostname, "task", taskID, "error", err)
 		}
 	}
 }
@@ -1072,48 +1032,17 @@ func (m *Manager) dispatchRedisHostUpdate(ctx context.Context, nodes []queries.N
 		if !m.h.IsConnected(n.ID) {
 			continue
 		}
-		if n.MaintenanceMode || n.Role == "db_only" {
+		if n.MaintenanceMode || !nodestate.IsAppRole(n.Role) {
 			continue
 		}
-		taskID := uuid.New()
-		if err := m.tasks.Create(ctx, n.ID, taskID, string(protocol.TaskUpdateRedisHost), params); err != nil {
-			slog.Error("failover: redis-host-update task record create failed — skipping dispatch", "node", n.Hostname, "error", err)
-			continue
-		}
-		if err := m.dispatcher.Dispatch(n.ID, protocol.TaskDispatchPayload{
-			TaskID:      taskID.String(),
-			TaskType:    protocol.TaskUpdateRedisHost,
-			Params:      json.RawMessage(params),
-			TimeoutSecs: 30,
-		}); err != nil {
+		if err := m.dispatcher.DispatchTask(ctx, m.tasks, n.ID, uuid.New(), protocol.TaskUpdateRedisHost, params, 30, 0); err != nil {
 			slog.Warn("failover: redis-host-update dispatch failed", "node", n.Hostname, "error", err)
-			continue
-		}
-		if err := m.tasks.SetSent(ctx, taskID); err != nil {
-			slog.Warn("failover: redis-host-update SetSent failed", "node", n.Hostname, "task", taskID, "error", err)
 		}
 	}
 }
 
 func (m *Manager) dispatchServiceTask(ctx context.Context, node *queries.Node, taskType protocol.TaskType) error {
-	taskID := uuid.New()
-	dispatchPayload := protocol.TaskDispatchPayload{
-		TaskID:      taskID.String(),
-		TaskType:    taskType,
-		Params:      json.RawMessage(`{}`),
-		TimeoutSecs: 30,
-	}
-	raw, _ := json.Marshal(dispatchPayload)
-	if err := m.tasks.Create(ctx, node.ID, taskID, string(taskType), raw); err != nil {
-		return fmt.Errorf("create task record: %w", err)
-	}
-	if err := m.dispatcher.Dispatch(node.ID, dispatchPayload); err != nil {
-		return err
-	}
-	if err := m.tasks.SetSent(ctx, taskID); err != nil {
-		slog.Warn("failover: service-task SetSent failed", "node", node.Hostname, "task", taskID, "type", taskType, "error", err)
-	}
-	return nil
+	return m.dispatcher.DispatchTask(ctx, m.tasks, node.ID, uuid.New(), taskType, json.RawMessage(`{}`), 30, 0)
 }
 
 // CheckTopology inspects the current Patroni leader against node priorities and

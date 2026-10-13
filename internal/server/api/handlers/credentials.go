@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -96,7 +97,7 @@ const (
 
 // Default usernames used when a credential record is created or when a config
 // builder needs a sensible fallback. Single source of truth — the credential
-// generator and the fallbacks in PushPatroniConfig must agree, otherwise a
+// generator and the fallbacks in patroniClusterInput must agree, otherwise a
 // fresh cluster could generate "replicator" while the config generator wrote
 // "replica" into patroni.yml.
 const (
@@ -133,6 +134,29 @@ var autoGenDefaults = []struct {
 
 func strPtr(s string) *string { return &s }
 
+// generateCredential stores a fresh random password for a cluster credential
+// and returns the plaintext.
+func generateCredential(ctx context.Context, creds *queries.CredentialQuerier, enc *crypto.Encryptor, clusterID uuid.UUID, kind, username string, dbName *string) (string, error) {
+	rawPassword, err := crypto.GenerateToken(32)
+	if err != nil {
+		return "", fmt.Errorf("generating password: %w", err)
+	}
+	encPassword, err := enc.Encrypt([]byte(rawPassword))
+	if err != nil {
+		return "", fmt.Errorf("encrypting password: %w", err)
+	}
+	if err := creds.Upsert(ctx, queries.UpsertCredentialParams{
+		ClusterID:   clusterID,
+		Kind:        kind,
+		Username:    username,
+		PasswordEnc: encPassword,
+		DBName:      dbName,
+	}); err != nil {
+		return "", fmt.Errorf("storing credential: %w", err)
+	}
+	return rawPassword, nil
+}
+
 // GenerateCredentials auto-generates secure random passwords for all
 // non-superuser credential kinds. Returns the plaintext values once.
 // POST /api/v1/clusters/:id/credentials/generate?missing_only=true
@@ -168,22 +192,9 @@ func (h *CredentialHandler) GenerateCredentials(c echo.Context) error {
 		if missingOnly && existing[def.Kind] {
 			continue
 		}
-		rawPassword, err := crypto.GenerateToken(32)
+		rawPassword, err := generateCredential(c.Request().Context(), h.creds, h.enc, clusterID, def.Kind, def.Username, def.DBName)
 		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate password")
-		}
-		encPassword, err := h.enc.Encrypt([]byte(rawPassword))
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt password")
-		}
-		if err := h.creds.Upsert(c.Request().Context(), queries.UpsertCredentialParams{
-			ClusterID:   clusterID,
-			Kind:        def.Kind,
-			Username:    def.Username,
-			PasswordEnc: encPassword,
-			DBName:      def.DBName,
-		}); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to save credential")
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to generate credential")
 		}
 		results = append(results, generated{
 			Kind:     def.Kind,

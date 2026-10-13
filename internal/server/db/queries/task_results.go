@@ -15,7 +15,7 @@ type TaskResult struct {
 	NodeID          uuid.UUID
 	TaskID          uuid.UUID
 	TaskType        string
-	Status          string          // queued → sent → ack → success|failure|timeout
+	Status          string // queued → sent → ack → success|failure|timeout
 	RequestPayload  json.RawMessage
 	ResponsePayload json.RawMessage
 	QueuedAt        time.Time
@@ -28,6 +28,18 @@ type TaskResultQuerier struct {
 
 func NewTaskResultQuerier(pool *pgxpool.Pool) *TaskResultQuerier {
 	return &TaskResultQuerier{pool: pool}
+}
+
+const taskResultCols = `id, node_id, task_id, task_type, status,
+	request_payload, response_payload, queued_at, completed_at`
+
+func scanTaskResult(row interface{ Scan(...any) error }) (*TaskResult, error) {
+	var t TaskResult
+	if err := row.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
+		&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // Create records a newly queued task using the default sweeper ack timeout.
@@ -95,25 +107,15 @@ func (q *TaskResultQuerier) MarkOrphaned(ctx context.Context, taskID uuid.UUID, 
 
 // GetByTaskID returns a single task result.
 func (q *TaskResultQuerier) GetByTaskID(ctx context.Context, taskID uuid.UUID) (*TaskResult, error) {
-	row := q.pool.QueryRow(ctx, `
-		SELECT id, node_id, task_id, task_type, status,
-		       request_payload, response_payload, queued_at, completed_at
-		FROM task_results WHERE task_id = $1`, taskID)
-
-	var t TaskResult
-	err := row.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
-		&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &t, nil
+	return scanTaskResult(q.pool.QueryRow(ctx, `
+		SELECT `+taskResultCols+`
+		FROM task_results WHERE task_id = $1`, taskID))
 }
 
 // ListByNode returns recent task results for a node.
 func (q *TaskResultQuerier) ListByNode(ctx context.Context, nodeID uuid.UUID, limit int) ([]TaskResult, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, node_id, task_id, task_type, status,
-		       request_payload, response_payload, queued_at, completed_at
+		SELECT `+taskResultCols+`
 		FROM task_results
 		WHERE node_id = $1
 		ORDER BY queued_at DESC
@@ -126,12 +128,11 @@ func (q *TaskResultQuerier) ListByNode(ctx context.Context, nodeID uuid.UUID, li
 
 	var results []TaskResult
 	for rows.Next() {
-		var t TaskResult
-		if err := rows.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
-			&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
+		t, err := scanTaskResult(rows)
+		if err != nil {
 			return nil, err
 		}
-		results = append(results, t)
+		results = append(results, *t)
 	}
 	return results, rows.Err()
 }
@@ -161,8 +162,7 @@ func (q *TaskResultQuerier) TimeoutStale(ctx context.Context, sentTimeout, ackTi
 // queued to prevent split-brain) and need to be dispatched for the first time.
 func (q *TaskResultQuerier) ListPendingByNode(ctx context.Context, nodeID uuid.UUID) ([]TaskResult, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, node_id, task_id, task_type, status,
-		       request_payload, response_payload, queued_at, completed_at
+		SELECT `+taskResultCols+`
 		FROM task_results
 		WHERE node_id = $1 AND status IN ('queued', 'sent')
 		ORDER BY queued_at`,
@@ -174,12 +174,11 @@ func (q *TaskResultQuerier) ListPendingByNode(ctx context.Context, nodeID uuid.U
 
 	var results []TaskResult
 	for rows.Next() {
-		var t TaskResult
-		if err := rows.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
-			&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
+		t, err := scanTaskResult(rows)
+		if err != nil {
 			return nil, err
 		}
-		results = append(results, t)
+		results = append(results, *t)
 	}
 	return results, rows.Err()
 }
@@ -191,8 +190,7 @@ func (q *TaskResultQuerier) ListByNodeIDs(ctx context.Context, nodeIDs []uuid.UU
 		return nil, nil
 	}
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, node_id, task_id, task_type, status,
-		       request_payload, response_payload, queued_at, completed_at
+		SELECT `+taskResultCols+`
 		FROM task_results
 		WHERE node_id = ANY($1)
 		ORDER BY queued_at DESC
@@ -205,47 +203,35 @@ func (q *TaskResultQuerier) ListByNodeIDs(ctx context.Context, nodeIDs []uuid.UU
 
 	var results []TaskResult
 	for rows.Next() {
-		var t TaskResult
-		if err := rows.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
-			&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
+		t, err := scanTaskResult(rows)
+		if err != nil {
 			return nil, err
 		}
-		results = append(results, t)
+		results = append(results, *t)
 	}
 	return results, rows.Err()
 }
 
-// ListByConfigPush returns all task results for a given set of task IDs (e.g. a push batch).
-func (q *TaskResultQuerier) ListByTaskIDs(ctx context.Context, taskIDs []uuid.UUID) ([]TaskResult, error) {
-	if len(taskIDs) == 0 {
-		return nil, nil
-	}
-	// Build $1,$2,... parameter list
-	args := make([]any, len(taskIDs))
-	for i, id := range taskIDs {
-		args[i] = id
-	}
-
-	rows, err := q.pool.Query(ctx, `
-		SELECT id, node_id, task_id, task_type, status,
-		       request_payload, response_payload, queued_at, completed_at
-		FROM task_results
-		WHERE task_id = ANY($1)
-		ORDER BY queued_at`,
-		taskIDs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []TaskResult
-	for rows.Next() {
-		var t TaskResult
-		if err := rows.Scan(&t.ID, &t.NodeID, &t.TaskID, &t.TaskType, &t.Status,
-			&t.RequestPayload, &t.ResponsePayload, &t.QueuedAt, &t.CompletedAt); err != nil {
-			return nil, err
+// WaitSuccess polls the DB every 3 seconds until the task reaches a terminal
+// state (success/failure/timeout), returning true only on success. This avoids
+// the WaitForTask race condition where the task completes before the waiter registers.
+func (q *TaskResultQuerier) WaitSuccess(ctx context.Context, taskID uuid.UUID, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		t, err := q.GetByTaskID(ctx, taskID)
+		if err == nil {
+			switch t.Status {
+			case "success":
+				return true
+			case "failure", "timeout":
+				return false
+			}
 		}
-		results = append(results, t)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(3 * time.Second):
+		}
 	}
-	return results, rows.Err()
+	return false
 }

@@ -39,12 +39,9 @@ func NewUserQuerier(pool *pgxpool.Pool) *UserQuerier {
 	return &UserQuerier{pool: pool}
 }
 
-func (q *UserQuerier) GetByUsername(ctx context.Context, username string) (*User, error) {
-	row := q.pool.QueryRow(ctx, `
-		SELECT id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
-		FROM users WHERE username = $1
-	`, username)
+const userCols = `id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at`
 
+func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	if err := row.Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.Role,
@@ -53,44 +50,33 @@ func (q *UserQuerier) GetByUsername(ctx context.Context, username string) (*User
 		return nil, err
 	}
 	return &u, nil
+}
+
+func (q *UserQuerier) GetByUsername(ctx context.Context, username string) (*User, error) {
+	return scanUser(q.pool.QueryRow(ctx, `
+		SELECT `+userCols+`
+		FROM users WHERE username = $1
+	`, username))
 }
 
 func (q *UserQuerier) GetByID(ctx context.Context, id uuid.UUID) (*User, error) {
-	row := q.pool.QueryRow(ctx, `
-		SELECT id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
+	return scanUser(q.pool.QueryRow(ctx, `
+		SELECT `+userCols+`
 		FROM users WHERE id = $1
-	`, id)
-
-	var u User
-	if err := row.Scan(
-		&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-		&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
-	); err != nil {
-		return nil, err
-	}
-	return &u, nil
+	`, id))
 }
 
 func (q *UserQuerier) Create(ctx context.Context, username, passwordHash, role string) (*User, error) {
-	row := q.pool.QueryRow(ctx, `
+	return scanUser(q.pool.QueryRow(ctx, `
 		INSERT INTO users (username, password_hash, role)
 		VALUES ($1, $2, $3)
-		RETURNING id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
-	`, username, passwordHash, role)
-
-	var u User
-	if err := row.Scan(
-		&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-		&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
-	); err != nil {
-		return nil, err
-	}
-	return &u, nil
+		RETURNING `+userCols,
+		username, passwordHash, role))
 }
 
 func (q *UserQuerier) List(ctx context.Context) ([]User, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, username, password_hash, role, totp_secret_enc, totp_enabled, created_at, last_login_at
+		SELECT `+userCols+`
 		FROM users ORDER BY username
 	`)
 	if err != nil {
@@ -100,14 +86,11 @@ func (q *UserQuerier) List(ctx context.Context) ([]User, error) {
 
 	var users []User
 	for rows.Next() {
-		var u User
-		if err := rows.Scan(
-			&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-			&u.TOTPSecretEnc, &u.TOTPEnabled, &u.CreatedAt, &u.LastLoginAt,
-		); err != nil {
+		u, err := scanUser(rows)
+		if err != nil {
 			return nil, err
 		}
-		users = append(users, u)
+		users = append(users, *u)
 	}
 	return users, rows.Err()
 }

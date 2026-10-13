@@ -25,14 +25,14 @@ type SyslogDestination struct {
 
 // SyslogDestinationParams holds the fields for create/update.
 type SyslogDestinationParams struct {
-	Name        string
-	Protocol    string
-	Host        string
-	Port        int
-	TLSCACert   *string
-	Categories  []string
-	MinSeverity string
-	Enabled     bool
+	Name        string   `json:"name"`
+	Protocol    string   `json:"protocol"`
+	Host        string   `json:"host"`
+	Port        int      `json:"port"`
+	TLSCACert   *string  `json:"tls_ca_cert"`
+	Categories  []string `json:"categories"`
+	MinSeverity string   `json:"min_severity"`
+	Enabled     bool     `json:"enabled"`
 }
 
 // SyslogDestinationQuerier performs syslog_destinations operations.

@@ -214,6 +214,19 @@ func (h *AuthHandler) ListUsers(c echo.Context) error {
 	return c.JSON(http.StatusOK, out)
 }
 
+// BcryptCost is the bcrypt work factor for every stored password hash.
+const BcryptCost = 12
+
+var validRoles = map[string]bool{"admin": true, "operator": true, "viewer": true}
+
+// validatePassword enforces the password policy wherever a password is set.
+func validatePassword(password string) error {
+	if len(password) < 8 {
+		return echo.NewHTTPError(http.StatusBadRequest, "password must be at least 8 characters")
+	}
+	return nil
+}
+
 type createUserRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -230,11 +243,13 @@ func (h *AuthHandler) CreateUser(c echo.Context) error {
 	if req.Username == "" || req.Password == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "username and password are required")
 	}
-	validRoles := map[string]bool{"admin": true, "operator": true, "viewer": true}
+	if err := validatePassword(req.Password); err != nil {
+		return err
+	}
 	if !validRoles[req.Role] {
 		return echo.NewHTTPError(http.StatusBadRequest, "role must be admin, operator, or viewer")
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), BcryptCost)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to hash password")
 	}
@@ -260,7 +275,6 @@ func (h *AuthHandler) UpdateUserRole(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	validRoles := map[string]bool{"admin": true, "operator": true, "viewer": true}
 	if !validRoles[req.Role] {
 		return echo.NewHTTPError(http.StatusBadRequest, "role must be admin, operator, or viewer")
 	}
@@ -304,8 +318,8 @@ func (h *AuthHandler) ChangePassword(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	if len(req.NewPassword) < 8 {
-		return echo.NewHTTPError(http.StatusBadRequest, "new password must be at least 8 characters")
+	if err := validatePassword(req.NewPassword); err != nil {
+		return err
 	}
 	user, err := h.users.GetByID(c.Request().Context(), callerID)
 	if err != nil {
@@ -314,7 +328,7 @@ func (h *AuthHandler) ChangePassword(c echo.Context) error {
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.CurrentPassword)); err != nil {
 		return echo.NewHTTPError(http.StatusUnauthorized, "current password is incorrect")
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), BcryptCost)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to hash password")
 	}
@@ -327,8 +341,8 @@ func (h *AuthHandler) ChangePassword(c echo.Context) error {
 }
 
 type tlsInfoResponse struct {
-	Enabled     bool              `json:"enabled"`
-	CertInfo    *tlscert.CertInfo `json:"cert_info,omitempty"`
+	Enabled  bool              `json:"enabled"`
+	CertInfo *tlscert.CertInfo `json:"cert_info,omitempty"`
 }
 
 // TLSInfo godoc
@@ -445,8 +459,8 @@ func (h *AuthHandler) EnrollTOTP(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"qr_uri":          key.URL(),
-		"secret":          key.Secret(), // shown once for manual entry
+		"qr_uri":           key.URL(),
+		"secret":           key.Secret(), // shown once for manual entry
 		"enrollment_token": enrollToken,
 	})
 }

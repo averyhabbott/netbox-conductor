@@ -1,17 +1,77 @@
 #!/usr/bin/env bash
 # NetBox Conductor Agent — installer
-# Usage: sudo bash install.sh
+# Usage: sudo bash install.sh [--netbox-root DIR | --db-only] [--fresh-install]
+#   --netbox-root DIR  NetBox's stable install path (default /opt/netbox, or the one
+#                      recorded in the .env by an earlier install)
+#   --db-only          no NetBox on this node (db_only role)
+#   --fresh-install    replace the .env with a blank one (drops the node ID and token)
 set -euo pipefail
 
 BIN_DEST=/usr/local/bin/netbox-agent
 OPT_DIR=/opt/netbox-agent
 VENV_DIR=/opt/netbox-agent/venv
 ENV_DIR=/etc/netbox-agent
+ENV_FILE=$ENV_DIR/netbox-agent.env
+CERT_DIR=$ENV_DIR/certs
 SERVICE_FILE=/etc/systemd/system/netbox-agent.service
+
+NB_ROOT_ARG="" DB_ONLY="" FRESH=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --netbox-root)
+      [[ -n ${2:-} ]] || { echo "--netbox-root needs a folder" >&2; exit 1; }
+      NB_ROOT_ARG=$2; shift 2 ;;
+    --db-only) DB_ONLY=1; shift ;;
+    --fresh-install) FRESH=1; shift ;;
+    *) echo "Unknown option: $1 (see the usage at the top of install.sh)" >&2; exit 1 ;;
+  esac
+done
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root: sudo bash install.sh" >&2
   exit 1
+fi
+
+# env_get KEY prints KEY's value from the existing .env (nothing if absent).
+env_get() {
+  if [[ -f $ENV_FILE ]]; then sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; fi
+}
+# env_set KEY VALUE replaces KEY's line in the .env, or appends it.
+env_set() {
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
+}
+
+# ── NetBox root ───────────────────────────────────────────────────────────────
+# Resolved before changing anything so a wrong root fails fast. Empty = no NetBox.
+if [[ -n $DB_ONLY && -n $NB_ROOT_ARG ]]; then
+  echo "ERROR: --db-only and --netbox-root can't be used together" >&2
+  exit 1
+elif [[ -n $DB_ONLY ]]; then
+  NB_ROOT=""
+elif [[ -n $NB_ROOT_ARG ]]; then
+  NB_ROOT=$NB_ROOT_ARG
+elif [[ -z $FRESH ]] && grep -qs "^NETBOX_ROOT=" "$ENV_FILE"; then
+  NB_ROOT=$(env_get NETBOX_ROOT)
+elif [[ -z $FRESH && -n $(env_get NETBOX_CONFIG_PATH) ]]; then
+  # .env from before NETBOX_ROOT existed
+  NB_ROOT=$(env_get NETBOX_CONFIG_PATH)
+  NB_ROOT=${NB_ROOT%/netbox/netbox/configuration.py}
+else
+  NB_ROOT=/opt/netbox
+fi
+[[ $NB_ROOT == */ && $NB_ROOT != / ]] && NB_ROOT=${NB_ROOT%/}
+if [[ -n $NB_ROOT ]]; then
+  # The root goes into sudoers, so only plain absolute paths are accepted.
+  if [[ ! $NB_ROOT =~ ^/[A-Za-z0-9._/-]+$ || $NB_ROOT == *..* ]]; then
+    echo "ERROR: NetBox root '$NB_ROOT' must be an absolute path of letters, digits and . _ - /" >&2
+    exit 1
+  fi
+  if [[ ! -d $NB_ROOT/netbox/netbox ]]; then
+    echo "ERROR: NetBox not found at $NB_ROOT ($NB_ROOT/netbox/netbox is missing)." >&2
+    echo "  Pass --netbox-root <dir> with NetBox's stable path (e.g. /opt/netbox, not a" >&2
+    echo "  version folder like /opt/netbox-4.2.0), or --db-only on a node without NetBox." >&2
+    exit 1
+  fi
 fi
 
 echo "→ Creating netbox-agent user/group"
@@ -34,20 +94,34 @@ echo "→ Installing binary to $BIN_DEST"
 install -m 755 netbox-agent "$BIN_DEST"
 
 echo "→ Creating $ENV_DIR"
+# root-owned: the agent reads its .env but can't change it, since install.sh
+# builds sudoers from values in it. The agent writes only $CERT_DIR.
 mkdir -p "$ENV_DIR"
-chown netbox-agent:netbox-agent "$ENV_DIR"
+chown root:netbox-agent "$ENV_DIR"
 chmod 750 "$ENV_DIR"
-if [[ ! -f "$ENV_DIR/netbox-agent.env" ]]; then
-  install -m 600 netbox-agent.env.example "$ENV_DIR/netbox-agent.env"
-  chown netbox-agent:netbox-agent "$ENV_DIR/netbox-agent.env"
-  echo "  Created $ENV_DIR/netbox-agent.env"
-  echo "  Fill in AGENT_NODE_ID, AGENT_TOKEN, and AGENT_SERVER_URL before starting."
-  echo "  (Or download a pre-filled env file from the Conductor UI.)"
-else
-  # Ensure agent owns the env file so cert-learning can update it.
-  chown netbox-agent:netbox-agent "$ENV_DIR/netbox-agent.env"
-  chmod 600 "$ENV_DIR/netbox-agent.env"
-  echo "  $ENV_DIR/netbox-agent.env already exists — permissions updated"
+if [[ -n $FRESH || ! -f $ENV_FILE ]]; then
+  install -m 640 netbox-agent.env.example "$ENV_FILE"
+  echo "  Created $ENV_FILE"
+  echo "  Set AGENT_NODE_ID, AGENT_TOKEN and AGENT_SERVER_URL (from the Conductor UI) before starting."
+fi
+# Older installs: cert-learning was switched by UPDATE_CERT and saved to $ENV_DIR/ca.crt.
+if [[ $(env_get UPDATE_CERT) == true && -z $(env_get AGENT_TLS_CA_CERT) ]]; then
+  env_set AGENT_TLS_CA_CERT "$CERT_DIR/ca.crt"
+fi
+sed -i -e "s|^AGENT_TLS_CA_CERT=$ENV_DIR/ca.crt\$|AGENT_TLS_CA_CERT=$CERT_DIR/ca.crt|" \
+  -e '/^UPDATE_CERT=/d; /^NETBOX_CONFIG_PATH=/d; /^NETBOX_MEDIA_ROOT=/d' "$ENV_FILE"
+env_set NETBOX_ROOT "$NB_ROOT"
+chown root:netbox-agent "$ENV_FILE"
+chmod 640 "$ENV_FILE"
+if [[ ! -d $CERT_DIR ]]; then
+  # Fill it before handing it to the agent: root never writes into it afterwards.
+  mkdir "$CERT_DIR"
+  if [[ -f $ENV_DIR/ca.crt && ! -L $ENV_DIR/ca.crt ]]; then
+    mv "$ENV_DIR/ca.crt" "$CERT_DIR/ca.crt"
+    chown netbox-agent:netbox-agent "$CERT_DIR/ca.crt"
+  fi
+  chown netbox-agent:netbox-agent "$CERT_DIR"
+  chmod 750 "$CERT_DIR"
 fi
 
 echo "→ Installing example configs to $ENV_DIR/examples"
@@ -64,20 +138,8 @@ echo "→ Setting up managed directories"
 # The agent writes configuration.py here; NetBox services read it.
 # Strategy: add netbox-agent to the 'netbox' group, then set setgid + group-write
 # on the directory so files written by the agent are readable by the netbox user.
-NB_CONFIG=""
-if [[ -f "$ENV_DIR/netbox-agent.env" ]]; then
-  NB_CONFIG=$(grep -E "^NETBOX_CONFIG_PATH=" "$ENV_DIR/netbox-agent.env" | head -1 | cut -d= -f2-)
-fi
-if [[ -z "$NB_CONFIG" ]]; then
-  for p in /opt/netbox/netbox/netbox/configuration.py /opt/netbox-*/netbox/netbox/configuration.py; do
-    if [[ -f "$p" ]]; then
-      NB_CONFIG="$p"
-      break
-    fi
-  done
-fi
-if [[ -n "$NB_CONFIG" ]]; then
-  NB_DIR=$(dirname "$NB_CONFIG")
+if [[ -n $NB_ROOT ]]; then
+  NB_DIR=$NB_ROOT/netbox/netbox
   echo "  NetBox config dir: $NB_DIR"
   if getent group netbox >/dev/null 2>&1; then
     usermod -aG netbox netbox-agent
@@ -89,30 +151,32 @@ if [[ -n "$NB_CONFIG" ]]; then
     echo "  Run manually: usermod -aG <netbox-group> netbox-agent && chmod g+ws $NB_DIR"
   fi
 else
-  echo "  WARNING: NetBox installation not detected"
-  echo "  After setting NETBOX_CONFIG_PATH in $ENV_DIR/netbox-agent.env, re-run install.sh"
+  echo "  --db-only: no NetBox on this node"
 fi
 
 # ── Patroni configuration directory ─────────────────────────────────────────
-# Create if absent, owned by agent
-mkdir -p /etc/patroni
-chown netbox-agent:netbox-agent /etc/patroni
-chmod 750 /etc/patroni
+# Create if absent, owned by agent. Left alone on upgrades: the agent hands it
+# to the postgres group when it writes patroni.yml, and Patroni can't start without that.
+if [[ ! -d /etc/patroni ]]; then
+  mkdir -p /etc/patroni
+  chown netbox-agent:netbox-agent /etc/patroni
+  chmod 750 /etc/patroni
+fi
 
 # ── HA packages: Patroni and Redis Sentinel ──────────────────────────────────
 # Install at agent-setup time (running as root). redis-sentinel comes from the
 # system package manager. Patroni is installed via the apt package for its
 # systemd unit, then also installed into the venv below so the venv binary is
 # what actually runs (giving us a self-contained patronictl as well).
-echo "→ Installing HA packages (patroni, redis-sentinel, python3-venv, pgbackrest)"
+echo "→ Installing HA packages (patroni, redis-sentinel, python3-venv, pgbackrest, acl)"
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get install -y patroni redis-sentinel python3-venv pgbackrest
+  apt-get install -y patroni redis-sentinel python3-venv pgbackrest acl
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y patroni redis-sentinel python3-virtualenv pgbackrest
+  dnf install -y patroni redis-sentinel python3-virtualenv pgbackrest acl
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y patroni redis-sentinel python3-virtualenv pgbackrest
+  yum install -y patroni redis-sentinel python3-virtualenv pgbackrest acl
 else
-  echo "  WARNING: no supported package manager found — install patroni, redis-sentinel, and pgbackrest manually"
+  echo "  WARNING: no supported package manager found — install patroni, redis-sentinel, pgbackrest and acl manually"
 fi
 
 # ── Normalize Redis service name ─────────────────────────────────────────────
@@ -164,10 +228,11 @@ chown postgres:postgres /var/lib/pgbackrest
 chmod 750 /var/lib/pgbackrest
 
 # Default posix backup target — group write (770) so netbox-agent (in postgres group)
-# can test path writability without requiring sudo.
+# can test path writability and receive synced backups without sudo. setgid keeps
+# synced files in the postgres group so pgBackRest can use them after a failover.
 mkdir -p /var/lib/postgresql/backups
 chown postgres:postgres /var/lib/postgresql/backups
-chmod 770 /var/lib/postgresql/backups
+chmod 2770 /var/lib/postgresql/backups
 
 mkdir -p /var/log/pgbackrest
 chown postgres:postgres /var/log/pgbackrest
@@ -223,9 +288,6 @@ systemctl daemon-reload 2>/dev/null || true
 # postgres group for local socket access when creating PostgreSQL roles.
 if getent group redis >/dev/null 2>&1; then
   usermod -aG redis netbox-agent
-  # Grant group-write on redis.conf so the agent can update the bind address
-  # directly (no sudo required). File is redis:redis; agent is in redis group.
-  chmod 660 /etc/redis/redis.conf 2>/dev/null || true
 fi
 if getent group postgres >/dev/null 2>&1; then
   usermod -aG postgres netbox-agent
@@ -233,13 +295,36 @@ fi
 
 echo "→ Installing sudoers drop-in"
 SUDOERS_FILE=/etc/sudoers.d/netbox-agent
-install -m 440 netbox-agent-sudoers "$SUDOERS_FILE"
-# Validate syntax — if visudo rejects it, remove and abort rather than breaking sudo.
-if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
-  rm -f "$SUDOERS_FILE"
+SUDOERS_TMP=$(mktemp)
+cp netbox-agent-sudoers "$SUDOERS_TMP"
+if [[ -n $NB_ROOT ]]; then
+  # Same commands as the agent's accessFixes (internal/agent/executor/accessrepair.go).
+  cat >> "$SUDOERS_TMP" <<EOF
+
+# NetBox service management
+netbox-agent ALL=(ALL) NOPASSWD: \\
+  /usr/bin/systemctl start netbox netbox-rq, \\
+  /usr/bin/systemctl stop netbox netbox-rq, \\
+  /usr/bin/systemctl restart netbox netbox-rq, \\
+  /usr/bin/systemctl restart netbox-rq
+
+# Restore the agent's access to the NetBox folders under NETBOX_ROOT after a
+# NetBox upgrade (new version folder behind the $NB_ROOT symlink). Exact commands
+# on exact paths only; extra File Sync folders use \`netbox-agent check-sync-permissions\`.
+netbox-agent ALL=(root) NOPASSWD: \\
+  /usr/bin/chgrp netbox $NB_ROOT/netbox/netbox, \\
+  /usr/bin/chmod g+ws $NB_ROOT/netbox/netbox, \\
+  /usr/bin/setfacl -R -m u\:netbox-agent\:rwX\,d\:u\:netbox-agent\:rwX\,u\:netbox\:rwX\,d\:u\:netbox\:rwX $NB_ROOT/netbox/media
+EOF
+fi
+# Validate before installing so a bad file never replaces a working one.
+if ! visudo -cf "$SUDOERS_TMP" >/dev/null 2>&1; then
+  rm -f "$SUDOERS_TMP"
   echo "ERROR: sudoers syntax check failed — service management will not work" >&2
   exit 1
 fi
+install -m 440 "$SUDOERS_TMP" "$SUDOERS_FILE"
+rm -f "$SUDOERS_TMP"
 
 echo "→ Installing systemd service"
 install -m 644 netbox-agent.service "$SERVICE_FILE"
@@ -248,7 +333,7 @@ systemctl enable netbox-agent
 
 echo ""
 echo "Installation complete. Next steps:"
-echo "  1. Edit $ENV_DIR/netbox-agent.env with your Conductor URL and credentials"
-echo "     (or download it from the Conductor UI: Cluster → Node → Download agent .env)"
+echo "  1. Set AGENT_NODE_ID, AGENT_TOKEN and AGENT_SERVER_URL in $ENV_FILE"
+echo "     (Conductor UI: Add Node, or Node → Re-key agent…)"
 echo "  2. sudo systemctl start netbox-agent"
 echo "  3. sudo journalctl -u netbox-agent -f"

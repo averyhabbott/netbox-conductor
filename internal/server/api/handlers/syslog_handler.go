@@ -37,17 +37,26 @@ func (h *SyslogHandler) Create(c echo.Context) error {
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
 	}
-	if p.Host == "" || p.Protocol == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "host and protocol are required")
-	}
-	if p.Port == 0 {
-		p.Port = 514
+	if err := validateSyslogDest(&p); err != nil {
+		return err
 	}
 	d, err := h.destQ.Create(c.Request().Context(), p)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to create destination")
 	}
 	return c.JSON(http.StatusCreated, d)
+}
+
+// validateSyslogDest checks a destination for Create and Update (both write
+// every field) and defaults the port.
+func validateSyslogDest(p *queries.SyslogDestinationParams) error {
+	if p.Host == "" || p.Protocol == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "host and protocol are required")
+	}
+	if p.Port == 0 {
+		p.Port = 514
+	}
+	return nil
 }
 
 func (h *SyslogHandler) Get(c echo.Context) error {
@@ -70,6 +79,9 @@ func (h *SyslogHandler) Update(c echo.Context) error {
 	var p queries.SyslogDestinationParams
 	if err := c.Bind(&p); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request")
+	}
+	if err := validateSyslogDest(&p); err != nil {
+		return err
 	}
 	d, err := h.destQ.Update(c.Request().Context(), id, p)
 	if err != nil {

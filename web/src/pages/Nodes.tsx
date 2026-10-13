@@ -1,7 +1,7 @@
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
-import { nodesApi } from '../api/nodes'
+import { nodesApi, roleLabel } from '../api/nodes'
 import type { Node } from '../api/nodes'
 import Layout from '../components/Layout'
 
@@ -23,12 +23,6 @@ const STATUS_BADGE: Record<string, string> = {
   connected: 'bg-emerald-900/50 text-emerald-300',
   disconnected: 'bg-red-900/50 text-red-300',
   unknown: 'bg-gray-800 text-gray-400',
-}
-
-const ROLE_LABEL: Record<string, string> = {
-  hyperconverged: 'Hyper-converged',
-  app: 'App',
-  db_only: 'DB only',
 }
 
 function ServiceDot({ running }: { running: boolean | null }) {
@@ -113,7 +107,7 @@ export default function Nodes() {
                       </span>
                     </td>
                     <td className="px-6 py-3 text-gray-400">
-                      {ROLE_LABEL[n.role] ?? n.role}
+                      {roleLabel(n.role)}
                     </td>
                     <td className="px-6 py-3">
                       <span

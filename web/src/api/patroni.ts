@@ -39,7 +39,7 @@ export interface PatroniConfigSnapshot {
   id: string
   cluster_id: string
   captured_at: string
-  source: 'configure-failover' | 'configure-backups' | 'user-edit' | 'user-revert' | 'discovered'
+  source: 'configure-failover' | 'configure-backups' | 'user-edit' | 'user-revert' | 'discovered' | 'disable-archiving'
   is_active: boolean
   config: unknown
 }
@@ -72,14 +72,6 @@ export const patroniApi = {
       .post(`/clusters/${clusterId}/patroni/switchover`, { candidate: candidate ?? '' })
       .then((r) => r.data),
 
-  pushPatroniConfig: (clusterId: string) =>
-    client
-      .post<{ cluster_id: string; nodes: PushResult[] }>(
-        `/clusters/${clusterId}/patroni/push-config`,
-        {}
-      )
-      .then((r) => r.data),
-
   pushPatroniConfigNode: (clusterId: string, nodeId: string) =>
     client
       .post(`/clusters/${clusterId}/nodes/${nodeId}/push-patroni-config`, {})
@@ -99,29 +91,6 @@ export const patroniApi = {
   failover: (clusterId: string, master: string, candidate?: string) =>
     client
       .post(`/clusters/${clusterId}/patroni/failover`, { master, candidate: candidate ?? '' })
-      .then((r) => r.data),
-
-  getRetentionPolicy: (clusterId: string) =>
-    client
-      .get<{ cluster_id: string; retention_days: number; expire_cmd: string }>(
-        `/clusters/${clusterId}/retention-policy`
-      )
-      .then((r) => r.data),
-
-  setRetentionPolicy: (clusterId: string, retentionDays: number, expireCmd: string) =>
-    client
-      .put<{ cluster_id: string; retention_days: number; expire_cmd: string }>(
-        `/clusters/${clusterId}/retention-policy`,
-        { retention_days: retentionDays, expire_cmd: expireCmd }
-      )
-      .then((r) => r.data),
-
-  enforceRetention: (clusterId: string) =>
-    client
-      .post<{ task_id: string; node_id: string; hostname: string; status: string }>(
-        `/clusters/${clusterId}/retention-policy/enforce`,
-        {}
-      )
       .then((r) => r.data),
 
   getPatroniConfig: (clusterId: string): Promise<PatroniConfigResponse> =>

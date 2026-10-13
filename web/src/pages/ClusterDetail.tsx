@@ -2,8 +2,8 @@ import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
-import type { Cluster, ClusterSyncResult, ConfigureFailoverResult, BackupTarget, BackupTargetType, CreateBackupTargetBody, NodeTestResult } from '../api/clusters'
-import { nodesApi } from '../api/nodes'
+import type { Cluster, ClusterSyncResult, MediaSyncSettings, ConfigureFailoverResult, BackupTarget, BackupTargetType, CreateBackupTargetBody, NodeTestResult } from '../api/clusters'
+import { nodesApi, NODE_ROLES, isInvalidHostname, roleLabel } from '../api/nodes'
 import type { Node, EditNodeBody } from '../api/nodes'
 import { credentialsApi, credentialLabels, secretOnlyKinds } from '../api/credentials'
 import type { Credential, CredentialKind, GeneratedCredential } from '../api/credentials'
@@ -12,17 +12,15 @@ import type { ReadNodeConfigResult } from '../api/configs'
 import { patroniApi } from '../api/patroni'
 import type { PatroniConfigSnapshot, PushResult } from '../api/patroni'
 import { alertsApi } from '../api/alerts'
-import { eventsApi } from '../api/events'
+import { eventsApi, SEV_TEXT } from '../api/events'
 import { useSSE } from '../hooks/useSSE'
 import type { Event } from '../api/events'
 import EventsTable from '../components/EventsTable'
-import client from '../api/client'
+import client, { apiError } from '../api/client'
+import HealthDot from '../components/HealthDot'
 import Layout from '../components/Layout'
+import { useCopy } from '../hooks/useCopy'
 import AddNodeWizard from './AddNodeWizard'
-
-// The agent version that ships with this conductor build.
-// Keep in sync with agentVersion in internal/agent/ws/client.go.
-const CURRENT_AGENT_VERSION = '0.1.0'
 
 function AgentStatusBadge({ status }: { status: string }) {
   const styles: Record<string, string> = {
@@ -47,24 +45,6 @@ function AgentStatusBadge({ status }: { status: string }) {
       />
       {status}
     </span>
-  )
-}
-
-function HealthDot({ status }: { status?: string }) {
-  const color =
-    status === 'healthy'
-      ? 'bg-emerald-400'
-      : status === 'degraded'
-      ? 'bg-amber-400'
-      : 'bg-red-500'
-  const title =
-    status === 'healthy'
-      ? 'Healthy'
-      : status === 'degraded'
-      ? 'Degraded (service down)'
-      : 'Offline'
-  return (
-    <span title={title} className={`inline-block w-2.5 h-2.5 rounded-full ${color}`} />
   )
 }
 
@@ -130,11 +110,11 @@ function EditNodeModal({
       onClose()
     },
     onError: (e: any) => {
-      setError(e.response?.data?.message ?? 'Failed to save changes')
+      setError(apiError(e, 'Failed to save changes'))
     },
   })
 
-  const hostnameInvalid = (form.hostname ?? '').length > 0 && /[^a-zA-Z0-9.\-]/.test(form.hostname ?? '')
+  const hostnameInvalid = isInvalidHostname(form.hostname ?? '')
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -199,9 +179,7 @@ function EditNodeModal({
                 setForm((f) => ({ ...f, role: e.target.value as EditNodeBody['role'] }))
               }
             >
-              <option value="hyperconverged">Hyperconverged</option>
-              <option value="app">App</option>
-              <option value="db_only">DB Only</option>
+              {NODE_ROLES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
             </select>
           </div>
 
@@ -252,15 +230,6 @@ function NodeRow({
   onEdit: (node: Node) => void
 }) {
   const navigate = useNavigate()
-  const qc = useQueryClient()
-  const upgrade = useMutation({
-    mutationFn: () => nodesApi.upgradeAgent(clusterId, node.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['nodes', clusterId] }),
-  })
-  const upgradeAvailable =
-    node.agent_status === 'connected' &&
-    node.agent_version != null &&
-    node.agent_version !== CURRENT_AGENT_VERSION
   const disconnected = node.agent_status !== 'connected'
 
   return (
@@ -291,23 +260,13 @@ function NodeRow({
         )}
       </td>
       <td className="px-6 py-4 text-gray-300 text-sm capitalize">
-        {node.role.replace('_', ' ')}
+        {roleLabel(node.role)}
       </td>
       <td className="px-6 py-4">
         <AgentStatusBadge status={node.agent_status} />
         {node.agent_version && (
           <div className="text-xs text-gray-500 mt-0.5 font-mono">
             v{node.agent_version}
-            {upgradeAvailable && (
-              <button
-                onClick={(e) => { e.stopPropagation(); upgrade.mutate() }}
-                disabled={upgrade.isPending}
-                className="ml-2 text-amber-400 hover:text-amber-300 disabled:opacity-40"
-                title={`Upgrade from v${node.agent_version} to v${CURRENT_AGENT_VERSION}`}
-              >
-                {upgrade.isPending ? 'upgrading…' : '↑ upgrade'}
-              </button>
-            )}
           </div>
         )}
       </td>
@@ -399,7 +358,7 @@ function CredentialRow({
       setPassword('')
       setError('')
     },
-    onError: (e: any) => setError(e.response?.data?.message ?? 'Failed to save'),
+    onError: (e: any) => setError(apiError(e, 'Failed to save')),
   })
 
   if (!editing) {
@@ -523,7 +482,7 @@ function ImportFromExistingModal({
       setSelected(found)
       setStep(2)
     } catch (e: any) {
-      setError(e.response?.data?.message ?? 'Failed to read config from node')
+      setError(apiError(e, 'Failed to read config from node'))
     } finally {
       setLoading(false)
     }
@@ -549,7 +508,7 @@ function ImportFromExistingModal({
       qc.invalidateQueries({ queryKey: ['credentials', clusterId] })
       setImportSuccess(true)
     } catch (e: any) {
-      setError(e.response?.data?.message ?? 'Import failed')
+      setError(apiError(e, 'Import failed'))
     } finally {
       setImporting(false)
     }
@@ -694,7 +653,7 @@ function SyncConfigModal({
       setContent(result.raw_config)
       setStep(2)
     } catch (e: any) {
-      setError(e.response?.data?.message ?? 'Failed to read config from node')
+      setError(apiError(e, 'Failed to read config from node'))
     } finally {
       setLoading(false)
     }
@@ -712,7 +671,7 @@ function SyncConfigModal({
       })
       setPushResult(result)
     } catch (e: any) {
-      setError(e.response?.data?.message ?? 'Sync failed')
+      setError(apiError(e, 'Sync failed'))
     } finally {
       setSyncing(false)
     }
@@ -1310,7 +1269,7 @@ function FailoverCard({ cluster, nodes, onOpenSyncModal }: { cluster: Cluster; n
           <div>
             {configure.isError && (
               <p className="text-xs text-red-400">
-                {(configure.error as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Configuration failed — check node connectivity and try again'}
+                {apiError(configure.error, 'Configuration failed — check node connectivity and try again')}
               </p>
             )}
           </div>
@@ -1485,6 +1444,7 @@ function FileSyncCard({ cluster }: { cluster: Cluster }) {
     serverFolders.length > 0 ? serverFolders : ['']
   )
   const [dirty, setDirty] = useState(false)
+  const [cron, setCron] = useState(cluster.file_sync_cron)
   const [syncResult, setSyncResult] = useState<ClusterSyncResult | null>(null)
   const [syncError, setSyncError] = useState<string | null>(null)
 
@@ -1494,29 +1454,38 @@ function FileSyncCard({ cluster }: { cluster: Cluster }) {
     setDirty(false)
   }, [cluster.extra_sync_folders])
 
+  useEffect(() => setCron(cluster.file_sync_cron), [cluster.file_sync_cron])
+
   const updateSettings = useMutation({
-    mutationFn: (body: { media_sync_enabled: boolean; extra_folders_sync_enabled: boolean; extra_sync_folders: string[] }) =>
-      clustersApi.updateMediaSyncSettings(cluster.id, body),
+    mutationFn: (body: MediaSyncSettings) => clustersApi.updateMediaSyncSettings(cluster.id, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['cluster', cluster.id] }),
   })
+  const settingsError = apiError(updateSettings.error)
+
+  // Saves the cluster's saved settings with the given changes applied.
+  function save(changes: Partial<MediaSyncSettings>) {
+    updateSettings.mutate({
+      media_sync_enabled: cluster.media_sync_enabled,
+      extra_folders_sync_enabled: cluster.extra_folders_sync_enabled,
+      extra_sync_folders: cluster.extra_sync_folders ?? [],
+      file_sync_cron: cluster.file_sync_cron,
+      file_sync_schedule_enabled: cluster.file_sync_schedule_enabled,
+      ...changes,
+    })
+  }
 
   const syncNow = useMutation({
     mutationFn: () => clustersApi.syncMedia(cluster.id),
     onSuccess: (data) => { setSyncResult(data); setSyncError(null) },
     onError: (e: unknown) => {
-      const msg = (e as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Sync failed'
+      const msg = apiError(e, 'Sync failed')
       setSyncError(msg)
       setSyncResult(null)
     },
   })
 
-  function toggle(field: 'media_sync_enabled' | 'extra_folders_sync_enabled') {
-    updateSettings.mutate({
-      media_sync_enabled: cluster.media_sync_enabled,
-      extra_folders_sync_enabled: cluster.extra_folders_sync_enabled,
-      extra_sync_folders: rows.filter((r) => r.trim() !== ''),
-      [field]: !cluster[field],
-    })
+  function toggle(field: 'media_sync_enabled' | 'extra_folders_sync_enabled' | 'file_sync_schedule_enabled') {
+    save({ [field]: !cluster[field] })
   }
 
   function updateRow(i: number, value: string) {
@@ -1537,11 +1506,7 @@ function FileSyncCard({ cluster }: { cluster: Cluster }) {
   }
 
   function saveFolders() {
-    updateSettings.mutate({
-      media_sync_enabled: cluster.media_sync_enabled,
-      extra_folders_sync_enabled: cluster.extra_folders_sync_enabled,
-      extra_sync_folders: rows.filter((r) => r.trim() !== ''),
-    })
+    save({ extra_sync_folders: rows.filter((r) => r.trim() !== '') })
   }
 
   return (
@@ -1559,12 +1524,14 @@ function FileSyncCard({ cluster }: { cluster: Cluster }) {
       </div>
 
       <p className="text-xs text-gray-500 mb-4">
-        When triggered, the conductor pulls from the most recently active app-tier or hyperconverged
-        node and pushes to all other connected nodes of the same type.
+        Keeps these folders the same on every connected app-tier or hyperconverged node: a file added,
+        changed or deleted on one node is added, changed or deleted on the others. Runs on Sync Now
+        and, if turned on, on the schedule below; each node's result appears in Events. Backup folders
+        aren't affected by this schedule: they sync right after every backup.
       </p>
 
       <label className="flex items-center justify-between py-2 border-b border-gray-800 cursor-pointer">
-        <span className="text-sm">Sync Media Root (<code className="text-xs text-gray-400">NETBOX_MEDIA_ROOT</code>)</span>
+        <span className="text-sm">Sync Media Root (<code className="text-xs text-gray-400">NETBOX_ROOT/netbox/media</code>)</span>
         <button
           role="switch"
           aria-checked={cluster.media_sync_enabled}
@@ -1626,18 +1593,57 @@ function FileSyncCard({ cluster }: { cluster: Cluster }) {
         </div>
       )}
 
+      <label className="flex items-center justify-between py-2 mt-1 border-t border-gray-800 cursor-pointer">
+        <span className="text-sm text-gray-300">Sync on a Schedule</span>
+        <button
+          role="switch"
+          aria-checked={cluster.file_sync_schedule_enabled}
+          onClick={() => toggle('file_sync_schedule_enabled')}
+          disabled={updateSettings.isPending || !cluster.media_sync_enabled}
+          className={`relative w-10 h-5 rounded-full transition-colors ${cluster.file_sync_schedule_enabled && cluster.media_sync_enabled ? 'bg-blue-600' : 'bg-gray-700'} disabled:opacity-40`}
+        >
+          <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${cluster.file_sync_schedule_enabled && cluster.media_sync_enabled ? 'translate-x-5' : 'translate-x-0'}`} />
+        </button>
+      </label>
+
+      {cluster.file_sync_schedule_enabled && cluster.media_sync_enabled && (
+        <div className="flex items-end gap-2 mt-2">
+          <div className="flex-1">
+            <input
+              type="text"
+              value={cron}
+              onChange={(e) => setCron(e.target.value)}
+              aria-label="Sync schedule"
+              className="w-full text-sm font-mono bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-gray-500"
+            />
+            <p className="text-xs text-gray-600 mt-0.5">
+              Default: every 30 minutes. Format: minute hour day month weekday, in UTC.{' '}
+              <a href="https://crontab.guru" target="_blank" rel="noopener noreferrer" className="text-gray-500 hover:text-gray-300">
+                cron help ↗
+              </a>
+            </p>
+          </div>
+          <button
+            onClick={() => save({ file_sync_cron: cron.trim() })}
+            disabled={cron.trim() === cluster.file_sync_cron || updateSettings.isPending}
+            className="text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1 rounded transition-colors mb-5"
+          >
+            Save
+          </button>
+        </div>
+      )}
+      {settingsError && <p className="mt-2 text-xs text-red-400">{settingsError}</p>}
+
       {syncResult && (
         <div className="mt-4 text-xs text-emerald-400 bg-emerald-900/20 border border-emerald-800 rounded-lg p-3">
-          <p className="font-medium mb-1">Sync started — source: <span className="font-mono">{syncResult.source_hostname}</span></p>
-          <ul className="space-y-0.5 text-emerald-300">
-            {syncResult.syncs.map((s) => (
-              <li key={s.transfer_id}>
-                → <span className="font-mono">{s.target_hostname}</span>
-                {s.source_path && <span className="text-emerald-500"> ({s.source_path})</span>}
-                <span className="text-emerald-600 ml-1">task {s.task_id.slice(0, 8)}…</span>
-              </li>
-            ))}
-          </ul>
+          <p className="font-medium mb-1">
+            Sync started across <span className="font-mono">{syncResult.hostnames.join(', ')}</span>
+          </p>
+          <p className="text-emerald-300">Folders: {syncResult.started.join(', ')}</p>
+          {syncResult.already_running && syncResult.already_running.length > 0 && (
+            <p className="text-amber-400">Already running, skipped: {syncResult.already_running.join(', ')}</p>
+          )}
+          <p className="text-emerald-600 mt-1">Results appear in Events when each folder finishes.</p>
         </div>
       )}
       {syncError && (
@@ -1668,12 +1674,6 @@ function FailoverHistoryTab({ events }: { events: Event[] }) {
     'NBC-HA-006': 'Role Changed',
     'NBC-HA-007': 'Maint. Failover',
   }
-  const sevColor: Record<string, string> = {
-    info:     'text-blue-400',
-    warn:     'text-amber-400',
-    error:    'text-red-400',
-    critical: 'text-red-300 font-semibold',
-  }
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
@@ -1693,7 +1693,7 @@ function FailoverHistoryTab({ events }: { events: Event[] }) {
                 {new Date(ev.occurred_at).toLocaleString()}
               </td>
               <td className="px-6 py-3">
-                <span className={`font-medium ${sevColor[ev.severity] ?? 'text-gray-300'}`}>
+                <span className={`font-medium ${SEV_TEXT[ev.severity] ?? 'text-gray-300'}`}>
                   {codeLabel[ev.code] ?? ev.code}
                 </span>
               </td>
@@ -2275,7 +2275,7 @@ function ClusterActionsDropdown({ clusterId, onAddNode }: { clusterId: string; o
             )}
             {switchover.isError && (
               <p className="text-xs text-red-400 mb-3">
-                {(switchover.error as any)?.response?.data?.message ?? 'Switchover failed'}
+                {apiError(switchover.error, 'Switchover failed')}
               </p>
             )}
             <div className="flex justify-end gap-3">
@@ -2317,7 +2317,7 @@ function ClusterActionsDropdown({ clusterId, onAddNode }: { clusterId: string; o
             )}
             {failover.isError && (
               <p className="text-xs text-red-400 mb-3">
-                {(failover.error as any)?.response?.data?.message ?? 'Failover failed'}
+                {apiError(failover.error, 'Failover failed')}
               </p>
             )}
             <div className="flex justify-end gap-3">
@@ -2351,6 +2351,11 @@ const TARGET_TYPE_LABELS: Record<BackupTargetType, string> = {
   azure: 'Azure Blob',
   sftp: 'SFTP Server',
 }
+
+// Not offered for new targets yet: the agent never writes the SFTP private key or
+// GCS key file that pgbackrest.conf points at (configgen/pgbackrest.go). Still
+// shown for any existing target of these types.
+const HIDDEN_TARGET_TYPES: BackupTargetType[] = ['gcs', 'sftp']
 
 const STORAGE_TYPE_HINTS: Record<BackupTargetType, string> = {
   posix: 'Use a network-mounted path (NFS/SMB) to share backups across nodes',
@@ -2482,7 +2487,7 @@ function AddStorageModal({
       qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
       onClose()
     },
-    onError: (e: any) => setError(e?.response?.data?.message ?? 'Save failed'),
+    onError: (e: any) => setError(apiError(e, 'Save failed')),
   })
 
   const field = (label: string, el: React.ReactNode) => (
@@ -2520,7 +2525,9 @@ function AddStorageModal({
               onChange={(e) => setType(e.target.value as BackupTargetType)}
               disabled={!!existing}
             >
-              {(Object.keys(TARGET_TYPE_LABELS) as BackupTargetType[]).map((t) => (
+              {(Object.keys(TARGET_TYPE_LABELS) as BackupTargetType[])
+                .filter((t) => t === type || !HIDDEN_TARGET_TYPES.includes(t))
+                .map((t) => (
                 <option key={t} value={t}>{TARGET_TYPE_LABELS[t]}</option>
               ))}
             </select>
@@ -2719,7 +2726,7 @@ sudo chown postgres:postgres "$BACKUP_DIR"
 sudo chmod 770 "$BACKUP_DIR"
 echo "Backup directory ready: $BACKUP_DIR"`
 
-  const [copied, setCopied] = useState(false)
+  const [copied, copy] = useCopy()
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60] p-4">
@@ -2735,11 +2742,7 @@ echo "Backup directory ready: $BACKUP_DIR"`
           <div className="relative">
             <pre className="bg-gray-950 border border-gray-700 rounded-lg p-4 text-xs text-gray-200 font-mono overflow-x-auto whitespace-pre">{script}</pre>
             <button
-              onClick={() => {
-                navigator.clipboard.writeText(script)
-                setCopied(true)
-                setTimeout(() => setCopied(false), 2000)
-              }}
+              onClick={() => copy(script)}
               className="absolute top-2 right-2 px-2 py-0.5 text-xs bg-gray-700 hover:bg-gray-600 rounded"
             >
               {copied ? 'Copied!' : 'Copy'}
@@ -2783,7 +2786,7 @@ function RestoreModal({
       setResult('Restore initiated. Track progress in the Database tab → DB Events.')
       qc.invalidateQueries({ queryKey: ['backup-config', clusterId] })
     },
-    onError: (e: any) => setResult('Failed: ' + (e?.response?.data?.message ?? e.message)),
+    onError: (e: any) => setResult('Failed: ' + apiError(e, e.message)),
   })
 
   return (
@@ -2880,6 +2883,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
   const deleteTarget = useMutation({
     mutationFn: (tid: string) => clustersApi.deleteBackupTarget(clusterId, tid),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
+    onError: (e: any) => alert('Failed: ' + apiError(e, e.message)),
   })
 
   const [enableError, setEnableError] = useState<string | null>(null)
@@ -2894,7 +2898,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
     },
     onError: (e: any) => {
       setConfiguringInProgress(false)
-      setEnableError(e?.response?.data?.message ?? e?.message ?? 'Request failed')
+      setEnableError(apiError(e, e?.message ?? 'Request failed'))
     },
   })
 
@@ -2919,6 +2923,7 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-config', clusterId] }),
   })
+  const scheduleError = apiError(saveSchedule.error)
 
   const [backupInProgress, setBackupInProgress] = useState(false)
   const [backupToast, setBackupToast] = useState(false)
@@ -3177,7 +3182,8 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
               <p className="text-xs text-gray-600 mt-0.5">captures incremental changes</p>
             </div>
           </div>
-          <div className="flex justify-end">
+          <div className="flex items-center justify-end gap-3">
+            {scheduleError && <p className="text-xs text-red-400">{scheduleError}</p>}
             <button
               onClick={() => saveSchedule.mutate()}
               disabled={saveSchedule.isPending}
@@ -3196,6 +3202,11 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
           <div className="flex items-center gap-2">
             {backupToast && (
               <span className="text-xs text-emerald-400">Backup job requested</span>
+            )}
+            {runBackup.isError && (
+              <span className="text-xs text-red-400">
+                {apiError(runBackup.error, runBackup.error.message)}
+              </span>
             )}
             <button
               onClick={() => refreshCatalog.mutate()}
@@ -3942,9 +3953,9 @@ function PatroniConfigModal({
     try {
       const { job_id } = await patroniApi.patchPatroniConfig(clusterId, parsed, source, snapshotId)
       startPolling(clusterId, job_id)
-    } catch (err: unknown) {
+    } catch (err: any) {
       setDeployStatus('fail')
-      setDeployError(err instanceof Error ? err.message : String(err))
+      setDeployError(apiError(err, err?.message ?? String(err)))
     }
   }
 

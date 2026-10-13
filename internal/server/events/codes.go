@@ -19,15 +19,19 @@ const (
 	CodeClusterFailoverUpdated = "NBC-CLU-003"
 	CodeNodeAdded              = "NBC-CLU-004"
 	CodeNodeRemoved            = "NBC-CLU-005"
+	CodeFileSyncCompleted      = "NBC-CLU-006"
+	CodeFileSyncFailed         = "NBC-CLU-007"
+	CodeFileSyncConflict       = "NBC-CLU-008"
 )
 
 // ─── Agent events (NBC-AGT-*) ─────────────────────────────────────────────────
 
 const (
-	CodeAgentConnected    = "NBC-AGT-001"
-	CodeAgentDisconnected = "NBC-AGT-002"
-	CodeAgentRegistered   = "NBC-AGT-003"
-	CodeAgentUpgraded     = "NBC-AGT-004"
+	CodeAgentConnected      = "NBC-AGT-001"
+	CodeAgentDisconnected   = "NBC-AGT-002"
+	CodeAgentRegistered     = "NBC-AGT-003"
+	CodeAgentUpgraded       = "NBC-AGT-004"
+	CodeAgentRepairedAccess = "NBC-AGT-005"
 )
 
 // ─── Service events (NBC-SVC-*) ───────────────────────────────────────────────

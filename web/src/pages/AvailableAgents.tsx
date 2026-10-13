@@ -2,8 +2,11 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import Layout from '../components/Layout'
 import { stagingApi, type StagingAgent, type StagingToken } from '../api/staging'
+import { apiError } from '../api/client'
 import { clustersApi, type Cluster } from '../api/clusters'
+import { NODE_ROLES } from '../api/nodes'
 import { useAuthStore } from '../store/auth'
+import { useCopy } from '../hooks/useCopy'
 
 export default function AvailableAgents() {
   const role = useAuthStore((s) => s.user?.role)
@@ -187,7 +190,7 @@ function AssignModal({
         ssh_port: sshPort,
       }),
     onSuccess: () => onAssigned(),
-    onError: (e: any) => setError(e.response?.data?.message ?? 'Assignment failed'),
+    onError: (e: any) => setError(apiError(e, 'Assignment failed')),
   })
 
   return (
@@ -222,9 +225,7 @@ function AssignModal({
               onChange={(e) => setRole(e.target.value as typeof role)}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
             >
-              <option value="hyperconverged">Hyperconverged</option>
-              <option value="app">App only</option>
-              <option value="db_only">DB only</option>
+              {NODE_ROLES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
             </select>
           </div>
 
@@ -282,7 +283,7 @@ function TokenManager() {
   const [label, setLabel] = useState('')
   const [expiresIn, setExpiresIn] = useState(24)
   const [newToken, setNewToken] = useState<StagingToken | null>(null)
-  const [copied, setCopied] = useState(false)
+  const [copied, copy] = useCopy()
 
   const { data: tokens = [] } = useQuery({
     queryKey: ['staging-tokens'],
@@ -303,12 +304,6 @@ function TokenManager() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['staging-tokens'] }),
   })
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
   const unusedTokens = tokens.filter((t) => !t.used_at)
 
   return (
@@ -324,7 +319,7 @@ function TokenManager() {
               {newToken.token}
             </code>
             <button
-              onClick={() => handleCopy(newToken.token!)}
+              onClick={() => copy(newToken.token!)}
               className="text-xs text-yellow-300 hover:text-white shrink-0 transition-colors"
             >
               {copied ? 'Copied!' : 'Copy'}

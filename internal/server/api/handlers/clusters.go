@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/api/middleware"
+	"github.com/averyhabbott/netbox-conductor/internal/server/cron"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
+	"github.com/averyhabbott/netbox-conductor/internal/server/filesync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
@@ -33,6 +36,7 @@ type ClusterHandler struct {
 	hub       *hub.Hub
 	witnesses WitnessManager
 	emitter   events.Emitter
+	syncRecs  *queries.FileSyncQuerier
 	logDir    string
 	logName   string
 }
@@ -57,6 +61,9 @@ func NewClusterHandler(
 }
 
 func (h *ClusterHandler) SetEmitter(e events.Emitter) { h.emitter = e }
+
+// SetFileSyncRecords wires the two-way file sync record, pruned when folders change.
+func (h *ClusterHandler) SetFileSyncRecords(q *queries.FileSyncQuerier) { h.syncRecs = q }
 
 // actorFromCtx returns the requesting user's username, or "system" as a fallback.
 func actorFromCtx(c echo.Context) string {
@@ -85,6 +92,8 @@ type clusterResponse struct {
 	MediaSyncEnabled        bool     `json:"media_sync_enabled"`
 	ExtraFoldersSyncEnabled bool     `json:"extra_folders_sync_enabled"`
 	ExtraSyncFolders        []string `json:"extra_sync_folders"`
+	FileSyncCron            string   `json:"file_sync_cron"`
+	FileSyncScheduleEnabled bool     `json:"file_sync_schedule_enabled"`
 	PatroniConfigured       bool     `json:"patroni_configured"`
 	RedisSentinelMaster     string   `json:"redis_sentinel_master"`
 	CreatedAt               string   `json:"created_at"`
@@ -113,6 +122,8 @@ func toClusterResponse(c *queries.Cluster) clusterResponse {
 		MediaSyncEnabled:        c.MediaSyncEnabled,
 		ExtraFoldersSyncEnabled: c.ExtraFoldersSyncEnabled,
 		ExtraSyncFolders:        folders,
+		FileSyncCron:            c.FileSyncCron,
+		FileSyncScheduleEnabled: c.FileSyncScheduleEnabled,
 		PatroniConfigured:       c.PatroniConfigured,
 		RedisSentinelMaster:     c.RedisSentinelMaster,
 		CreatedAt:               c.CreatedAt.Format(time.RFC3339),
@@ -316,6 +327,8 @@ type updateMediaSyncRequest struct {
 	MediaSyncEnabled        bool     `json:"media_sync_enabled"`
 	ExtraFoldersSyncEnabled bool     `json:"extra_folders_sync_enabled"`
 	ExtraSyncFolders        []string `json:"extra_sync_folders"`
+	FileSyncCron            string   `json:"file_sync_cron"`
+	FileSyncScheduleEnabled bool     `json:"file_sync_schedule_enabled"`
 }
 
 // UpdateMediaSyncSettings godoc
@@ -330,12 +343,18 @@ func (h *ClusterHandler) UpdateMediaSyncSettings(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
+	req.FileSyncCron = strings.TrimSpace(req.FileSyncCron)
+	if err := cron.Validate(req.FileSyncCron); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "sync schedule: "+err.Error())
+	}
 
 	if err := h.clusters.UpdateMediaSyncSettings(c.Request().Context(), queries.UpdateMediaSyncParams{
 		ID:                      id,
 		MediaSyncEnabled:        req.MediaSyncEnabled,
 		ExtraFoldersSyncEnabled: req.ExtraFoldersSyncEnabled,
 		ExtraSyncFolders:        req.ExtraSyncFolders,
+		FileSyncCron:            req.FileSyncCron,
+		FileSyncScheduleEnabled: req.FileSyncScheduleEnabled,
 	}); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "cluster not found")
 	}
@@ -343,6 +362,10 @@ func (h *ClusterHandler) UpdateMediaSyncSettings(c echo.Context) error {
 	cluster, err := h.clusters.GetByID(c.Request().Context(), id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch updated cluster")
+	}
+	// A folder no longer synced starts over (copy only) if it comes back.
+	if err := h.syncRecs.KeepFolders(c.Request().Context(), id, filesync.SyncFolders(cluster)); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to update the file sync record")
 	}
 
 	return c.JSON(http.StatusOK, toClusterResponse(cluster))

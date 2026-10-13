@@ -1,8 +1,8 @@
 package executor
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -17,7 +17,7 @@ import (
 // Retries for up to 60 seconds when PostgreSQL is not yet accepting
 // connections, which happens when this task runs immediately after a
 // Patroni restart (Patroni needs a few seconds to start PostgreSQL).
-func CreatePgRole(params protocol.CreatePgRoleParams) (string, error) {
+func CreatePgRole(ctx context.Context, params protocol.CreatePgRoleParams) (string, error) {
 	if params.RoleName == "" {
 		return "", fmt.Errorf("role_name is required")
 	}
@@ -55,14 +55,13 @@ END %s;`,
 	deadline := time.Now().Add(120 * time.Second)
 	for {
 		// SQL (with the password) goes via stdin, not -c, so it isn't visible in ps.
-		cmd := exec.Command("sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1")
+		cmd := Command(ctx, "sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1")
 		cmd.Stdin = strings.NewReader(sql)
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			return fmt.Sprintf("role %s created/updated", params.RoleName), nil
 		}
-		if pgIsUnavailable(out) && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Second)
+		if pgIsUnavailable(out) && time.Now().Before(deadline) && sleep(ctx, 5*time.Second) == nil {
 			continue
 		}
 		return string(out), fmt.Errorf("create role %s failed: %w", params.RoleName, err)

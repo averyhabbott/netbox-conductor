@@ -27,6 +27,8 @@ type Cluster struct {
 	MediaSyncEnabled        bool
 	ExtraFoldersSyncEnabled bool
 	ExtraSyncFolders        []string
+	FileSyncCron            string
+	FileSyncScheduleEnabled bool
 	// Patroni / HA
 	PatroniConfigured    bool
 	RedisSentinelMaster  string
@@ -47,7 +49,7 @@ const clusterColumns = `
 	id, name, description, mode, auto_failover, auto_failback,
 	app_tier_always_available, failover_on_maintenance, failover_delay_secs, failback_multiplier,
 	vip::text, patroni_scope, netbox_version,
-	media_sync_enabled, extra_folders_sync_enabled, extra_sync_folders,
+	media_sync_enabled, extra_folders_sync_enabled, extra_sync_folders, file_sync_cron, file_sync_schedule_enabled,
 	patroni_configured, redis_sentinel_master,
 	created_at, updated_at`
 
@@ -59,7 +61,7 @@ func scanCluster(row interface {
 		&c.ID, &c.Name, &c.Description, &c.Mode, &c.AutoFailover, &c.AutoFailback,
 		&c.AppTierAlwaysAvailable, &c.FailoverOnMaintenance, &c.FailoverDelaySecs, &c.FailbackMultiplier,
 		&c.VIP, &c.PatroniScope, &c.NetboxVersion,
-		&c.MediaSyncEnabled, &c.ExtraFoldersSyncEnabled, &c.ExtraSyncFolders,
+		&c.MediaSyncEnabled, &c.ExtraFoldersSyncEnabled, &c.ExtraSyncFolders, &c.FileSyncCron, &c.FileSyncScheduleEnabled,
 		&c.PatroniConfigured, &c.RedisSentinelMaster,
 		&c.CreatedAt, &c.UpdatedAt,
 	); err != nil {
@@ -161,6 +163,8 @@ type UpdateMediaSyncParams struct {
 	MediaSyncEnabled        bool
 	ExtraFoldersSyncEnabled bool
 	ExtraSyncFolders        []string
+	FileSyncCron            string
+	FileSyncScheduleEnabled bool
 }
 
 func (q *ClusterQuerier) UpdateMediaSyncSettings(ctx context.Context, p UpdateMediaSyncParams) error {
@@ -170,9 +174,10 @@ func (q *ClusterQuerier) UpdateMediaSyncSettings(ctx context.Context, p UpdateMe
 	}
 	_, err := q.pool.Exec(ctx, `
 		UPDATE clusters
-		SET media_sync_enabled = $2, extra_folders_sync_enabled = $3, extra_sync_folders = $4, updated_at = now()
+		SET media_sync_enabled = $2, extra_folders_sync_enabled = $3, extra_sync_folders = $4,
+		    file_sync_cron = $5, file_sync_schedule_enabled = $6, updated_at = now()
 		WHERE id = $1
-	`, p.ID, p.MediaSyncEnabled, p.ExtraFoldersSyncEnabled, folders)
+	`, p.ID, p.MediaSyncEnabled, p.ExtraFoldersSyncEnabled, folders, p.FileSyncCron, p.FileSyncScheduleEnabled)
 	return err
 }
 

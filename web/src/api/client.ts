@@ -34,4 +34,11 @@ client.interceptors.response.use(
   }
 )
 
+// Returns the server's error message from a failed API call, else the fallback.
+export function apiError(e: unknown, fallback: string): string
+export function apiError(e: unknown): string | undefined
+export function apiError(e: unknown, fallback?: string) {
+  return (e as { response?: { data?: { message?: string } } } | null)?.response?.data?.message ?? fallback
+}
+
 export default client

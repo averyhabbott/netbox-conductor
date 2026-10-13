@@ -3,8 +3,6 @@ package ws
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -52,7 +50,7 @@ type Client struct {
 
 // New creates a Client. HeartbeatFn must be set before Run is called.
 func New(cfg *config.Config, onMessage MessageHandler) (*Client, error) {
-	httpClient, err := buildHTTPClient(cfg)
+	httpClient, err := cfg.HTTPClient()
 	if err != nil {
 		return nil, fmt.Errorf("building HTTP client: %w", err)
 	}
@@ -252,30 +250,6 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-func buildHTTPClient(cfg *config.Config) (*http.Client, error) {
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: cfg.TLSSkipVerify, //nolint:gosec // intentional dev option, warned at startup
-	}
-
-	if cfg.TLSCACert != "" {
-		pemData, err := os.ReadFile(cfg.TLSCACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert %s: %w", cfg.TLSCACert, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pemData) {
-			return nil, fmt.Errorf("no valid certs in %s", cfg.TLSCACert)
-		}
-		tlsCfg.RootCAs = pool
-	}
-
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsCfg,
-		},
-	}, nil
-}
-
 func newID() string {
 	b := make([]byte, 8)
 	rand.Read(b) //nolint:gosec
@@ -288,4 +262,3 @@ func min(a, b time.Duration) time.Duration {
 	}
 	return b
 }
-

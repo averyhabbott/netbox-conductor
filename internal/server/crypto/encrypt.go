@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 const (
@@ -30,7 +31,7 @@ func LoadMasterKey(create bool) (*MasterKey, error) {
 		return loadFromFile(path, create)
 	}
 	if hexKey := os.Getenv("NETBOX_CONDUCTOR_MASTER_KEY"); hexKey != "" {
-		return loadFromHex(hexKey)
+		return ParseMasterKey(hexKey)
 	}
 	// Default path
 	return loadFromFile("/etc/netbox-conductor/master.key", create)
@@ -44,16 +45,13 @@ func loadFromFile(path string, create bool) (*MasterKey, error) {
 		}
 		return nil, fmt.Errorf("reading master key file %s: %w", path, err)
 	}
-	hexStr := string(data)
-	// Strip trailing newline if present
-	if len(hexStr) > 0 && hexStr[len(hexStr)-1] == '\n' {
-		hexStr = hexStr[:len(hexStr)-1]
-	}
-	return loadFromHex(hexStr)
+	return ParseMasterKey(string(data))
 }
 
-func loadFromHex(hexStr string) (*MasterKey, error) {
-	raw, err := hex.DecodeString(hexStr)
+// ParseMasterKey decodes a hex-encoded master key, ignoring one trailing newline
+// as written to key files.
+func ParseMasterKey(hexStr string) (*MasterKey, error) {
+	raw, err := hex.DecodeString(strings.TrimSuffix(hexStr, "\n"))
 	if err != nil {
 		return nil, fmt.Errorf("decoding master key hex: %w", err)
 	}
@@ -65,16 +63,25 @@ func loadFromHex(hexStr string) (*MasterKey, error) {
 	return &mk, nil
 }
 
-func generateAndSave(path string) (*MasterKey, error) {
+// GenerateMasterKey returns a new random master key.
+func GenerateMasterKey() (*MasterKey, error) {
 	var mk MasterKey
 	if _, err := io.ReadFull(rand.Reader, mk[:]); err != nil {
 		return nil, fmt.Errorf("generating master key: %w", err)
+	}
+	return &mk, nil
+}
+
+func generateAndSave(path string) (*MasterKey, error) {
+	mk, err := GenerateMasterKey()
+	if err != nil {
+		return nil, err
 	}
 	hexKey := hex.EncodeToString(mk[:]) + "\n"
 	if err := os.WriteFile(path, []byte(hexKey), 0400); err != nil {
 		return nil, fmt.Errorf("writing master key to %s: %w", path, err)
 	}
-	return &mk, nil
+	return mk, nil
 }
 
 // Encryptor performs AES-256-GCM encryption/decryption using the master key.
@@ -155,12 +162,11 @@ func HashToken(token string) string {
 }
 
 // GenerateToken generates a cryptographically random token of byteLen bytes,
-// returned as a base64url-encoded string (URL-safe, no padding).
+// returned hex-encoded (URL- and env-file-safe).
 func GenerateToken(byteLen int) (string, error) {
 	raw := make([]byte, byteLen)
 	if _, err := io.ReadFull(rand.Reader, raw); err != nil {
 		return "", fmt.Errorf("generating random token: %w", err)
 	}
-	// Use hex encoding for simplicity and compatibility with env files
 	return hex.EncodeToString(raw), nil
 }

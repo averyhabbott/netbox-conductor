@@ -1,13 +1,9 @@
 package executor
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
-	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -20,11 +16,8 @@ const defaultPGBackRestConfigPath = "/etc/pgbackrest/pgbackrest.conf"
 func WritePGBackRestConfig(params protocol.PGBackRestConfigParams) (string, error) {
 	configPath := defaultPGBackRestConfigPath
 
-	if params.Sha256 != "" {
-		sum := sha256.Sum256([]byte(params.Config))
-		if actual := fmt.Sprintf("%x", sum[:]); actual != params.Sha256 {
-			return "", fmt.Errorf("sha256 mismatch: expected %s got %s", params.Sha256, actual)
-		}
+	if _, err := checkSHA256(params.Config, params.Sha256); err != nil {
+		return "", err
 	}
 
 	dir := filepath.Dir(configPath)
@@ -33,20 +26,9 @@ func WritePGBackRestConfig(params protocol.PGBackRestConfigParams) (string, erro
 	}
 	_ = os.Chmod(dir, 0755)
 
-	tmpPath := filepath.Join(dir, fmt.Sprintf(".pgbackrest.conf.tmp.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpPath, []byte(params.Config), 0640); err != nil {
-		return "", fmt.Errorf("writing temp pgbackrest config: %w", err)
-	}
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("atomic rename of pgbackrest config failed: %w", err)
-	}
 	// Mode 0640 with group=postgres lets postgres read without requiring root ownership.
-	_ = os.Chmod(configPath, 0640)
-	if pg, err := user.LookupGroup("postgres"); err == nil {
-		if gid, err := strconv.Atoi(pg.Gid); err == nil {
-			_ = os.Chown(configPath, -1, gid)
-		}
+	if err := writeFileAtomic(configPath, params.Config, 0640, groupID("postgres")); err != nil {
+		return "", err
 	}
 
 	return fmt.Sprintf("wrote %d bytes to %s", len(params.Config), configPath), nil

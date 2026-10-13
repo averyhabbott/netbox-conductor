@@ -128,9 +128,9 @@ Add at least one storage location from the Backups tab. Up to four locations can
 |---|---|
 | Local Disk | NFS or SMB mount that all nodes share; or local disk with sync enabled |
 | Amazon S3 | AWS S3 or any S3-compatible service (MinIO, Wasabi, Backblaze B2 via custom endpoint) |
-| Google Cloud Storage | GCS bucket with service account key |
+| Google Cloud Storage *(future)* | GCS bucket with service account key — not offered for new storage locations yet |
 | Azure Blob Storage | Azure storage account and container |
-| SFTP Server | Remote server accessible via SSH key auth |
+| SFTP Server *(future)* | Remote server accessible via SSH key auth — not offered for new storage locations yet |
 
 For each location, set retention:
 - **Keep N full backups** — how many weekly full backups to retain (default: 2)
@@ -151,7 +151,7 @@ Click "Enable Backups." This runs a three-step bootstrap sequence:
 
 3. **`stanza_initialized` marked** — Once stanza creation succeeds, the cluster is marked backup-ready and the scheduler will begin honoring the backup schedule.
 
-**Expected outcome:** Both tasks (configure push + stanza create) should complete within about 2 minutes for local and cloud storage. SFTP may take longer depending on network latency.
+**Expected outcome:** Both tasks (configure push + stanza create) should complete within about 2 minutes for local and cloud storage.
 
 **Risks:**
 - If pgBackRest is not installed on a node, the push task will fail. The agent installer handles this, but manually provisioned nodes may be missing it.

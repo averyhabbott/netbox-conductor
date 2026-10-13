@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -21,9 +22,9 @@ var redisHostRe = regexp.MustCompile(`('HOST'\s*:\s*)'[^']*'`)
 // active/standby cluster with app_tier_always_available=true, so every
 // app-tier node redirects its Redis connection to the new primary without a
 // full config rewrite.
-func UpdateRedisHost(params protocol.RedisHostUpdateParams, configPath string) (string, error) {
+func UpdateRedisHost(ctx context.Context, params protocol.RedisHostUpdateParams, configPath string) (string, error) {
 	if configPath == "" {
-		return "", fmt.Errorf("NETBOX_CONFIG_PATH is not configured")
+		return "", ErrNoNetbox
 	}
 	if params.Host == "" {
 		return "", fmt.Errorf("host must not be empty")
@@ -53,21 +54,12 @@ func UpdateRedisHost(params protocol.RedisHostUpdateParams, configPath string) (
 	}
 
 	updated := content[:start] + newBlock + content[end:]
-	if err := os.WriteFile(configPath, []byte(updated), 0640); err != nil {
-		return "", fmt.Errorf("writing %s: %w", configPath, err)
+	if err := writeNetboxConfig(ctx, configPath, updated, false); err != nil {
+		return "", err
 	}
 
 	output := fmt.Sprintf("updated Redis HOST to %s in %s", params.Host, configPath)
-
-	if params.RestartAfter {
-		restartOut, err := restartNetbox()
-		output += "\n" + restartOut
-		if err != nil {
-			output += "\nwarn: restart failed: " + err.Error()
-		}
-	}
-
-	return output, nil
+	return withNetboxRestart(ctx, output, params.RestartAfter), nil
 }
 
 // findRedisBlockBounds returns the [start, end) byte range of "REDIS = { ... }"

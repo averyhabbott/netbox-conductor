@@ -1,12 +1,10 @@
 package executor
 
 import (
-	"crypto/sha256"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -14,39 +12,24 @@ import (
 const defaultSentinelConfigPath = "/etc/redis/sentinel.conf"
 
 // WriteSentinelConfig atomically writes sentinel.conf and optionally restarts redis-sentinel.
-func WriteSentinelConfig(params protocol.SentinelConfigWriteParams) (string, error) {
+func WriteSentinelConfig(ctx context.Context, params protocol.SentinelConfigWriteParams) (string, error) {
 	configPath := defaultSentinelConfigPath
 
-	if params.Sha256 != "" {
-		sum := sha256.Sum256([]byte(params.Content))
-		if actual := fmt.Sprintf("%x", sum[:]); actual != params.Sha256 {
-			return "", fmt.Errorf("sha256 mismatch: expected %s got %s", params.Sha256, actual)
-		}
+	if _, err := checkSHA256(params.Content, params.Sha256); err != nil {
+		return "", err
 	}
 
-	dir := filepath.Dir(configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
 		return "", fmt.Errorf("creating config dir: %w", err)
 	}
-
-	tmpPath := filepath.Join(dir, fmt.Sprintf(".sentinel-config.tmp.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpPath, []byte(params.Content), 0660); err != nil {
-		return "", fmt.Errorf("writing temp config: %w", err)
-	}
-	// Chmod after WriteFile to force 0660 regardless of process umask.
-	if err := os.Chmod(tmpPath, 0660); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("setting sentinel config permissions: %w", err)
-	}
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("atomic rename failed: %w", err)
+	if err := writeFileAtomic(configPath, params.Content, 0660, -1); err != nil {
+		return "", err
 	}
 
 	output := fmt.Sprintf("wrote %d bytes to %s", len(params.Content), configPath)
 
 	if params.RestartAfter {
-		cmd := exec.Command("sudo", "systemctl", "restart", "redis-sentinel")
+		cmd := Command(ctx, "sudo", "systemctl", "restart", "redis-sentinel")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return output, fmt.Errorf("redis-sentinel restart failed: %w\n%s", err, out)
 		}

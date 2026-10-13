@@ -120,9 +120,7 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.DELETE("/clusters/:id/nodes/:nid", cfg.NodeHandler.Delete, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/nodes/:nid/status", cfg.NodeHandler.Status)
 	protected.POST("/clusters/:id/nodes/:nid/registration-token", cfg.NodeHandler.GenerateRegToken, mw.RequireRole("operator"))
-	protected.POST("/clusters/:id/nodes/:nid/agent-env", cfg.NodeHandler.DownloadAgentEnv, mw.RequireRole("operator"))
 	protected.GET("/clusters/:id/nodes/:nid/tasks", cfg.NodeHandler.Tasks)
-	protected.POST("/clusters/:id/nodes/:nid/media-sync", cfg.AgentHandler.StartMediaSync, mw.RequireRole("operator"))
 	protected.GET("/clusters/:id/nodes/:nid/logs", cfg.NodeHandler.GetLogs)
 	protected.GET("/clusters/:id/nodes/:nid/netbox-log-names", cfg.NodeHandler.GetNetboxLogNames)
 	protected.PUT("/clusters/:id/nodes/:nid/maintenance", cfg.NodeHandler.SetMaintenance, mw.RequireRole("operator"))
@@ -130,7 +128,6 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.POST("/clusters/:id/nodes/:nid/stop-netbox", cfg.NodeHandler.ServiceAction, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/nodes/:nid/restart-netbox", cfg.NodeHandler.ServiceAction, mw.RequireRole("operator"))
 	protected.POST("/clusters/:id/nodes/:nid/restart-rq", cfg.NodeHandler.ServiceAction, mw.RequireRole("operator"))
-	protected.POST("/clusters/:id/nodes/:nid/upgrade-agent", cfg.NodeHandler.UpgradeAgent, mw.RequireRole("operator"))
 
 	// ── Config (Phase 3) ────────────────────────────────────────────────────
 	protected.GET("/clusters/:id/config", cfg.ConfigHandler.GetOrCreate)
@@ -156,11 +153,6 @@ func New(cfg RouterConfig) *echo.Echo {
 	protected.PATCH("/clusters/:id/patroni-config", cfg.PatroniHandler.PatchPatroniConfig, mw.RequireRole("admin"))
 	protected.GET("/clusters/:id/patroni-config/snapshots", cfg.PatroniHandler.GetPatroniSnapshots, mw.RequireRole("operator"))
 	protected.GET("/clusters/:id/patroni-config/deploy/:jobId", cfg.PatroniHandler.GetPatroniDeployStatus, mw.RequireRole("operator"))
-
-	// ── Retention policy ────────────────────────────────────────────────────
-	protected.GET("/clusters/:id/retention-policy", cfg.PatroniHandler.GetRetentionPolicy)
-	protected.PUT("/clusters/:id/retention-policy", cfg.PatroniHandler.SetRetentionPolicy, mw.RequireRole("operator"))
-	protected.POST("/clusters/:id/retention-policy/enforce", cfg.PatroniHandler.EnforceRetention, mw.RequireRole("operator"))
 
 	// ── Backups ──────────────────────────────────────────────────────────────
 	if cfg.BackupHandler != nil {

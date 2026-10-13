@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { clustersApi } from '../api/clusters'
 import type { ClusterStatus } from '../api/clusters'
 import { alertsApi } from '../api/alerts'
+import HealthDot from '../components/HealthDot'
 import Layout from '../components/Layout'
 import { useSSE } from '../hooks/useSSE'
 import type { SSEEvent } from '../hooks/useSSE'
@@ -145,23 +146,6 @@ function DonutChart({
         </div>
       </div>
     </div>
-  )
-}
-
-// ── Health dot ────────────────────────────────────────────────────────────────
-
-const HEALTH_DOT_BG: Record<HealthStatus, string> = {
-  healthy: 'bg-emerald-400',
-  degraded: 'bg-amber-400',
-  offline: 'bg-red-500',
-}
-
-function HealthDot({ status }: { status: HealthStatus }) {
-  return (
-    <span
-      className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${HEALTH_DOT_BG[status]}`}
-      title={status}
-    />
   )
 }
 
