@@ -20,7 +20,8 @@ client.interceptors.response.use(
   (res) => res,
   async (err) => {
     const original = err.config
-    if (err.response?.status === 401 && !original._retry) {
+    // A 401 from the refresh call itself must not trigger another refresh (infinite loop).
+    if (err.response?.status === 401 && !original._retry && original.url !== '/auth/refresh') {
       original._retry = true
       const refreshed = await useAuthStore.getState().refresh()
       if (refreshed) {
