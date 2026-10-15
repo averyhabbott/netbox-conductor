@@ -2,7 +2,9 @@ package hub
 
 import (
 	"context"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
@@ -17,7 +19,19 @@ type Hub struct {
 	stagingSessions map[uuid.UUID]*Session // keyed by StagingAgentID (unassigned agents)
 
 	taskWaitersMu sync.Mutex
-	taskWaiters   map[uuid.UUID]chan protocol.TaskResultPayload
+	taskWaiters   map[uuid.UUID]*taskWatch
+}
+
+// taskWatch waits for one task's result. With node set it also follows that
+// node's heartbeats, which list every task the agent holds: once the agent has
+// shown it holds the task (ack or heartbeat), a heartbeat without it means the
+// task ended and its result never arrived.
+type taskWatch struct {
+	node     uuid.UUID
+	result   chan protocol.TaskResultPayload
+	known    atomic.Bool
+	lost     chan struct{}
+	lostOnce sync.Once
 }
 
 // New creates an empty Hub.
@@ -25,7 +39,7 @@ func New() *Hub {
 	return &Hub{
 		sessions:        make(map[uuid.UUID]*Session),
 		stagingSessions: make(map[uuid.UUID]*Session),
-		taskWaiters:     make(map[uuid.UUID]chan protocol.TaskResultPayload),
+		taskWaiters:     make(map[uuid.UUID]*taskWatch),
 	}
 }
 
@@ -203,11 +217,17 @@ func (h *Hub) WaitForTask(ctx context.Context, taskID uuid.UUID, timeout time.Du
 // ExpectTask registers for taskID's result; call it before dispatching the
 // task so a fast result can't be missed, and call done when no longer waiting.
 func (h *Hub) ExpectTask(taskID uuid.UUID) (result <-chan protocol.TaskResultPayload, done func()) {
-	ch := make(chan protocol.TaskResultPayload, 1)
+	w, done := h.watchTask(taskID, uuid.Nil)
+	return w.result, done
+}
+
+// watchTask registers a watch for taskID on node; see taskWatch.
+func (h *Hub) watchTask(taskID, node uuid.UUID) (*taskWatch, func()) {
+	w := &taskWatch{node: node, result: make(chan protocol.TaskResultPayload, 1), lost: make(chan struct{})}
 	h.taskWaitersMu.Lock()
-	h.taskWaiters[taskID] = ch
+	h.taskWaiters[taskID] = w
 	h.taskWaitersMu.Unlock()
-	return ch, func() {
+	return w, func() {
 		h.taskWaitersMu.Lock()
 		delete(h.taskWaiters, taskID)
 		h.taskWaitersMu.Unlock()
@@ -218,12 +238,39 @@ func (h *Hub) ExpectTask(taskID uuid.UUID) (result <-chan protocol.TaskResultPay
 // Called by handleTaskResult after the result is persisted.
 func (h *Hub) NotifyTaskResult(taskID uuid.UUID, result protocol.TaskResultPayload) {
 	h.taskWaitersMu.Lock()
-	ch, ok := h.taskWaiters[taskID]
+	w, ok := h.taskWaiters[taskID]
 	h.taskWaitersMu.Unlock()
 	if ok {
 		select {
-		case ch <- result:
+		case w.result <- result:
 		default:
+		}
+	}
+}
+
+// NotifyTaskAck records that the agent received taskID.
+func (h *Hub) NotifyTaskAck(taskID uuid.UUID) {
+	h.taskWaitersMu.Lock()
+	defer h.taskWaitersMu.Unlock()
+	if w, ok := h.taskWaiters[taskID]; ok {
+		w.known.Store(true)
+	}
+}
+
+// NotifyHeartbeat checks node's watched tasks against the tasks its heartbeat
+// lists. The agent sends acks, results and heartbeats in order, so a listed
+// task the agent no longer lists has had its result handled already, if it sent one.
+func (h *Hub) NotifyHeartbeat(node uuid.UUID, tasks []string) {
+	h.taskWaitersMu.Lock()
+	defer h.taskWaitersMu.Unlock()
+	for id, w := range h.taskWaiters {
+		if w.node != node {
+			continue
+		}
+		if slices.Contains(tasks, id.String()) {
+			w.known.Store(true)
+		} else if w.known.Load() {
+			w.lostOnce.Do(func() { close(w.lost) })
 		}
 	}
 }

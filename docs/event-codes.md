@@ -22,6 +22,13 @@ Events are stored in the `events` table and can be queried via `GET /api/v1/even
 | NBC-CLU-006 | info | Folder sync to a node finished (backups, media or an extra folder) | — |
 | NBC-CLU-007 | error | Folder sync to a node failed | Read the message. Permission errors: run `sudo netbox-agent check-sync-permissions` on the node. Failed files are retried on the next sync. |
 | NBC-CLU-008 | warn | Two-way folder sync (media or an extra folder) found a file changed on more than one node, or changed on one and deleted on another; the newest change was kept everywhere | Check the named files. The overwritten version is gone; restore it from a backup if it was needed. |
+| NBC-CLU-009 | error | A local-disk backup storage path failed its test on a node (when the location is saved, or at the start of a backup sync) | Run the commands shown on the storage location (`mkdir -p`, `chown postgres:postgres`, `chmod 750`) on the named node. |
+| NBC-CLU-010 | error | Backup sync found the same WAL segment or `.history` file with different contents on two nodes (two nodes were primary at once); it was left as it is everywhere | Find out which node's history is the real one, then remove the other copy by hand. |
+| NBC-CLU-011 | warn | A scheduled backup couldn't start (no connected primary, the cluster busy with another operation, or the job couldn't be sent); it is tried again in 1 minute, 3 tries in all | Usually none. If it repeats, check the primary's agent is connected. |
+| NBC-CLU-012 | error | A scheduled backup was skipped: it couldn't start in 3 tries | Read the message for why. WAL keeps archiving, so restores still reach the present from the previous backup. |
+| NBC-CLU-013 | warn | Before its backup, a storage location's check (`pgbackrest info` for that location) failed; it is checked again in 1 minute, 3 checks in all, while the other locations go ahead | Usually none. If it repeats, check the location is reachable. |
+| NBC-CLU-014 | error | A backup to a storage location failed: its 3 checks failed, or the backup itself failed (it is not retried until the next scheduled backup) | Read the message; fix the location (space, permissions, reachability). WAL keeps archiving, so restores still reach the present from the previous backup. |
+| NBC-CLU-015 | info | A backup sync left out a node that hasn't stayed connected long enough (the failback timer's length) since it last connected; it catches up once it has | None. The node's last NBC-CLU-006 shows its last successful backup sync. |
 
 ---
 

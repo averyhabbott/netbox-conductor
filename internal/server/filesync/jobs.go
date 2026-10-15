@@ -2,22 +2,19 @@ package filesync
 
 import (
 	"errors"
-	"os"
 
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/google/uuid"
 )
 
-// BackupJob syncs a posix pgBackRest repo: dests become exact copies of the
-// source's. Files get no access for others (a backup is a full copy of the
-// database); setgid keeps new dirs in the repo's group (postgres) so
-// pgBackRest can use them after a failover.
-func BackupJob(clusterID uuid.UUID, repoPath string, source queries.Node, dests []queries.Node) Job {
+// BackupJob syncs a local-disk storage location's pgBackRest repo from the
+// main server (source) to dests: see backupPlan. Files are written as postgres.
+func BackupJob(target queries.BackupTarget, stanza string, source queries.Node, dests []queries.Node) Job {
 	return Job{
-		ClusterID: clusterID, Name: "backups", Root: repoPath,
+		ClusterID: target.ClusterID, Name: "backups (" + target.Label + ")", Root: *target.PosixPath,
 		Nodes: append([]queries.Node{source}, dests...), Source: source.ID,
-		FileMode: 0o660, DirMode: os.ModeSetgid | 0o770,
+		Backup: &Backup{Target: target, Stanza: stanza},
 	}
 }
 

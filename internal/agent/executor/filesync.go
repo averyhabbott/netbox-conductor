@@ -171,30 +171,75 @@ type SyncReceiver struct {
 type syncRecv struct {
 	root              string
 	fileMode, dirMode os.FileMode
+	repo              *repoReceiver // a pgBackRest repo: files are written by the repo helper
 	result            protocol.SyncFinishResult
 
-	skip string // a file that already failed; its remaining chunks are ignored
-	repairTried bool // access to the folder was repaired once this sync
+	skip        string // a file that already failed; its remaining chunks are ignored
+	repairTried bool   // access to the folder was repaired once this sync
 
 	// file being written
 	path string
-	tmp  *os.File
+	tmp  partialFile
 	hash hash.Hash
 	next int
+}
+
+// partialFile is a received file being written as "<dest>.nbc-partial":
+// commit renames it into place, abort discards it.
+type partialFile interface {
+	io.Writer
+	commit() error
+	abort()
+}
+
+// localPartial is a partial file the agent writes itself.
+type localPartial struct {
+	f    *os.File
+	dest string
+}
+
+func (p *localPartial) Write(b []byte) (int, error) { return p.f.Write(b) }
+
+func (p *localPartial) commit() error {
+	err := p.f.Close()
+	if err == nil {
+		err = os.Rename(p.f.Name(), p.dest)
+	}
+	if err != nil {
+		_ = os.Remove(p.f.Name())
+	}
+	return err
+}
+
+func (p *localPartial) abort() {
+	_ = p.f.Close()
+	_ = os.Remove(p.f.Name())
 }
 
 func NewSyncReceiver() *SyncReceiver {
 	return &SyncReceiver{syncs: map[string]*syncRecv{}}
 }
 
-// Start begins accepting chunks for a sync.
-// shortcut: a sync the conductor never finishes keeps its entry (and an open
-// partial file) until the agent restarts; fine while the conductor always finishes.
+// Start begins accepting chunks for a sync. A sync of the same folder that
+// was never finished (the conductor lost track of it) is stopped first.
 func (r *SyncReceiver) Start(p protocol.SyncReceiveParams, root string) (string, error) {
 	if p.SyncID == "" || root == "" {
 		return "", errors.New("sync_id and root are required")
 	}
-	r.syncs[p.SyncID] = &syncRecv{root: root, fileMode: os.FileMode(p.FileMode), dirMode: os.FileMode(p.DirMode)}
+	for id, s := range r.syncs {
+		if s.root == root {
+			s.stop()
+			delete(r.syncs, id)
+		}
+	}
+	s := &syncRecv{root: root, fileMode: os.FileMode(p.FileMode), dirMode: os.FileMode(p.DirMode)}
+	if p.AsPostgres {
+		var err error
+		if s.repo, err = startRepoReceiver(root); err != nil {
+			return "", err
+		}
+	}
+	r.syncs[p.SyncID] = s
 	return "receiving", nil
 }
 
@@ -239,7 +284,13 @@ func (s *syncRecv) chunk(c protocol.SyncChunkPayload) error {
 		if err != nil {
 			return err
 		}
-		if err := withAccessRepair(context.Background(), s.root, &s.repairTried, func() error { return s.open(dest) }); err != nil {
+		if s.repo != nil {
+			p, err := s.repo.open(c.Path)
+			if err != nil {
+				return err
+			}
+			s.tmp, s.hash, s.next = p, sha256.New(), 0
+		} else if err := withAccessRepair(context.Background(), s.root, &s.repairTried, func() error { return s.open(dest) }); err != nil {
 			return err
 		}
 		s.path = c.Path
@@ -255,13 +306,9 @@ func (s *syncRecv) chunk(c protocol.SyncChunkPayload) error {
 	if got := hex.EncodeToString(s.hash.Sum(nil)); got != c.SHA256 {
 		return fmt.Errorf("checksum mismatch (got %s, source sent %s)", got, c.SHA256)
 	}
-	tmpName := s.tmp.Name()
-	if err := s.tmp.Close(); err != nil {
-		return err
-	}
+	tmp := s.tmp
 	s.tmp = nil
-	if err := os.Rename(tmpName, strings.TrimSuffix(tmpName, protocol.SyncPartialSuffix)); err != nil {
-		_ = os.Remove(tmpName)
+	if err := tmp.commit(); err != nil {
 		return err
 	}
 	s.path, s.next = "", 0
@@ -285,15 +332,14 @@ func (s *syncRecv) open(dest string) error {
 		return err
 	}
 	_ = f.Chmod(s.fileMode)
-	s.tmp, s.hash, s.next = f, sha256.New(), 0
+	s.tmp, s.hash, s.next = &localPartial{f: f, dest: dest}, sha256.New(), 0
 	return nil
 }
 
 // abort discards the file being written and, with a reason, records a failure.
 func (s *syncRecv) abort(reason string) {
 	if s.tmp != nil {
-		_ = s.tmp.Close()
-		_ = os.Remove(s.tmp.Name())
+		s.tmp.abort()
 		s.tmp = nil
 	}
 	s.path, s.next = "", 0
@@ -314,19 +360,58 @@ func (r *SyncReceiver) Finish(p protocol.SyncFinishParams) (string, error) {
 	}
 	delete(r.syncs, p.SyncID)
 	s.abort("")
+	if s.repo != nil {
+		if err := s.repo.close(); err != nil {
+			s.abort(err.Error())
+		}
+	}
 	out, _ := json.Marshal(s.result)
 	return string(out), nil
 }
 
-// DeleteSyncFiles removes the named files under root, then any directories
-// that became empty (never root itself). Already-missing files are fine.
+// StopAll stops every sync, discarding unfinished files: used when the
+// connection to the conductor drops, which ends those syncs.
+func (r *SyncReceiver) StopAll() {
+	for id, s := range r.syncs {
+		s.stop()
+		delete(r.syncs, id)
+	}
+}
+
+// stop discards the file being written and ends the repo helper, if any.
+func (s *syncRecv) stop() {
+	s.abort("")
+	if s.repo != nil {
+		s.repo.stop()
+	}
+}
+
+// DeleteSyncFiles removes the named files under root (in a repo, through the
+// repo helper as postgres), then any directories that became empty.
 func DeleteSyncFiles(ctx context.Context, p protocol.SyncDeleteParams, root string) (string, error) {
+	var err error
+	if p.AsPostgres {
+		err = runRepoHelper(ctx, strings.Join(p.Paths, "\n"), "delete", root)
+	} else {
+		var repairTried bool
+		err = removeSyncFiles(root, p.Paths, func(path string) error {
+			return withAccessRepair(ctx, root, &repairTried, func() error { return os.Remove(path) })
+		})
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("deleted %d files", len(p.Paths)), nil
+}
+
+// removeSyncFiles removes each named file under root with remove, then any
+// directories that became empty (never root itself). Already-missing files are fine.
+func removeSyncFiles(root string, rels []string, remove func(path string) error) error {
 	var failed []string
-	var repairTried bool
-	for _, rel := range p.Paths {
+	for _, rel := range rels {
 		path, err := syncRelPath(root, rel)
 		if err == nil {
-			err = withAccessRepair(ctx, root, &repairTried, func() error { return os.Remove(path) })
+			err = remove(path)
 		}
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			failed = append(failed, err.Error())
@@ -336,7 +421,7 @@ func DeleteSyncFiles(ctx context.Context, p protocol.SyncDeleteParams, root stri
 		}
 	}
 	if len(failed) > 0 {
-		return "", fmt.Errorf("%d of %d deletes failed, first: %s", len(failed), len(p.Paths), failed[0])
+		return fmt.Errorf("%d of %d deletes failed, first: %s", len(failed), len(rels), failed[0])
 	}
-	return fmt.Sprintf("deleted %d files", len(p.Paths)), nil
+	return nil
 }

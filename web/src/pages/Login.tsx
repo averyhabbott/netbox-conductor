@@ -53,7 +53,7 @@ export default function Login() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-950">
       <div className="w-full max-w-sm bg-gray-900 rounded-xl p-8 shadow-lg border border-gray-800">
-        <h1 className="text-2xl font-semibold text-white mb-2">NetBox Failover</h1>
+        <h1 className="text-2xl font-semibold text-white mb-2">NetBox Conductor</h1>
         <p className="text-gray-400 text-sm mb-8">
           {step === 'credentials' ? 'Sign in to your account' : 'Enter your authenticator code'}
         </p>

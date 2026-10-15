@@ -16,6 +16,7 @@ const (
 	TypeSyncListing        MessageType = "sync.listing" // one piece of a folder listing (sync.list)
 	TypeSyncChunk          MessageType = "sync.chunk"   // source → conductor → destinations (sync.send)
 	TypeNetboxLog          MessageType = "netbox.log"
+	TypeBackupEvent        MessageType = "backup.event" // a backup round's warning or error, sent as it happens
 
 	// Server → Agent
 	TypeServerHello  MessageType = "server.hello"
@@ -54,7 +55,7 @@ const (
 	// pgBackRest backup management
 	TaskPGBackRestConfigure    TaskType = "pgbackrest.configure"     // write /etc/pgbackrest/pgbackrest.conf
 	TaskPGBackRestStanzaCreate TaskType = "pgbackrest.stanza-create" // stanza-create + stanza-check (one-time bootstrap)
-	TaskPGBackRestBackup       TaskType = "pgbackrest.backup"        // run pgbackrest backup (full|diff|incr)
+	TaskPGBackRestBackup       TaskType = "pgbackrest.backup"        // check + back up to each storage location in turn (full|diff|incr)
 	TaskPGBackRestCatalog      TaskType = "pgbackrest.catalog"       // pgbackrest info --output=json
 	TaskPGBackRestRestore      TaskType = "pgbackrest.restore"       // full cluster restore (stops Patroni, runs pgBackRest restore)
 	TaskPGBackRestTestPath     TaskType = "pgbackrest.test_path"     // verify a posix backup path is writable by the postgres user
@@ -141,6 +142,10 @@ type HeartbeatPayload struct {
 	SentinelRunning bool   `json:"sentinel_running"`
 	PatroniRunning  bool   `json:"patroni_running"`
 	PostgresRunning bool   `json:"postgres_running"`
+
+	// Tasks lists the IDs of the tasks the agent has received and not yet
+	// reported, running or queued. A task gone from it without a result was lost.
+	Tasks []string `json:"tasks"`
 }
 
 // PatroniStatePayload is sent proactively when the agent detects a role change.
@@ -209,6 +214,14 @@ type SyncChunkPayload struct {
 // SyncPartialSuffix marks a file still being received; it is renamed into
 // place only once its hash matches.
 const SyncPartialSuffix = ".nbc-partial"
+
+// BackupEventPayload is a backup round's warning (a location's check failed;
+// it is checked again) or error (a location's backup failed).
+type BackupEventPayload struct {
+	Repo    int    `json:"repo"`
+	Error   bool   `json:"error"`
+	Message string `json:"message"`
+}
 
 // NetboxLogPayload carries a batch of NetBox application log lines from the agent.
 type NetboxLogPayload struct {
@@ -361,10 +374,30 @@ type PGBackRestStanzaCreateParams struct {
 	Stanza string `json:"stanza"` // pgBackRest stanza name (= Patroni scope)
 }
 
-// PGBackRestBackupParams are the params for TaskPGBackRestBackup.
+// PGBackRestBackupParams are the params for TaskPGBackRestBackup: one round
+// that backs up to each storage location once, after checking it can be read.
+// A location whose check fails goes to the back of the queue, not to be checked
+// again for CheckRetrySecs; after CheckTries failed checks its backup has failed.
+// The output is a []PGBackRestBackupResult as JSON.
 type PGBackRestBackupParams struct {
-	Stanza string `json:"stanza"`
-	Type   string `json:"type"` // "full" | "diff" | "incr"
+	Stanza            string `json:"stanza"`
+	Type              string `json:"type"`  // "full" | "diff" | "incr"
+	Repos             []int  `json:"repos"` // pgBackRest repos (storage locations), 1–4
+	CheckTries        int    `json:"check_tries"`
+	CheckTimeoutSecs  int    `json:"check_timeout_secs"`
+	CheckRetrySecs    int    `json:"check_retry_secs"`
+	BackupTimeoutSecs int    `json:"backup_timeout_secs"`
+}
+
+// PGBackRestRepoReadable reports whether a repo status code from `pgbackrest
+// info` means the repo was read: 0 ok, or 2 "no valid backups" (a new
+// location before its first backup).
+func PGBackRestRepoReadable(code int) bool { return code == 0 || code == 2 }
+
+// PGBackRestBackupResult is one location's outcome in a backup round.
+type PGBackRestBackupResult struct {
+	Repo  int    `json:"repo"`
+	Error string `json:"error,omitempty"` // "" = backed up
 }
 
 // PGBackRestCatalogParams are the params for TaskPGBackRestCatalog.
@@ -384,8 +417,10 @@ type PGBackRestRestoreParams struct {
 }
 
 // PGBackRestTestPathParams are the params for TaskPGBackRestTestPath.
+// The agent writes, reads back and removes a test file in Path: written and
+// removed as postgres, read as the agent.
 type PGBackRestTestPathParams struct {
-	Path string `json:"path"` // absolute path to test for write access by the postgres user
+	Path string `json:"path"` // absolute path of a local-disk storage location
 }
 
 // SyncListParams are the params for TaskSyncList. Root "" means the node's
@@ -413,7 +448,10 @@ type SyncReceiveParams struct {
 	SyncID   string `json:"sync_id"`
 	Root     string `json:"root"`
 	FileMode uint32 `json:"file_mode"` // os.FileMode for written files
-	DirMode  uint32 `json:"dir_mode"`  // os.FileMode for created dirs (os.ModeSetgid, not 0o2000)
+	DirMode  uint32 `json:"dir_mode"`  // os.FileMode for created dirs
+	// AsPostgres: Root is a pgBackRest repo; files are written as postgres
+	// (through the agent's repo helper) and FileMode/DirMode are ignored.
+	AsPostgres bool `json:"as_postgres,omitempty"`
 }
 
 // SyncFinishParams are the params for TaskSyncFinish. Output is a SyncFinishResult as JSON.
@@ -431,6 +469,7 @@ type SyncFinishResult struct {
 
 // SyncDeleteParams are the params for TaskSyncDelete.
 type SyncDeleteParams struct {
-	Root  string   `json:"root"`
-	Paths []string `json:"paths"`
+	Root       string   `json:"root"`
+	Paths      []string `json:"paths"`
+	AsPostgres bool     `json:"as_postgres,omitempty"` // as in SyncReceiveParams
 }

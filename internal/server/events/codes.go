@@ -22,6 +22,13 @@ const (
 	CodeFileSyncCompleted      = "NBC-CLU-006"
 	CodeFileSyncFailed         = "NBC-CLU-007"
 	CodeFileSyncConflict       = "NBC-CLU-008"
+	CodeBackupPathFailed       = "NBC-CLU-009"
+	CodeBackupWALConflict      = "NBC-CLU-010"
+	CodeBackupPostponed        = "NBC-CLU-011"
+	CodeBackupSkipped          = "NBC-CLU-012"
+	CodeBackupCheckFailed      = "NBC-CLU-013"
+	CodeBackupFailed           = "NBC-CLU-014"
+	CodeBackupSyncNodeSkipped  = "NBC-CLU-015"
 )
 
 // ─── Agent events (NBC-AGT-*) ─────────────────────────────────────────────────

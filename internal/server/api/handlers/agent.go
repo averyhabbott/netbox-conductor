@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/filesync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/logging"
+	"github.com/averyhabbott/netbox-conductor/internal/server/scheduler"
 	"github.com/averyhabbott/netbox-conductor/internal/server/sse"
 	"github.com/averyhabbott/netbox-conductor/internal/shared/protocol"
 )
@@ -42,6 +44,7 @@ type AgentHandler struct {
 	catalog       *queries.BackupCatalogQuerier
 	enc           *crypto.Encryptor
 	fileSync      *filesync.Manager
+	backups       *scheduler.BackupScheduler
 	failover      *failover.Manager
 	emitter       events.Emitter
 	hbQ           *queries.HeartbeatQuerier
@@ -88,6 +91,10 @@ func (h *AgentHandler) SetCatalogQuerier(q *queries.BackupCatalogQuerier) { h.ca
 
 // SetFileSync wires the folder sync manager (backups, media, extra folders).
 func (h *AgentHandler) SetFileSync(m *filesync.Manager) { h.fileSync = m }
+
+// SetBackups wires the backup scheduler, for backup syncs on reconnect and
+// when the primary changes.
+func (h *AgentHandler) SetBackups(s *scheduler.BackupScheduler) { h.backups = s }
 
 // SetEmitter wires up the event emitter (called from main after construction).
 func (h *AgentHandler) SetEmitter(e events.Emitter) { h.emitter = e }
@@ -326,6 +333,9 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 		if h.failover != nil {
 			h.failover.OnNodeDisconnect(nodeID, clusterID)
 		}
+		if h.backups != nil {
+			h.backups.OnNodeDisconnect(nodeID)
+		}
 		slog.Info("agent disconnected", "node", nodeID, "hostname", node.Hostname)
 
 		if h.emitter != nil {
@@ -344,6 +354,9 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	_ = h.agentToks.Touch(ctx, crypto.HashToken(hello.Token))
 	if h.failover != nil {
 		h.failover.OnNodeConnect(nodeID, clusterID)
+	}
+	if h.backups != nil {
+		h.backups.OnNodeConnect(nodeID, clusterID)
 	}
 
 	// Emit agent-connected event.
@@ -590,6 +603,8 @@ func (h *AgentHandler) handleInbound(ctx context.Context, sess *hub.Session, env
 		h.fileSync.HandleChunk(sess.NodeID, env)
 	case protocol.TypeNetboxLog:
 		h.handleNetboxLog(ctx, sess, env, logger)
+	case protocol.TypeBackupEvent:
+		h.handleBackupEvent(sess, env)
 	default:
 		logger.Warn("unknown message type", "type", env.Type)
 	}
@@ -600,6 +615,7 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 	if err := json.Unmarshal(env.Payload, &hb); err != nil {
 		return
 	}
+	h.hub.NotifyHeartbeat(sess.NodeID, hb.Tasks)
 
 	var patroniStateJSON json.RawMessage
 	if hb.PatroniState != nil {
@@ -663,6 +679,13 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 			// NetBox restarted — cancel any pending failover timer.
 			h.failover.OnNetboxStarted(sess.NodeID)
 		}
+	}
+
+	// Backup sync when a node becomes primary: it gathers the WAL a former
+	// primary archived. (A node's reconnect is covered when it settles.)
+	if prev, first := sess.SetPatroniRole(hb.PatroniRole); h.backups != nil &&
+		!first && prev != hb.PatroniRole && hb.PatroniRole == "primary" {
+		go h.backups.SyncBackups(sess.ClusterID)
 	}
 
 	if hb.NetboxVersion != "" {
@@ -856,6 +879,7 @@ func (h *AgentHandler) handleTaskAck(ctx context.Context, _ *hub.Session, env pr
 	logger.Info("task ack", "task_id", ack.TaskID, "status", ack.Status)
 	if taskID, err := uuid.Parse(ack.TaskID); err == nil {
 		_ = h.taskResults.SetAck(ctx, taskID)
+		h.hub.NotifyTaskAck(taskID)
 	}
 }
 
@@ -918,6 +942,20 @@ func (h *AgentHandler) handleTaskResult(ctx context.Context, sess *hub.Session, 
 			"duration": result.DurationMs,
 		},
 	})
+}
+
+// handleBackupEvent emits a backup round's warning or error as it happens.
+func (h *AgentHandler) handleBackupEvent(sess *hub.Session, env protocol.Envelope) {
+	var e protocol.BackupEventPayload
+	if err := json.Unmarshal(env.Payload, &e); err != nil || h.emitter == nil {
+		return
+	}
+	sev, code, msg := events.SeverityWarn, events.CodeBackupCheckFailed, "Backup storage location %d: %s"
+	if e.Error {
+		sev, code, msg = events.SeverityError, events.CodeBackupFailed, "Backup to storage location %d failed: %s"
+	}
+	h.emitter.Emit(events.New(events.CategoryCluster, sev, code, fmt.Sprintf(msg, e.Repo, e.Message), events.ActorSystem).
+		Cluster(sess.ClusterID).Node(sess.NodeID).Meta("repo", e.Repo).Build())
 }
 
 func (h *AgentHandler) handleNetboxLog(_ context.Context, sess *hub.Session, env protocol.Envelope, logger *slog.Logger) {

@@ -215,6 +215,21 @@ func (m *Manager) OnNodeConnect(nodeID, clusterID uuid.UUID) {
 	m.mu.Unlock()
 
 	// Read per-cluster settings outside the lock to avoid holding it during a DB call.
+	failbackDelay := m.FailbackDelay(clusterID)
+
+	m.mu.Lock()
+	m.failbackTimers[nodeID] = time.AfterFunc(failbackDelay, func() {
+		m.attemptFailback(nodeID, clusterID)
+	})
+	m.mu.Unlock()
+
+	slog.Info("failover: node connected — failback check scheduled",
+		"node", nodeID, "cluster", clusterID, "failback_delay", failbackDelay)
+}
+
+// FailbackDelay is the failback timer's length for clusterID: the failover
+// delay × the failback multiplier.
+func (m *Manager) FailbackDelay(clusterID uuid.UUID) time.Duration {
 	grace := m.grace
 	multiplier := DefaultFailbackMultiplier
 	if cluster, err := m.clusters.GetByID(context.Background(), clusterID); err == nil {
@@ -225,16 +240,7 @@ func (m *Manager) OnNodeConnect(nodeID, clusterID uuid.UUID) {
 			multiplier = cluster.FailbackMultiplier
 		}
 	}
-	failbackDelay := grace * time.Duration(multiplier)
-
-	m.mu.Lock()
-	m.failbackTimers[nodeID] = time.AfterFunc(failbackDelay, func() {
-		m.attemptFailback(nodeID, clusterID)
-	})
-	m.mu.Unlock()
-
-	slog.Info("failover: node connected — failback check scheduled",
-		"node", nodeID, "cluster", clusterID, "failback_delay", failbackDelay)
+	return grace * time.Duration(multiplier)
 }
 
 // OnMaintenanceDisabled must be called when an operator removes a node from

@@ -227,12 +227,11 @@ mkdir -p /var/lib/pgbackrest
 chown postgres:postgres /var/lib/pgbackrest
 chmod 750 /var/lib/pgbackrest
 
-# Default posix backup target — group write (770) so netbox-agent (in postgres group)
-# can test path writability and receive synced backups without sudo. setgid keeps
-# synced files in the postgres group so pgBackRest can use them after a failover.
+# Default local-disk backup location. postgres writes it (pgBackRest, and backup
+# syncs through the agent's repo helper); the agent only reads (postgres group).
 mkdir -p /var/lib/postgresql/backups
 chown postgres:postgres /var/lib/postgresql/backups
-chmod 2770 /var/lib/postgresql/backups
+chmod 750 /var/lib/postgresql/backups
 
 mkdir -p /var/log/pgbackrest
 chown postgres:postgres /var/log/pgbackrest

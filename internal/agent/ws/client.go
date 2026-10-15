@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
+	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -46,6 +49,15 @@ type Client struct {
 	// Use it to propagate cluster config to other subsystems (e.g. status server).
 	// Called on the connect goroutine; must not block.
 	OnServerHello func(protocol.ServerHelloPayload)
+
+	// OnDisconnect is called when an authenticated connection ends.
+	OnDisconnect func()
+
+	// tasks are the tasks received and not yet reported, listed in every
+	// heartbeat. tasksMu also keeps a heartbeat's list and its place in
+	// outbound together; see StartTask.
+	tasksMu sync.Mutex
+	tasks   map[string]bool
 }
 
 // New creates a Client. HeartbeatFn must be set before Run is called.
@@ -59,7 +71,27 @@ func New(cfg *config.Config, onMessage MessageHandler) (*Client, error) {
 		onMessage:  onMessage,
 		httpClient: httpClient,
 		outbound:   make(chan protocol.Envelope, 64),
+		tasks:      map[string]bool{},
 	}, nil
+}
+
+// StartTask lists taskID in heartbeats, then sends ack. The conductor reads a
+// task missing from a heartbeat that follows its ack as lost, so a task is
+// listed before its ack is sent and until after its result is (EndTask).
+func (c *Client) StartTask(taskID string, ack protocol.Envelope) {
+	c.tasksMu.Lock()
+	c.tasks[taskID] = true
+	c.tasksMu.Unlock()
+	c.Send(ack)
+}
+
+// EndTask sends a task's result (as SendWait), then stops listing the task.
+func (c *Client) EndTask(taskID string, result protocol.Envelope, timeout time.Duration) error {
+	err := c.SendWait(result, timeout)
+	c.tasksMu.Lock()
+	delete(c.tasks, taskID)
+	c.tasksMu.Unlock()
+	return err
 }
 
 // Send enqueues an envelope for delivery to the server.
@@ -173,6 +205,9 @@ func (c *Client) connect(ctx context.Context) error {
 	if c.OnServerHello != nil {
 		c.OnServerHello(serverHello)
 	}
+	if c.OnDisconnect != nil {
+		defer c.OnDisconnect()
+	}
 
 	// Run pumps
 	connCtx, connCancel := context.WithCancel(ctx)
@@ -240,12 +275,17 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 			hb.NodeID = c.cfg.NodeID
+			// The list and the send stay together, so a heartbeat queued after
+			// a task's ack always lists it (see StartTask).
+			c.tasksMu.Lock()
+			hb.Tasks = slices.Collect(maps.Keys(c.tasks))
 			payload, _ := json.Marshal(hb)
 			c.Send(protocol.Envelope{
 				ID:      newID(),
 				Type:    protocol.TypeAgentHeartbeat,
 				Payload: json.RawMessage(payload),
 			})
+			c.tasksMu.Unlock()
 		}
 	}
 }

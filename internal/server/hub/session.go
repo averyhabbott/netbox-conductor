@@ -42,7 +42,8 @@ type Session struct {
 	mu             sync.Mutex
 	connectedAt    time.Time
 	lastSeen       time.Time
-	netboxRunning  *bool // last value reported by a heartbeat; nil = not yet seen
+	netboxRunning  *bool   // last value reported by a heartbeat; nil = not yet seen
+	patroniRole    *string // likewise
 }
 
 // NewSession creates a new authenticated agent session.
@@ -157,6 +158,19 @@ func (s *Session) SetNetboxRunning(running *bool) (prev *bool, changed bool) {
 	changed = (old == nil) != (running == nil) || oldVal != newVal
 	s.netboxRunning = running
 	return old, changed
+}
+
+// SetPatroniRole records the latest patroni_role from a heartbeat and returns
+// the previous one; first is true when this session hadn't reported one yet.
+func (s *Session) SetPatroniRole(role string) (prev string, first bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.patroniRole != nil {
+		prev = *s.patroniRole
+	}
+	first = s.patroniRole == nil
+	s.patroniRole = &role
+	return prev, first
 }
 
 // NetboxRunning returns the last NetBox-running value reported by a heartbeat

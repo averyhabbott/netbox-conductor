@@ -119,6 +119,7 @@ export interface BackupTarget {
   target_type: BackupTargetType
   recovery_days: number
   sync_to_nodes: string[]
+  path_check: Record<string, string>  // local disk: node ID → last path test error, "" = passed
   created_at: string
   updated_at: string
   // posix
@@ -182,13 +183,13 @@ export interface BackupRun {
   id: string
   cluster_id: string
   backup_type: 'full' | 'diff' | 'incr'
+  repo_index: number | null  // storage location's pgBackRest repo
   task_id?: string
   attempt: number
   status: 'pending' | 'running' | 'success' | 'failed' | 'abandoned'
   scheduled_at: string
   dispatched_at?: string
   completed_at?: string
-  retry_after?: string
   error_message?: string
 }
 

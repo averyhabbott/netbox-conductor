@@ -2537,7 +2537,7 @@ function AddStorageModal({
           {type === 'posix' && (
             <div className="space-y-2">
               {field('Path', inp(posixPath, setPosixPath, '/var/lib/postgresql/backups'))}
-              <p className="text-xs text-gray-500 -mt-1">The <span className="font-mono text-gray-400">postgres</span> user and group must have write access to this path (<span className="font-mono text-gray-400">chown postgres:postgres</span>, <span className="font-mono text-gray-400">chmod 770</span>).</p>
+              <p className="text-xs text-gray-500 -mt-1">Owned by the <span className="font-mono text-gray-400">postgres</span> user on every database node (<span className="font-mono text-gray-400">chown postgres:postgres</span>, <span className="font-mono text-gray-400">chmod 750</span>).</p>
               <div className="flex items-center gap-2 flex-wrap">
                 <button
                   type="button"
@@ -2563,7 +2563,7 @@ function AddStorageModal({
                       onChange={(e) => setSyncEnabled(e.target.checked)}
                       className="w-3.5 h-3.5 accent-blue-500"
                     />
-                    <span className="text-xs text-gray-300">Sync backups to other nodes after each backup</span>
+                    <span className="text-xs text-gray-300">Sync backups to other nodes (after each backup and after a failover)</span>
                   </label>
                   {syncEnabled && (
                     <div className="pl-5 space-y-1">
@@ -2686,7 +2686,7 @@ function AddStorageModal({
                 <span className="text-gray-300 font-mono">{row.hostname}</span>
                 <span>
                   {row.status === 'pending' && <span className="text-gray-400">Testing…</span>}
-                  {row.status === 'ok' && <span className="text-emerald-400">✓ Writable</span>}
+                  {row.status === 'ok' && <span className="text-emerald-400">✓ Works</span>}
                   {row.status === 'fail' && <span className="text-red-400">✗ Failed</span>}
                   {row.status === 'skipped' && row.skipReason === 'maintenance' && (
                     <span className="text-yellow-600">— Skipped (maintenance)</span>
@@ -2702,6 +2702,12 @@ function AddStorageModal({
                 {row.hostname}: {row.message}
               </p>
             ))}
+            {nodeTestResults.some((r) => r.status === 'fail') && (
+              <PathFix
+                path={posixPath || '/var/lib/postgresql/backups'}
+                hostnames={nodeTestResults.filter((r) => r.status === 'fail').map((r) => r.hostname)}
+              />
+            )}
           </div>
           <div className="flex justify-end">
             <button
@@ -2718,16 +2724,39 @@ function AddStorageModal({
   )
 }
 
-function ProvisionScriptModal({ path, onClose }: { path: string; onClose: () => void }) {
-  const script = `BACKUP_DIR="${path}"
+// pathFixCommands sets up a local-disk backup folder the way the agent needs it.
+const pathFixCommands = (path: string) => `sudo mkdir -p "${path}"
+sudo chown postgres:postgres "${path}"
+sudo chmod 750 "${path}"`
 
-sudo mkdir -p "$BACKUP_DIR"
-sudo chown postgres:postgres "$BACKUP_DIR"
-sudo chmod 770 "$BACKUP_DIR"
-echo "Backup directory ready: $BACKUP_DIR"`
-
+function CommandBox({ text }: { text: string }) {
   const [copied, copy] = useCopy()
+  return (
+    <div className="relative">
+      <pre className="bg-gray-950 border border-gray-700 rounded-lg p-4 text-xs text-gray-200 font-mono overflow-x-auto whitespace-pre">{text}</pre>
+      <button
+        onClick={() => copy(text)}
+        className="absolute top-2 right-2 px-2 py-0.5 text-xs bg-gray-700 hover:bg-gray-600 rounded"
+      >
+        {copied ? 'Copied!' : 'Copy'}
+      </button>
+    </div>
+  )
+}
 
+// PathFix tells how to fix a backup folder that failed its path test.
+function PathFix({ path, hostnames }: { path: string; hostnames: string[] }) {
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs text-gray-400">
+        Run on <span className="font-mono text-gray-300">{hostnames.join(', ')}</span>, then test again:
+      </p>
+      <CommandBox text={pathFixCommands(path)} />
+    </div>
+  )
+}
+
+function ProvisionScriptModal({ path, onClose }: { path: string; onClose: () => void }) {
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60] p-4">
       <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-lg">
@@ -2737,17 +2766,9 @@ echo "Backup directory ready: $BACKUP_DIR"`
         </div>
         <div className="px-6 py-4 space-y-3">
           <p className="text-sm text-gray-400">
-            SSH into each node and run these commands:
+            SSH into each database node and run these commands:
           </p>
-          <div className="relative">
-            <pre className="bg-gray-950 border border-gray-700 rounded-lg p-4 text-xs text-gray-200 font-mono overflow-x-auto whitespace-pre">{script}</pre>
-            <button
-              onClick={() => copy(script)}
-              className="absolute top-2 right-2 px-2 py-0.5 text-xs bg-gray-700 hover:bg-gray-600 rounded"
-            >
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
-          </div>
+          <CommandBox text={pathFixCommands(path || '/var/lib/postgresql/backups')} />
         </div>
         <div className="flex justify-end px-6 py-4 border-t border-gray-800">
           <button onClick={onClose} className="px-4 py-2 text-sm text-gray-400 hover:text-white">Close</button>
@@ -3045,9 +3066,14 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
           </div>
         ) : (
           <div className="divide-y divide-gray-800">
-            {targets.map((t) => (
-              <div key={t.id} className="flex items-center justify-between px-5 py-3">
+            {targets.map((t) => {
+              const failing = Object.entries(t.path_check ?? {}).filter(([, err]) => err)
+              const hostname = (id: string) => clusterNodes?.find((n) => n.id === id)?.hostname ?? id
+              return (
+              <div key={t.id} className="px-5 py-3">
+              <div className="flex items-center justify-between">
                 <div>
+                  {failing.length > 0 && <span className="text-amber-400 mr-1.5" title="Path test failed">⚠</span>}
                   <span className="text-sm text-white">{t.label}</span>
                   <span className="ml-2 text-xs px-2 py-0.5 bg-gray-800 border border-gray-700 rounded text-gray-400">
                     {TARGET_TYPE_LABELS[t.target_type]}
@@ -3071,7 +3097,19 @@ function BackupsTab({ clusterId }: { clusterId: string }) {
                   </button>
                 </div>
               </div>
-            ))}
+              {failing.length > 0 && (
+                <div className="mt-2 space-y-2">
+                  {failing.map(([id, err]) => (
+                    <p key={id} className="text-xs text-red-400/80 font-mono break-all">
+                      {hostname(id)}: {err}
+                    </p>
+                  ))}
+                  <PathFix path={t.posix_path ?? ''} hostnames={failing.map(([id]) => hostname(id))} />
+                </div>
+              )}
+              </div>
+              )
+            })}
           </div>
         )}
 

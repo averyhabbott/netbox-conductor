@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/averyhabbott/netbox-conductor/internal/server/cron"
 	"github.com/averyhabbott/netbox-conductor/internal/server/db/queries"
 	"github.com/averyhabbott/netbox-conductor/internal/server/events"
+	"github.com/averyhabbott/netbox-conductor/internal/server/filesync"
 	"github.com/averyhabbott/netbox-conductor/internal/server/hub"
 	"github.com/averyhabbott/netbox-conductor/internal/server/nodestate"
 	"github.com/averyhabbott/netbox-conductor/internal/server/oplock"
@@ -51,9 +51,17 @@ type BackupHandler struct {
 	witness     *patroni.WitnessManager
 	ops         *oplock.Locks
 	emitter     events.Emitter
+	backups     *scheduler.BackupScheduler
+	fileSync    *filesync.Manager
 }
 
 func (h *BackupHandler) SetEmitter(e events.Emitter) { h.emitter = e }
+
+// SetBackups wires the backup scheduler (Run Backup) and the folder sync
+// manager (storage path tests).
+func (h *BackupHandler) SetBackups(s *scheduler.BackupScheduler, fs *filesync.Manager) {
+	h.backups, h.fileSync = s, fs
+}
 
 func NewBackupHandler(
 	clusters *queries.ClusterQuerier,
@@ -190,6 +198,7 @@ func (h *BackupHandler) CreateBackupTarget(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to create backup target: "+err.Error())
 	}
+	h.testPathInBackground(*target)
 
 	if h.emitter != nil {
 		h.emitter.Emit(events.New(events.CategoryConfig, events.SeverityInfo, events.CodeNodeConfigUpdated,
@@ -227,8 +236,24 @@ func (h *BackupHandler) UpdateBackupTarget(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to update backup target: "+err.Error())
 	}
+	h.testPathInBackground(*target)
 
 	return c.JSON(http.StatusOK, serializeTarget(target))
+}
+
+// testPathInBackground tests a saved local-disk location's path on every
+// database node; the results show on the location.
+func (h *BackupHandler) testPathInBackground(t queries.BackupTarget) {
+	if t.TargetType != "posix" {
+		return
+	}
+	go func() {
+		ctx := context.Background()
+		nodes, err := h.nodes.ListByCluster(ctx, t.ClusterID)
+		if err == nil {
+			h.fileSync.TestPath(ctx, t, dbRoleNodes(nodes))
+		}
+	}()
 }
 
 // DeleteBackupTarget removes a backup storage location.
@@ -834,39 +859,10 @@ func (h *BackupHandler) RunBackup(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusConflict, "backups not yet configured for this cluster")
 	}
 
-	nodes, err := h.nodes.ListByCluster(ctx, clusterID)
+	// Backs up to every location in turn; the task returned is the first one's.
+	primary, taskID, err := h.backups.StartBackups(ctx, clusterID, *schedule.StanzaName, req.Type, time.Now().UTC())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list nodes")
-	}
-
-	primary := nodestate.PrimaryDBNode(nodes)
-	if primary == nil {
-		return echo.NewHTTPError(http.StatusConflict, "no connected database node found")
-	}
-
-	unlock, err := lockCluster(h.ops, clusterID, "a backup")
-	if err != nil {
-		return err
-	}
-
-	params, _ := json.Marshal(protocol.PGBackRestBackupParams{
-		Stanza: *schedule.StanzaName,
-		Type:   req.Type,
-	})
-	taskID := uuid.New()
-	if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, primary.ID, taskID, protocol.TaskPGBackRestBackup, params, scheduler.BackupTimeoutSecs, scheduler.BackupAckTimeoutSecs); dispErr != nil {
-		unlock()
-		return echo.NewHTTPError(http.StatusConflict, "primary node is not connected: "+dispErr.Error())
-	}
-	go func() {
-		defer unlock()
-		h.taskResults.WaitSuccess(context.Background(), taskID, scheduler.BackupAckTimeoutSecs*time.Second)
-	}()
-
-	// Create a backup_run record for tracking.
-	run, _ := h.runs.Create(ctx, clusterID, req.Type, time.Now().UTC(), 1)
-	if run != nil {
-		_ = h.runs.SetDispatched(ctx, run.ID, taskID)
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
 
 	return c.JSON(http.StatusAccepted, map[string]any{
@@ -1012,17 +1008,16 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 		TargetTime: req.TargetTime,
 		RestoreCmd: req.RestoreCmd,
 	})
-	restoreTaskID := uuid.New()
 	var restoreTask taskRef
-	if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, restoreNode.ID, restoreTaskID, protocol.TaskPGBackRestRestore, restoreParams, 3600, 0); dispErr != nil {
+	if rt, dispErr := h.dispatcher.StartTask(ctx, h.taskResults, restoreNode.ID, protocol.TaskPGBackRestRestore, restoreParams, 3600); dispErr != nil {
 		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, Status: "offline", Error: dispErr.Error()}
 		_ = h.schedules.SetRestoreInProgress(ctx, clusterID, false)
 	} else {
-		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: restoreTaskID.String(), Status: "dispatched"}
+		restoreTask = taskRef{NodeID: restoreNode.ID.String(), Hostname: restoreNode.Hostname, TaskID: rt.ID.String(), Status: "dispatched"}
 
 		// Capture state for background goroutine before returning 202.
 		capturedStopIDs := stopIDs
-		capturedRestoreID := restoreTaskID
+		capturedRestoreID := rt.ID
 		capturedRestoreNode := *restoreNode
 		capturedRestoreIP := restoreIP
 		capturedReplicas := make([]queries.Node, 0, len(dbNodes)-1)
@@ -1044,10 +1039,10 @@ func (h *BackupHandler) ClusterRestore(c echo.Context) error {
 				slog.Info("restore goroutine: postgres stop result", "task_id", tid, "success", ok)
 			}
 
-			// Wait for restore + promotion (up to 30 min).
+			// Wait for restore + promotion.
 			slog.Info("restore goroutine: waiting for pgbackrest.restore task", "task_id", capturedRestoreID)
-			if ok := h.taskResults.WaitSuccess(bgCtx, capturedRestoreID, 30*time.Minute); !ok {
-				slog.Error("restore goroutine: pgbackrest.restore task did not succeed", "task_id", capturedRestoreID)
+			if _, err := rt.Wait(bgCtx); err != nil {
+				slog.Error("restore goroutine: pgbackrest.restore task did not succeed", "task_id", capturedRestoreID, "error", err)
 				_ = h.schedules.SetRestoreInProgress(bgCtx, clusterID, false)
 				return
 			}
@@ -1187,7 +1182,7 @@ func (h *BackupHandler) TestBackupPath(c echo.Context) error {
 			continue
 		}
 		taskID := uuid.New()
-		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskPGBackRestTestPath, params, 15, 0); dispErr != nil {
+		if dispErr := h.dispatcher.DispatchTask(ctx, h.taskResults, node.ID, taskID, protocol.TaskPGBackRestTestPath, params, filesync.PathTestTimeoutSecs, 0); dispErr != nil {
 			results = append(results, nodeTestResult{
 				NodeID:     node.ID.String(),
 				Hostname:   node.Hostname,
@@ -1270,17 +1265,11 @@ func renderPGBackRestConf(stanza string, targets []queries.BackupTarget, enc *cr
 
 	repos := make([]configgen.PGBackRestRepo, 0, len(targets))
 	for _, t := range targets {
-		days := t.RecoveryDays
-		if days == 0 {
-			days = 14
-		}
 		repo := configgen.PGBackRestRepo{
-			Index:            t.RepoIndex,
-			RepoType:         t.TargetType,
-			Label:            t.Label,
-			FullRetention:    int(math.Ceil(float64(days)/7)) + 1,
-			DiffRetention:    days,
-			WALRetentionDays: days + 7,
+			Index:         t.RepoIndex,
+			RepoType:      t.TargetType,
+			Label:         t.Label,
+			RetentionDays: t.RecoveryDays,
 		}
 
 		switch t.TargetType {
@@ -1561,6 +1550,7 @@ func serializeTarget(t *queries.BackupTarget) map[string]any {
 		"target_type":        t.TargetType,
 		"recovery_days": t.RecoveryDays,
 		"sync_to_nodes":      uuidsToStrings(t.SyncToNodes),
+		"path_check":         t.PathCheck,
 		"created_at":         t.CreatedAt.UTC().Format(time.RFC3339),
 		"updated_at":         t.UpdatedAt.UTC().Format(time.RFC3339),
 	}
@@ -1661,6 +1651,7 @@ func serializeRuns(runs []queries.BackupRun) []map[string]any {
 			"id":           r.ID.String(),
 			"cluster_id":   r.ClusterID.String(),
 			"backup_type":  r.BackupType,
+			"repo_index":   r.RepoIndex,
 			"attempt":      r.Attempt,
 			"status":       r.Status,
 			"scheduled_at": r.ScheduledAt.UTC().Format(time.RFC3339),
@@ -1673,9 +1664,6 @@ func serializeRuns(runs []queries.BackupRun) []map[string]any {
 		}
 		if r.CompletedAt != nil {
 			m["completed_at"] = r.CompletedAt.UTC().Format(time.RFC3339)
-		}
-		if r.RetryAfter != nil {
-			m["retry_after"] = r.RetryAfter.UTC().Format(time.RFC3339)
 		}
 		if r.ErrorMessage != nil {
 			m["error_message"] = *r.ErrorMessage

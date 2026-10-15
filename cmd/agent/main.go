@@ -31,6 +31,16 @@ const defaultEnvFile = "/etc/netbox-agent/netbox-agent.env"
 const chunkSendTimeout = 30 * time.Second
 
 func main() {
+	// The repo helper runs as postgres (via sudo), which can't read the agent's
+	// .env, so it runs before the config is loaded.
+	if len(os.Args) > 1 && os.Args[1] == "repo" {
+		if err := executor.RepoHelper(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	envFile := os.Getenv("AGENT_ENV_FILE")
 	if envFile == "" {
 		envFile = defaultEnvFile
@@ -167,6 +177,10 @@ func main() {
 	}
 	wsClient = client
 
+	// A receive the conductor can no longer finish is stopped, so no partial
+	// file or repo helper is left behind.
+	client.OnDisconnect = func() { chunkQueue <- syncRecv.StopAll }
+
 	// Per-heartbeat service state tracking for fast TypeServiceStateChange emission.
 	type svcState struct {
 		netbox, rq, redis, sentinel, patroni, postgres *bool
@@ -281,7 +295,7 @@ func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws
 		TaskID: task.TaskID,
 		Status: "accepted",
 	})
-	client.Send(protocol.Envelope{
+	client.StartTask(task.TaskID, protocol.Envelope{
 		ID:      uuid.New().String(),
 		Type:    protocol.TypeTaskAck,
 		Payload: json.RawMessage(ackPayload),
@@ -434,7 +448,12 @@ func executeTask(ctx context.Context, cfg *agentconfig.Config, client *ws.Client
 		output, err = run(ctx, task.Params, executor.RunPGBackRestStanzaCreate)
 
 	case protocol.TaskPGBackRestBackup:
-		output, err = run(ctx, task.Params, executor.RunPGBackRestBackup)
+		output, err = run(ctx, task.Params, func(ctx context.Context, p protocol.PGBackRestBackupParams) (string, error) {
+			return executor.RunPGBackRestBackups(ctx, p, func(e protocol.BackupEventPayload) {
+				raw, _ := json.Marshal(e)
+				client.Send(protocol.Envelope{ID: uuid.New().String(), Type: protocol.TypeBackupEvent, Payload: raw})
+			})
+		})
 
 	case protocol.TaskPGBackRestCatalog:
 		output, err = run(ctx, task.Params, executor.RunPGBackRestCatalog)
@@ -556,9 +575,9 @@ func sendResult(client *ws.Client, taskID string, success bool, output, errMsg s
 		DurationMs: durationMs,
 		Repaired:   executor.TakeRepaired(),
 	})
-	// Wait for buffer space: a lost result leaves the conductor waiting until
-	// the task's timeout, and a sync task can leave the buffer full of chunks.
-	if err := client.SendWait(protocol.Envelope{
+	// Wait for buffer space: a sync task can leave the buffer full of chunks.
+	// A result that still can't be sent is read by the conductor as lost.
+	if err := client.EndTask(taskID, protocol.Envelope{
 		ID:      uuid.New().String(),
 		Type:    protocol.TypeTaskResult,
 		Payload: json.RawMessage(payload),

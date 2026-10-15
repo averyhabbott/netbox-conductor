@@ -54,6 +54,9 @@ type BackupTarget struct {
 	// conductor-relayed local repo sync (posix only)
 	SyncToNodes []uuid.UUID
 
+	// posix: last path test result per node ID; "" = passed
+	PathCheck map[string]string
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -75,6 +78,7 @@ const backupTargetCols = `
 	sftp_host, sftp_port, sftp_user, sftp_private_key_enc, sftp_path,
 	recovery_days,
 	sync_to_nodes,
+	path_check,
 	created_at, updated_at`
 
 func scanBackupTarget(row interface{ Scan(...any) error }) (*BackupTarget, error) {
@@ -88,6 +92,7 @@ func scanBackupTarget(row interface{ Scan(...any) error }) (*BackupTarget, error
 		&t.SFTPHost, &t.SFTPPort, &t.SFTPUser, &t.SFTPPrivateKeyEnc, &t.SFTPPath,
 		&t.RecoveryDays,
 		&t.SyncToNodes,
+		&t.PathCheck,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 	return &t, err
@@ -226,6 +231,7 @@ func (q *BackupTargetQuerier) Update(ctx context.Context, p UpdateBackupTargetPa
 	return scanBackupTarget(q.pool.QueryRow(ctx, `
 		UPDATE backup_targets SET
 			label = $2,
+			path_check = CASE WHEN posix_path IS DISTINCT FROM $3 THEN '{}' ELSE path_check END,
 			posix_path = $3,
 			s3_bucket = $4, s3_region = $5, s3_endpoint = $6, s3_key_id_enc = $7, s3_secret_enc = $8,
 			gcs_bucket = $9, gcs_key_enc = $10,
@@ -245,6 +251,13 @@ func (q *BackupTargetQuerier) Update(ctx context.Context, p UpdateBackupTargetPa
 		p.RecoveryDays,
 		p.SyncToNodes,
 	))
+}
+
+// SetPathCheck records path test results, node ID → error ("" = passed),
+// keeping other nodes' results.
+func (q *BackupTargetQuerier) SetPathCheck(ctx context.Context, id uuid.UUID, results map[string]string) error {
+	_, err := q.pool.Exec(ctx, `UPDATE backup_targets SET path_check = path_check || $2 WHERE id = $1`, id, results)
+	return err
 }
 
 func (q *BackupTargetQuerier) Delete(ctx context.Context, id uuid.UUID) error {
@@ -427,12 +440,12 @@ type BackupRun struct {
 	ID           uuid.UUID
 	ClusterID    uuid.UUID
 	BackupType   string // "full" | "diff" | "incr"
+	RepoIndex    *int   // the storage location's pgBackRest repo; nil on runs from before locations had their own
 	TaskID       *uuid.UUID
 	Attempt      int
 	ScheduledAt  time.Time
 	DispatchedAt *time.Time
 	Status       string
-	RetryAfter   *time.Time
 	CompletedAt  *time.Time
 	ErrorMessage *string
 }
@@ -445,16 +458,17 @@ func NewBackupRunQuerier(pool *pgxpool.Pool) *BackupRunQuerier {
 	return &BackupRunQuerier{pool: pool}
 }
 
-func (q *BackupRunQuerier) Create(ctx context.Context, clusterID uuid.UUID, backupType string, scheduledAt time.Time, attempt int) (*BackupRun, error) {
+// Create records a run; attempt is the round's try to start (1–3).
+func (q *BackupRunQuerier) Create(ctx context.Context, clusterID uuid.UUID, backupType string, repoIndex int, scheduledAt time.Time, attempt int) (*BackupRun, error) {
 	var r BackupRun
 	err := q.pool.QueryRow(ctx, `
-		INSERT INTO backup_runs (cluster_id, backup_type, scheduled_at, attempt)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, cluster_id, backup_type, task_id, attempt, scheduled_at,
-			dispatched_at, status, retry_after, completed_at, error_message
-	`, clusterID, backupType, scheduledAt, attempt).Scan(
-		&r.ID, &r.ClusterID, &r.BackupType, &r.TaskID, &r.Attempt, &r.ScheduledAt,
-		&r.DispatchedAt, &r.Status, &r.RetryAfter, &r.CompletedAt, &r.ErrorMessage,
+		INSERT INTO backup_runs (cluster_id, backup_type, repo_index, scheduled_at, attempt)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, cluster_id, backup_type, repo_index, task_id, attempt, scheduled_at,
+			dispatched_at, status, completed_at, error_message
+	`, clusterID, backupType, repoIndex, scheduledAt, attempt).Scan(
+		&r.ID, &r.ClusterID, &r.BackupType, &r.RepoIndex, &r.TaskID, &r.Attempt, &r.ScheduledAt,
+		&r.DispatchedAt, &r.Status, &r.CompletedAt, &r.ErrorMessage,
 	)
 	return &r, err
 }
@@ -475,12 +489,12 @@ func (q *BackupRunQuerier) SetSuccess(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-func (q *BackupRunQuerier) SetFailed(ctx context.Context, id uuid.UUID, errMsg string, retryAfter *time.Time) error {
+func (q *BackupRunQuerier) SetFailed(ctx context.Context, id uuid.UUID, errMsg string) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE backup_runs
-		SET status = 'failed', completed_at = now(), error_message = $2, retry_after = $3
+		SET status = 'failed', completed_at = now(), error_message = $2
 		WHERE id = $1
-	`, id, errMsg, retryAfter)
+	`, id, errMsg)
 	return err
 }
 
@@ -498,6 +512,7 @@ func (q *BackupRunQuerier) SetAbandoned(ctx context.Context, id uuid.UUID, errMs
 type CompletedBackupRun struct {
 	RunID           uuid.UUID
 	ClusterID       uuid.UUID
+	RepoIndex       *int
 	TaskStatus      string
 	ResponsePayload json.RawMessage
 }
@@ -507,7 +522,7 @@ type CompletedBackupRun struct {
 // scheduler to flip run status once the agent reports back.
 func (q *BackupRunQuerier) ListRunningWithCompletedTask(ctx context.Context) ([]CompletedBackupRun, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT br.id, br.cluster_id, tr.status, tr.response_payload
+		SELECT br.id, br.cluster_id, br.repo_index, tr.status, tr.response_payload
 		FROM backup_runs br
 		JOIN task_results tr ON tr.task_id = br.task_id
 		WHERE br.status = 'running'
@@ -520,7 +535,7 @@ func (q *BackupRunQuerier) ListRunningWithCompletedTask(ctx context.Context) ([]
 	var results []CompletedBackupRun
 	for rows.Next() {
 		var r CompletedBackupRun
-		if err := rows.Scan(&r.RunID, &r.ClusterID, &r.TaskStatus, &r.ResponsePayload); err != nil {
+		if err := rows.Scan(&r.RunID, &r.ClusterID, &r.RepoIndex, &r.TaskStatus, &r.ResponsePayload); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
@@ -528,39 +543,11 @@ func (q *BackupRunQuerier) ListRunningWithCompletedTask(ctx context.Context) ([]
 	return results, rows.Err()
 }
 
-// SetRetrying updates an existing backup_run in-place for a retry attempt.
-// The same row is reused — attempt increments, task_id and dispatched_at update,
-// retry_after clears, and status returns to 'running'. No new row is inserted.
-func (q *BackupRunQuerier) SetRetrying(ctx context.Context, id, taskID uuid.UUID, newAttempt int) error {
-	_, err := q.pool.Exec(ctx, `
-		UPDATE backup_runs
-		SET task_id=$2, attempt=$3, status='running', dispatched_at=now(), retry_after=NULL
-		WHERE id=$1
-	`, id, taskID, newAttempt)
-	return err
-}
-
-// PendingRetries returns failed runs whose retry_after has passed.
-func (q *BackupRunQuerier) PendingRetries(ctx context.Context) ([]BackupRun, error) {
-	rows, err := q.pool.Query(ctx, `
-		SELECT id, cluster_id, backup_type, task_id, attempt, scheduled_at,
-			dispatched_at, status, retry_after, completed_at, error_message
-		FROM backup_runs
-		WHERE status = 'failed' AND retry_after <= now()
-		ORDER BY retry_after
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanBackupRuns(rows)
-}
-
 // ListByCluster returns the most recent backup runs for a cluster.
 func (q *BackupRunQuerier) ListByCluster(ctx context.Context, clusterID uuid.UUID, limit int) ([]BackupRun, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, cluster_id, backup_type, task_id, attempt, scheduled_at,
-			dispatched_at, status, retry_after, completed_at, error_message
+		SELECT id, cluster_id, backup_type, repo_index, task_id, attempt, scheduled_at,
+			dispatched_at, status, completed_at, error_message
 		FROM backup_runs
 		WHERE cluster_id = $1
 		ORDER BY scheduled_at DESC
@@ -582,8 +569,8 @@ func scanBackupRuns(rows interface {
 	for rows.Next() {
 		var r BackupRun
 		if err := rows.Scan(
-			&r.ID, &r.ClusterID, &r.BackupType, &r.TaskID, &r.Attempt, &r.ScheduledAt,
-			&r.DispatchedAt, &r.Status, &r.RetryAfter, &r.CompletedAt, &r.ErrorMessage,
+			&r.ID, &r.ClusterID, &r.BackupType, &r.RepoIndex, &r.TaskID, &r.Attempt, &r.ScheduledAt,
+			&r.DispatchedAt, &r.Status, &r.CompletedAt, &r.ErrorMessage,
 		); err != nil {
 			return nil, err
 		}

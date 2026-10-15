@@ -19,11 +19,14 @@ netbox-agent ALL=(ALL) NOPASSWD: \
   /usr/bin/systemctl restart netbox-agent
 
 # Database backup: run pg_dump, psql, pgbackrest, and pg_ctl as the postgres OS user
-# so that peer authentication works without a password.
+# so that peer authentication works without a password. The agent's own repo
+# helper (`netbox-agent repo ...`) writes and deletes backup sync files as postgres,
+# the owner of the backup storage folders.
 netbox-agent ALL=(postgres) NOPASSWD: \
   /usr/bin/pg_dump, \
   /usr/bin/psql, \
   /bin/mkdir, \
   /usr/bin/pgbackrest, \
-  /usr/local/bin/pg_ctl
+  /usr/local/bin/pg_ctl, \
+  /usr/local/bin/netbox-agent
 

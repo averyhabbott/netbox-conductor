@@ -2,11 +2,14 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -44,25 +47,131 @@ func RunPGBackRestStanzaCreate(ctx context.Context, params protocol.PGBackRestSt
 	return fmt.Sprintf("stanza-create: ok\nstanza-check: ok\n%s", checkOut), nil
 }
 
-// RunPGBackRestBackup runs a pgBackRest backup of the given type (full|diff|incr).
-func RunPGBackRestBackup(ctx context.Context, params protocol.PGBackRestBackupParams) (string, error) {
-	stanza := params.Stanza
-	if stanza == "" {
+// RunPGBackRestBackups runs one backup round: each location (repo) in turn is
+// checked, then backed up once. A failed check sends the location to the back
+// of the queue, not ready again for CheckRetrySecs; the next ready location
+// runs, or the round waits for the first to be ready. After CheckTries failed
+// checks, or a failed backup, the location has failed. Warnings and errors go
+// to report as they happen. The output lists every location's outcome.
+func RunPGBackRestBackups(ctx context.Context, p protocol.PGBackRestBackupParams, report func(protocol.BackupEventPayload)) (string, error) {
+	if p.Stanza == "" {
 		return "", fmt.Errorf("stanza is required")
 	}
-	backupType := params.Type
-	if backupType == "" {
-		backupType = "incr"
+	if p.Type != "full" && p.Type != "diff" && p.Type != "incr" {
+		return "", fmt.Errorf("invalid backup type %q (must be full|diff|incr)", p.Type)
 	}
-	if backupType != "full" && backupType != "diff" && backupType != "incr" {
-		return "", fmt.Errorf("invalid backup type %q (must be full|diff|incr)", backupType)
+	for _, r := range p.Repos {
+		if r < 1 || r > 4 {
+			return "", fmt.Errorf("invalid repo %d (must be 1-4)", r)
+		}
 	}
+	check := func(ctx context.Context, repo int) error {
+		return checkRepo(ctx, p.Stanza, repo, time.Duration(p.CheckTimeoutSecs)*time.Second)
+	}
+	backup := func(ctx context.Context, repo int) error {
+		ctx, cancel := context.WithTimeout(ctx, time.Duration(p.BackupTimeoutSecs)*time.Second)
+		defer cancel()
+		out, err := pgbackrest(ctx, p.Stanza, "backup", "--type="+p.Type, fmt.Sprintf("--repo=%d", repo))
+		if err != nil {
+			return fmt.Errorf("pgbackrest backup (%s) failed: %w: %s", p.Type, err, strings.TrimSpace(out))
+		}
+		return nil
+	}
+	return backupRound(ctx, p, check, backup, report)
+}
 
-	out, err := pgbackrest(ctx, stanza, "backup", "--type="+backupType)
-	if err != nil {
-		return out, fmt.Errorf("pgbackrest backup (%s) failed: %w\n%s", backupType, err, out)
+// backupRound is RunPGBackRestBackups' queue, with the check and backup passed in.
+func backupRound(ctx context.Context, p protocol.PGBackRestBackupParams, check, backup func(context.Context, int) error,
+	report func(protocol.BackupEventPayload)) (string, error) {
+	type loc struct {
+		repo, fails int
+		ready       time.Time
 	}
-	return fmt.Sprintf("backup type=%s complete\n%s", backupType, out), nil
+	var queue []*loc
+	for _, r := range p.Repos {
+		queue = append(queue, &loc{repo: r})
+	}
+	var results []protocol.PGBackRestBackupResult
+	failed := 0
+	done := func(l *loc, err error) {
+		res := protocol.PGBackRestBackupResult{Repo: l.repo}
+		if err != nil {
+			res.Error = err.Error()
+			failed++
+			report(protocol.BackupEventPayload{Repo: l.repo, Error: true, Message: res.Error})
+		}
+		results = append(results, res)
+	}
+	for len(queue) > 0 {
+		i := slices.IndexFunc(queue, func(l *loc) bool { return !time.Now().Before(l.ready) })
+		if i < 0 {
+			first := slices.MinFunc(queue, func(a, b *loc) int { return a.ready.Compare(b.ready) })
+			if err := sleep(ctx, time.Until(first.ready)); err != nil {
+				for _, l := range queue {
+					done(l, fmt.Errorf("round ended before its backup: %w", err))
+				}
+				break
+			}
+			continue
+		}
+		l := queue[i]
+		queue = slices.Delete(queue, i, i+1)
+		if err := check(ctx, l.repo); err != nil {
+			if l.fails++; l.fails >= p.CheckTries || ctx.Err() != nil {
+				done(l, fmt.Errorf("storage location can't be read (%d checks failed), not backed up: %w", l.fails, err))
+				continue
+			}
+			report(protocol.BackupEventPayload{Repo: l.repo, Message: fmt.Sprintf(
+				"check %d of %d failed, checking again in %ds: %v", l.fails, p.CheckTries, p.CheckRetrySecs, err)})
+			l.ready = time.Now().Add(time.Duration(p.CheckRetrySecs) * time.Second)
+			queue = append(queue, l)
+			continue
+		}
+		done(l, backup(ctx, l.repo))
+	}
+	out, _ := json.Marshal(results)
+	if failed > 0 {
+		return string(out), fmt.Errorf("%d of %d storage locations not backed up", failed, len(p.Repos))
+	}
+	return string(out), nil
+}
+
+// checkRepo checks one repo can be read: `pgbackrest info` reads its index
+// files and reports a status per repo (exiting 0 even when one is broken).
+func checkRepo(ctx context.Context, stanza string, repo int, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := pgbackrest(ctx, stanza, "info", fmt.Sprintf("--repo=%d", repo), "--output=json")
+	if err != nil {
+		return fmt.Errorf("pgbackrest info: %w: %s", err, strings.TrimSpace(out))
+	}
+	var info []struct {
+		Name string `json:"name"`
+		Repo []struct {
+			Key    int `json:"key"`
+			Status struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"status"`
+		} `json:"repo"`
+	}
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		return fmt.Errorf("reading pgbackrest info: %w", err)
+	}
+	for _, st := range info {
+		if st.Name != stanza {
+			continue
+		}
+		for _, r := range st.Repo {
+			if r.Key == repo {
+				if !protocol.PGBackRestRepoReadable(r.Status.Code) {
+					return fmt.Errorf("pgbackrest info: %s (code %d)", r.Status.Message, r.Status.Code)
+				}
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("pgbackrest info doesn't list repo %d of stanza %s", repo, stanza)
 }
 
 // RunPGBackRestCatalog returns the raw JSON output of `pgbackrest info`.
@@ -173,25 +282,33 @@ func RunPGBackRestRestore(ctx context.Context, params protocol.PGBackRestRestore
 	return log.String(), nil
 }
 
-// RunPGBackRestTestPath verifies that the given path is writable by the postgres
-// OS user, which is the user pgBackRest uses for posix repo operations.
-// Uses psql COPY (already in sudoers) rather than /bin/sh, which sudo-rs blocks.
+// RunPGBackRestTestPath checks a local-disk storage location works for both
+// users that need it: postgres (pgBackRest, and the sync's writes) writes and
+// removes a test file through the repo helper; the agent reads it back and
+// lists the folder, as a backup sync does.
 func RunPGBackRestTestPath(ctx context.Context, params protocol.PGBackRestTestPathParams) (string, error) {
-	if params.Path == "" {
-		return "", fmt.Errorf("path is required")
+	root := filepath.Clean(params.Path)
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("path must be absolute: %q", params.Path)
 	}
-	if strings.Contains(params.Path, "'") {
-		return "", fmt.Errorf("path contains invalid character: single quote")
+	if err := runRepoHelper(ctx, "", "test", root); err != nil {
+		return "", fmt.Errorf("postgres can't write to %s: %w", root, err)
 	}
-	testFile := params.Path + "/.conductor_pgbackrest_test"
-	out, err := Command(ctx, "sudo", "-u", "postgres",
-		"/usr/bin/psql", "-c",
-		fmt.Sprintf("COPY (SELECT 1) TO '%s'", testFile),
-	).CombinedOutput()
+	got, err := os.ReadFile(filepath.Join(root, pathTestFile))
+	if err == nil && string(got) != pathTestValue {
+		err = errors.New("the test file read back differently")
+	}
+	if err == nil {
+		_, err = os.ReadDir(root)
+	}
+	rmErr := runRepoHelper(ctx, "", "untest", root)
 	if err != nil {
-		return string(out), fmt.Errorf("path not writable by postgres: %w — %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("netbox-agent can't read %s: %w", root, err)
 	}
-	return fmt.Sprintf("path %s is writable", params.Path), nil
+	if rmErr != nil {
+		return "", fmt.Errorf("postgres can't remove files in %s: %w", root, rmErr)
+	}
+	return fmt.Sprintf("path %s works", root), nil
 }
 
 // pgbackrest runs the pgbackrest binary as the postgres OS user with the given

@@ -1,7 +1,11 @@
 package filesync
 
 import (
+	"bytes"
 	"cmp"
+	"encoding/json"
+	"fmt"
+	"maps"
 	"path"
 	"slices"
 	"strings"
@@ -61,28 +65,143 @@ func (p *plan) index(node uuid.UUID, files []protocol.SyncFile) map[string]proto
 	return m
 }
 
-// mirrorPlan makes every other listed node an exact copy of source.
-func mirrorPlan(source uuid.UUID, lists map[uuid.UUID][]protocol.SyncFile) plan {
+// backupPlan syncs a pgBackRest repo from the main server (source) in one run:
+//   - gather: WAL only other nodes hold (archived while they were primary) is
+//     copied to the main server, and every other node, if keep says the main
+//     server's retention still covers it; .history files always are. It never
+//     overwrites the main server's files.
+//   - spread: every other node becomes an exact copy of the main server's repo
+//     plus what was gathered. WAL found only elsewhere and older than the
+//     main server's retention has been expired by pgBackRest and is deleted.
+//
+// A WAL segment held with different contents (split brain) is a conflict: no
+// node's copy of it is changed or deleted, and it isn't gathered.
+func backupPlan(source uuid.UUID, lists map[uuid.UUID][]protocol.SyncFile, keep func(path string) bool) plan {
 	p := newPlan()
-	src := p.index(source, lists[source])
-	for node, files := range lists {
+	nodes := slices.SortedFunc(maps.Keys(lists), func(a, b uuid.UUID) int { return bytes.Compare(a[:], b[:]) })
+	have := make(map[uuid.UUID]map[string]protocol.SyncFile, len(lists))
+	versions := map[string]map[string]bool{} // segment → path + checksum of each copy
+	holds := map[uuid.UUID]map[string]bool{} // node → segments it holds
+	for _, node := range nodes {
+		have[node] = p.index(node, lists[node])
+		holds[node] = map[string]bool{}
+		for path, f := range have[node] {
+			if isWAL(path) {
+				seg := walSegment(path)
+				if versions[seg] == nil {
+					versions[seg] = map[string]bool{}
+				}
+				versions[seg][path+" "+f.SHA256] = true
+				holds[node][seg] = true
+			}
+		}
+	}
+	conflicted := map[string]bool{}
+	for seg, v := range versions {
+		if len(v) > 1 {
+			conflicted[seg] = true
+			p.conflicts = append(p.conflicts, seg)
+		}
+	}
+
+	want := map[string]version{}
+	for path, f := range have[source] {
+		want[path] = version{source, f}
+	}
+	for _, node := range nodes {
+		for path, f := range have[node] {
+			if _, ok := want[path]; ok || !isWAL(path) || conflicted[walSegment(path)] {
+				continue
+			}
+			if strings.HasSuffix(path, ".history") || keep(path) {
+				want[path] = version{node, f}
+			}
+		}
+	}
+
+	for _, node := range nodes {
+		for path, v := range want {
+			if have[node][path].SHA256 != v.file.SHA256 && !(isWAL(path) && holds[node][walSegment(path)] && conflicted[walSegment(path)]) {
+				p.copy(v.node, node, v.file)
+			}
+		}
 		if node == source {
 			continue
 		}
-		have := p.index(node, files)
-		for _, f := range src {
-			if have[f.Path].SHA256 != f.SHA256 {
-				p.copy(source, node, f)
-			}
-		}
-		for path := range have {
-			if _, ok := src[path]; !ok {
+		for path := range have[node] {
+			if _, ok := want[path]; !ok && !(isWAL(path) && conflicted[walSegment(path)]) {
 				p.deletes[node] = append(p.deletes[node], path)
 			}
 		}
 	}
 	p.sortDeletes()
+	slices.Sort(p.conflicts)
 	return p
+}
+
+// isWAL reports a file in a repo's WAL archive: a segment, partial segment or
+// timeline .history file (archive/<stanza>/<archive id>/...).
+func isWAL(p string) bool {
+	return strings.HasPrefix(p, "archive/") && strings.Count(p, "/") >= 3 && !isIndexFile(p)
+}
+
+// walSegment names what a WAL file holds: its path up to the "-<checksum>"
+// pgBackRest appends to segments ("…/000000080000000000000005",
+// "…/000000080000000000000005.partial"); a .history file's own path.
+func walSegment(p string) string {
+	dir, base := path.Split(p)
+	base, _, _ = strings.Cut(base, "-")
+	return dir + base
+}
+
+// walKeep reads `pgbackrest info --output=json` from the main server and
+// returns whether a WAL segment in repo's archive is at or after the oldest
+// WAL the repo keeps for its archive id, i.e. within retention. Timelines are
+// ignored: only the position counts.
+func walKeep(info []byte, stanza string, repo int) (func(path string) bool, error) {
+	var stanzas []struct {
+		Name    string `json:"name"`
+		Archive []struct {
+			Database struct {
+				RepoKey int `json:"repo-key"`
+			} `json:"database"`
+			ID  string `json:"id"`
+			Min string `json:"min"`
+		} `json:"archive"`
+		Repo []struct {
+			Key    int `json:"key"`
+			Status struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"status"`
+		} `json:"repo"`
+	}
+	if err := json.Unmarshal(info, &stanzas); err != nil {
+		return nil, fmt.Errorf("reading pgbackrest info: %w", err)
+	}
+	for _, st := range stanzas {
+		if st.Name != stanza {
+			continue
+		}
+		for _, r := range st.Repo {
+			if r.Key == repo && !protocol.PGBackRestRepoReadable(r.Status.Code) {
+				return nil, fmt.Errorf("pgbackrest info: repo%d: %s", repo, r.Status.Message)
+			}
+		}
+		oldest := map[string]string{} // archive id → position of its oldest kept segment
+		for _, a := range st.Archive {
+			if a.Database.RepoKey == repo && len(a.Min) == 24 {
+				oldest[a.ID] = a.Min[8:]
+			}
+		}
+		return func(p string) bool {
+			parts := strings.Split(p, "/")
+			seg := parts[len(parts)-1]
+			min, ok := oldest[parts[2]]
+			return ok && len(seg) >= 24 && seg[8:24] >= min
+		}, nil
+	}
+	return nil, fmt.Errorf("pgbackrest info: no stanza %q", stanza)
 }
 
 // version is one node's copy of a file.
