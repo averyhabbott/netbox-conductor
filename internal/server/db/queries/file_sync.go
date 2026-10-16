@@ -84,6 +84,19 @@ func (q *FileSyncQuerier) Save(ctx context.Context, clusterID uuid.UUID, folder 
 	}
 	defer tx.Rollback(ctx)
 
+	// Lock the cluster row so a settings change removing this folder either
+	// waits for this save (its KeepFolders then clears it) or is seen here.
+	// Same rule as filesync.SyncFolders.
+	var wanted bool
+	if err := tx.QueryRow(ctx, `
+		SELECT $2::text = '' OR (extra_folders_sync_enabled AND $2::text = ANY(extra_sync_folders))
+		FROM clusters WHERE id = $1 FOR UPDATE`, clusterID, folder).Scan(&wanted); err != nil {
+		return err
+	}
+	if !wanted {
+		return nil
+	}
+
 	paths := slices.Collect(maps.Keys(files))
 	for _, node := range synced {
 		if _, err := tx.Exec(ctx, `

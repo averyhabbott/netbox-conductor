@@ -26,6 +26,7 @@ const (
 type Session struct {
 	NodeID          uuid.UUID
 	ClusterID       uuid.UUID
+	Hostname        string // node hostname at connect
 	AgentVersion    string // from agent.hello
 	Arch            string // from agent.hello ("amd64" | "arm64")
 	NetboxVersion   string // from heartbeat; updated on each heartbeat

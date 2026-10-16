@@ -137,3 +137,39 @@ func TestDeleteSyncFilesPrunesEmptyDirs(t *testing.T) {
 		t.Error("d1/keep removed")
 	}
 }
+
+// Chunks the agent drops (its chunk queue stayed full) fail only their file:
+// a gap mid-file is an error; a lost last chunk leaves the file uncounted,
+// which the conductor reads as "received N of M files".
+func TestSyncDroppedChunks(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	writeFile(t, filepath.Join(src, "mid"), bytes.Repeat([]byte("m"), syncChunkSize*2+10))
+	writeFile(t, filepath.Join(src, "ok"), []byte("fine"))
+	writeFile(t, filepath.Join(src, "tail"), bytes.Repeat([]byte("t"), syncChunkSize+10))
+
+	r := NewSyncReceiver()
+	if _, err := r.Start(protocol.SyncReceiveParams{SyncID: "d", Root: dst, FileMode: 0o640, DirMode: 0o750}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SendSyncFiles(context.Background(), protocol.SyncSendParams{SyncID: "d", Paths: []string{"mid", "ok", "tail"}}, src,
+		func(c protocol.SyncChunkPayload) error {
+			if (c.Path == "mid" && c.Index == 1) || (c.Path == "tail" && c.EOF) {
+				return nil // dropped
+			}
+			_ = r.Chunk(c)
+			return nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := r.Finish(protocol.SyncFinishParams{SyncID: "d"})
+	var fin protocol.SyncFinishResult
+	_ = json.Unmarshal([]byte(out), &fin)
+	if fin.Copied != 1 || fin.Errors != 1 || !strings.Contains(fin.Failed[0], "expected 1") {
+		t.Errorf("finish = %s, want ok copied, mid failed (gap), tail uncounted", out)
+	}
+	for _, name := range []string{"mid", "tail", "tail" + protocol.SyncPartialSuffix} {
+		if _, err := os.Stat(filepath.Join(dst, name)); err == nil {
+			t.Errorf("%s left behind", name)
+		}
+	}
+}

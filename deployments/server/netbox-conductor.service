@@ -19,7 +19,7 @@ SyslogIdentifier=netbox-conductor
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/etc/netbox-conductor /var/log/netbox-conductor /opt/netbox-conductor
+ReadWritePaths=/etc/netbox-conductor /var/log/netbox-conductor /opt/netbox-conductor /var/lib/netbox-conductor
 PrivateTmp=yes
 
 [Install]

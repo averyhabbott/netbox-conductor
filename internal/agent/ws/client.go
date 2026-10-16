@@ -78,11 +78,15 @@ func New(cfg *config.Config, onMessage MessageHandler) (*Client, error) {
 // StartTask lists taskID in heartbeats, then sends ack. The conductor reads a
 // task missing from a heartbeat that follows its ack as lost, so a task is
 // listed before its ack is sent and until after its result is (EndTask).
-func (c *Client) StartTask(taskID string, ack protocol.Envelope) {
+// It reports false when the task is already listed: the conductor re-sent a
+// task (its ack was lost) that is still queued or running here.
+func (c *Client) StartTask(taskID string, ack protocol.Envelope) bool {
 	c.tasksMu.Lock()
+	isNew := !c.tasks[taskID]
 	c.tasks[taskID] = true
 	c.tasksMu.Unlock()
 	c.Send(ack)
+	return isNew
 }
 
 // EndTask sends a task's result (as SendWait), then stops listing the task.

@@ -30,6 +30,11 @@ const defaultEnvFile = "/etc/netbox-agent/netbox-agent.env"
 // failing the task; the buffer stays full while the server is slow or disconnected.
 const chunkSendTimeout = 30 * time.Second
 
+// chunkQueueWait is how long the read loop waits for room in the chunk queue
+// before dropping a chunk. Well under the conductor's 10 s pong deadline
+// (hub/session.go), like its own relaySendTimeout.
+const chunkQueueWait = 5 * time.Second
+
 func main() {
 	// The repo helper runs as postgres (via sudo), which can't read the agent's
 	// .env, so it runs before the config is loaded.
@@ -145,14 +150,42 @@ func main() {
 			fn()
 		}
 	}()
+	// queueSync puts sync work on chunkQueue from the read loop, which can't
+	// answer the conductor's pings while it waits. It waits at most
+	// chunkQueueWait; after that, until the queue has room again, it doesn't
+	// wait at all. A dropped chunk fails only its file (the receiver sees the
+	// gap) and the next sync copies it again. Read loop only.
+	syncStuck := false
+	queueSync := func(fn func()) bool {
+		if syncStuck {
+			select {
+			case chunkQueue <- fn:
+				syncStuck = false
+				return true
+			default:
+				return false
+			}
+		}
+		t := time.NewTimer(chunkQueueWait)
+		defer t.Stop()
+		select {
+		case chunkQueue <- fn:
+			return true
+		case <-t.C:
+			syncStuck = true
+			return false
+		}
+	}
 
-	// Message handler for inbound server commands
-	onMessage := func(ctx context.Context, env protocol.Envelope) error {
+	// Message handler for inbound server commands. Tasks run under the agent's
+	// ctx, not the connection's, so a dropped connection doesn't cancel them:
+	// results queue in the client and are sent once it reconnects.
+	onMessage := func(_ context.Context, env protocol.Envelope) error {
 		switch env.Type {
 		case protocol.TypeTaskDispatch:
-			handleTaskDispatch(ctx, cfg, wsClient, env, taskQueue, chunkQueue, syncRecv)
+			handleTaskDispatch(ctx, cfg, wsClient, env, taskQueue, queueSync, syncRecv)
 		case protocol.TypeSyncChunk:
-			chunkQueue <- func() {
+			write := func() {
 				var c protocol.SyncChunkPayload
 				if err := json.Unmarshal(env.Payload, &c); err != nil {
 					slog.Warn("malformed sync.chunk", "error", err)
@@ -161,6 +194,9 @@ func main() {
 				if err := syncRecv.Chunk(c); err != nil {
 					slog.Warn("sync chunk", "sync_id", c.SyncID, "path", c.Path, "error", err)
 				}
+			}
+			if !queueSync(write) {
+				slog.Warn("sync chunk dropped: writes not keeping up")
 			}
 
 		default:
@@ -282,7 +318,7 @@ func setupLogging(level slog.Level) {
 }
 
 // handleTaskDispatch acks an inbound task and queues it for execution.
-func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope, taskQueue, chunkQueue chan<- func(), syncRecv *executor.SyncReceiver) {
+func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws.Client, env protocol.Envelope, taskQueue chan<- func(), queueSync func(func()) bool, syncRecv *executor.SyncReceiver) {
 	var task protocol.TaskDispatchPayload
 	if err := json.Unmarshal(env.Payload, &task); err != nil {
 		slog.Error("malformed task dispatch", "error", err)
@@ -295,15 +331,20 @@ func handleTaskDispatch(ctx context.Context, cfg *agentconfig.Config, client *ws
 		TaskID: task.TaskID,
 		Status: "accepted",
 	})
-	client.StartTask(task.TaskID, protocol.Envelope{
+	if !client.StartTask(task.TaskID, protocol.Envelope{
 		ID:      uuid.New().String(),
 		Type:    protocol.TypeTaskAck,
 		Payload: json.RawMessage(ackPayload),
-	})
+	}) {
+		slog.Info("task already queued or running, not run twice", "task_id", task.TaskID)
+		return
+	}
 
 	switch task.TaskType {
 	case protocol.TaskSyncReceive, protocol.TaskSyncFinish, protocol.TaskSyncDelete:
-		chunkQueue <- func() { executeTask(ctx, cfg, client, task, syncRecv) }
+		if !queueSync(func() { executeTask(ctx, cfg, client, task, syncRecv) }) {
+			go sendResult(client, task.TaskID, false, "", "sync writes not keeping up (chunk queue full)", 0)
+		}
 	default:
 		// Serial execution — tasks run one at a time in receive order.
 		taskQueue <- func() { executeTask(ctx, cfg, client, task, syncRecv) }

@@ -304,6 +304,7 @@ func (h *AgentHandler) connectNode(ctx context.Context, conn *websocket.Conn, he
 	agentLog := logging.OpenAgentLog(h.logDir, h.logName, clusterName, node.Hostname)
 
 	sess := hub.NewSession(nodeID, clusterID, conn)
+	sess.Hostname = node.Hostname
 	sess.AgentVersion = hello.AgentVersion
 	sess.Arch = hello.Arch
 	h.hub.Register(sess)
@@ -651,7 +652,7 @@ func (h *AgentHandler) handleHeartbeat(ctx context.Context, sess *hub.Session, e
 	// Detect service state transitions and emit events.
 	if h.emitter != nil {
 		hbInput := events.HeartbeatInput{
-			NodeID: sess.NodeID, ClusterID: sess.ClusterID,
+			NodeID: sess.NodeID, ClusterID: sess.ClusterID, Hostname: sess.Hostname,
 			NetboxRunning: hb.NetboxRunning, RQRunning: hb.RQRunning,
 			PatroniRunning: hb.PatroniRunning, PostgresRunning: hb.PostgresRunning,
 			RedisRunning: hb.RedisRunning, SentinelRunning: hb.SentinelRunning,

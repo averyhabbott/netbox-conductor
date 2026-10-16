@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/smtp"
 	"strings"
 	"time"
@@ -125,34 +126,48 @@ func extractRecipients(cfg map[string]interface{}) []string {
 }
 
 // sendMail sends an email. If useTLS is true it uses implicit TLS (SMTPS / port 465);
-// otherwise it uses smtp.SendMail which negotiates STARTTLS when the server offers it.
+// otherwise it negotiates STARTTLS when the server offers it. The whole exchange
+// gets the webhook client's limit, so a hung mail server can't block a send.
 func sendMail(host, port, from string, recipients []string, body []byte, user, pass string, useTLS bool) error {
 	addr := host + ":" + port
+	dialer := &net.Dialer{Timeout: client.Timeout}
 
+	var conn net.Conn
+	var err error
 	if useTLS {
-		tlsCfg := &tls.Config{ServerName: host}
-		conn, err := tls.Dial("tcp", addr, tlsCfg)
-		if err != nil {
-			return fmt.Errorf("tls dial: %w", err)
-		}
-		c, err := smtp.NewClient(conn, host)
-		if err != nil {
-			return fmt.Errorf("smtp client: %w", err)
-		}
-		defer c.Close()
-		if user != "" && pass != "" {
-			if err := c.Auth(smtp.PlainAuth("", user, pass, host)); err != nil {
-				return fmt.Errorf("smtp auth: %w", err)
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: host})
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(client.Timeout)); err != nil {
+		conn.Close()
+		return err
+	}
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp client: %w", err)
+	}
+	defer c.Close()
+	if !useTLS {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
+				return fmt.Errorf("starttls: %w", err)
 			}
 		}
-		return sendViaClient(c, from, recipients, body)
 	}
-
-	var auth smtp.Auth
 	if user != "" && pass != "" {
-		auth = smtp.PlainAuth("", user, pass, host)
+		if err := c.Auth(smtp.PlainAuth("", user, pass, host)); err != nil {
+			return fmt.Errorf("smtp auth: %w", err)
+		}
 	}
-	return smtp.SendMail(addr, auth, from, recipients, body)
+	if err := sendViaClient(c, from, recipients, body); err != nil {
+		return err
+	}
+	return c.Quit()
 }
 
 // sendViaClient sends a message using an already-connected smtp.Client.

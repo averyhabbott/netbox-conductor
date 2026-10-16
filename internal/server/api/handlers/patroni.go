@@ -432,7 +432,7 @@ func (h *PatroniHandler) DBRestore(c echo.Context) error {
 		PatroniScope: cluster.PatroniScope,
 	})
 
-	if err := h.dispatcher.DispatchTask(ctx, h.taskResults, nid, taskID, protocol.TaskDBRestore, params, 3600, 0); err != nil {
+	if err := h.dispatcher.DispatchTask(ctx, h.taskResults, nid, taskID, protocol.TaskDBRestore, params, 3600, 3600); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, "node is not connected: "+err.Error())
 	}
 	return c.JSON(http.StatusAccepted, map[string]any{

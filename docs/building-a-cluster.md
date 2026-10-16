@@ -98,7 +98,7 @@ Configure Failover is a single operation that bootstraps the full HA stack on th
 
 10. **Redis auth configured** — `redis-cli CONFIG SET requirepass` is called on each node, then `CONFIG REWRITE` persists it to `/etc/redis/redis.conf`. The `redis_tasks_password` credential is used. This runs before `configuration.py` is pushed so that Redis and the application config are in sync when services start.
 
-11. **NetBox configuration pushed** — A full `configuration.py` is rendered with all credentials and database connection info and pushed to each node. Services are restarted immediately after the config is written.
+11. **NetBox configuration pushed** — A full `configuration.py` is rendered with all credentials and database connection info and pushed to each node. Services are restarted immediately after the config is written. This needs a saved config template: run **Sync Config** first (it saves one). Without a template this step is skipped and the response's `warnings` says so.
 
 12. **Replicas configured asynchronously** — In a background goroutine, the conductor polls the primary's Patroni REST API until it confirms leader status (up to 90 seconds), then dispatches the same Patroni → Sentinel → Config sequence to each replica node.
 
